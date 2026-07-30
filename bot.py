@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -75,6 +76,38 @@ SCHEDULER_STATUS_EXPIRED = "EXPIRED"
 SCHEDULER_STATUS_FAILED = "FAILED"
 SCHEDULER_STATUS_CANCELLED = "CANCELLED"
 SCHEDULER_RESTORE_GRACE_MINUTES = 15
+
+ACTION_JOURNAL_SHEET = "16_Журнал_действий"
+ACTION_JOURNAL_HEADERS = [
+    "ACTION_ID",
+    "IDEMPOTENCY_KEY",
+    "Операция",
+    "Тип объекта",
+    "OBJECT_ID",
+    "Статус",
+    "Источник",
+    "Цель",
+    "PAYLOAD_HASH",
+    "Payload JSON",
+    "Result JSON",
+    "Создано",
+    "Завершено",
+    "Дубли заблокированы",
+    "Последний дубль",
+    "Ошибка",
+    "Исполнитель",
+    "Системная проверка",
+]
+ACTION_STATUS_STARTED = "STARTED"
+ACTION_STATUS_SUCCEEDED = "SUCCEEDED"
+ACTION_STATUS_FAILED = "FAILED"
+ACTION_STATUS_BLOCKED = "BLOCKED"
+ACTION_EXECUTOR = "EverestMacrocycleBot"
+action_journal_thread_lock = threading.Lock()
+
+JOURNAL_TEST_SHEET = "10_План_факт_дня"
+JOURNAL_TEST_CELL = "R505"
+JOURNAL_TEST_ROW_RANGE = "A505:Z505"
 
 WRITE_TEST_SHEET = "10_План_факт_дня"
 WRITE_TEST_CELL = "R504"
@@ -301,6 +334,569 @@ def run_plan_fact_write_test() -> dict:
 
 
 
+
+
+
+def _stable_json(value) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _payload_hash(payload) -> str:
+    return hashlib.sha256(
+        _stable_json(payload).encode("utf-8")
+    ).hexdigest()
+
+
+def ensure_action_journal_sheet():
+    spreadsheet = get_spreadsheet()
+    try:
+        worksheet = spreadsheet.worksheet(ACTION_JOURNAL_SHEET)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=ACTION_JOURNAL_SHEET,
+            rows=2000,
+            cols=len(ACTION_JOURNAL_HEADERS),
+        )
+        worksheet.update(
+            range_name="A1:R1",
+            values=[ACTION_JOURNAL_HEADERS],
+            value_input_option="RAW",
+        )
+        worksheet.freeze(rows=1)
+        worksheet.format(
+            "A1:R1",
+            {
+                "backgroundColor": {
+                    "red": 0.18,
+                    "green": 0.27,
+                    "blue": 0.40,
+                },
+                "textFormat": {
+                    "foregroundColor": {
+                        "red": 1,
+                        "green": 1,
+                        "blue": 1,
+                    },
+                    "bold": True,
+                },
+                "horizontalAlignment": "CENTER",
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
+            },
+        )
+        worksheet.format(
+            "A2:R2000",
+            {
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
+            },
+        )
+        logger.info(
+            "Action journal sheet created: %s",
+            ACTION_JOURNAL_SHEET,
+        )
+        return spreadsheet, worksheet
+
+    current_headers = worksheet.get(
+        "A1:R1",
+        value_render_option="FORMATTED_VALUE",
+    )
+    found = list(current_headers[0]) if current_headers else []
+    found += [""] * (len(ACTION_JOURNAL_HEADERS) - len(found))
+    if found[:len(ACTION_JOURNAL_HEADERS)] != ACTION_JOURNAL_HEADERS:
+        raise RuntimeError(
+            f"Action journal {ACTION_JOURNAL_SHEET} "
+            "has unexpected headers."
+        )
+    return spreadsheet, worksheet
+
+
+def _journal_row_to_entry(
+    row_number: int,
+    row: list[str],
+) -> dict:
+    padded = list(row) + [""] * (
+        len(ACTION_JOURNAL_HEADERS) - len(row)
+    )
+    try:
+        duplicate_count = int(padded[13] or 0)
+    except ValueError:
+        duplicate_count = 0
+
+    return {
+        "row_number": row_number,
+        "action_id": padded[0].strip(),
+        "idempotency_key": padded[1].strip(),
+        "operation": padded[2].strip(),
+        "object_type": padded[3].strip(),
+        "object_id": padded[4].strip(),
+        "status": padded[5].strip(),
+        "source": padded[6].strip(),
+        "target": padded[7].strip(),
+        "payload_hash": padded[8].strip(),
+        "payload_json": padded[9],
+        "result_json": padded[10],
+        "created_at": padded[11].strip(),
+        "finished_at": padded[12].strip(),
+        "duplicate_count": duplicate_count,
+        "last_duplicate_at": padded[14].strip(),
+        "error": padded[15],
+        "executor": padded[16].strip(),
+        "system_check": padded[17].strip(),
+    }
+
+
+def read_action_journal_entries() -> list[dict]:
+    _, worksheet = ensure_action_journal_sheet()
+    rows = worksheet.get(
+        "A2:R2000",
+        value_render_option="FORMATTED_VALUE",
+    )
+    entries = []
+    for row_number, row in enumerate(rows, start=2):
+        if not row or not str(row[0]).strip():
+            continue
+        entries.append(
+            _journal_row_to_entry(row_number, row)
+        )
+    return entries
+
+
+def _write_action_journal_entry(
+    worksheet,
+    entry: dict,
+) -> None:
+    worksheet.update(
+        range_name=(
+            f"A{entry['row_number']}:R{entry['row_number']}"
+        ),
+        values=[[
+            entry["action_id"],
+            entry["idempotency_key"],
+            entry["operation"],
+            entry["object_type"],
+            entry["object_id"],
+            entry["status"],
+            entry["source"],
+            entry["target"],
+            entry["payload_hash"],
+            entry["payload_json"],
+            entry["result_json"],
+            entry["created_at"],
+            entry["finished_at"],
+            str(entry["duplicate_count"]),
+            entry["last_duplicate_at"],
+            entry["error"],
+            entry["executor"],
+            entry["system_check"],
+        ]],
+        value_input_option="RAW",
+    )
+
+
+def begin_action_once(
+    *,
+    idempotency_key: str,
+    operation: str,
+    object_type: str,
+    object_id: str,
+    source: str,
+    target: str,
+    payload,
+) -> dict:
+    key = idempotency_key.strip()
+    if not key:
+        raise ValueError("Idempotency key must not be empty.")
+
+    with action_journal_thread_lock:
+        _, worksheet = ensure_action_journal_sheet()
+        entries = read_action_journal_entries()
+        now = datetime.now(MOSCOW_TZ).replace(
+            microsecond=0
+        ).isoformat()
+
+        existing = next(
+            (
+                entry
+                for entry in entries
+                if entry["idempotency_key"] == key
+            ),
+            None,
+        )
+        if existing is not None:
+            existing["duplicate_count"] += 1
+            existing["last_duplicate_at"] = now
+            existing["system_check"] = "DUPLICATE_BLOCKED"
+            _write_action_journal_entry(
+                worksheet,
+                existing,
+            )
+            return {
+                "created": False,
+                "blocked": True,
+                "entry": existing,
+            }
+
+        action_id = (
+            f"ACTLOG-{datetime.now(MOSCOW_TZ).strftime('%Y%m%d-%H%M%S')}-"
+            f"{uuid.uuid4().hex[:8].upper()}"
+        )
+        payload_json = _stable_json(payload)
+        entry = {
+            "row_number": 0,
+            "action_id": action_id,
+            "idempotency_key": key,
+            "operation": operation.strip().upper(),
+            "object_type": object_type.strip().upper(),
+            "object_id": object_id.strip(),
+            "status": ACTION_STATUS_STARTED,
+            "source": source.strip(),
+            "target": target.strip(),
+            "payload_hash": _payload_hash(payload),
+            "payload_json": payload_json,
+            "result_json": "",
+            "created_at": now,
+            "finished_at": "",
+            "duplicate_count": 0,
+            "last_duplicate_at": "",
+            "error": "",
+            "executor": ACTION_EXECUTOR,
+            "system_check": "CLAIMED_ONCE",
+        }
+        worksheet.append_row(
+            [
+                entry["action_id"],
+                entry["idempotency_key"],
+                entry["operation"],
+                entry["object_type"],
+                entry["object_id"],
+                entry["status"],
+                entry["source"],
+                entry["target"],
+                entry["payload_hash"],
+                entry["payload_json"],
+                entry["result_json"],
+                entry["created_at"],
+                entry["finished_at"],
+                str(entry["duplicate_count"]),
+                entry["last_duplicate_at"],
+                entry["error"],
+                entry["executor"],
+                entry["system_check"],
+            ],
+            value_input_option="RAW",
+        )
+
+        persisted = next(
+            (
+                candidate
+                for candidate in read_action_journal_entries()
+                if candidate["action_id"] == action_id
+            ),
+            None,
+        )
+        if persisted is None:
+            raise RuntimeError(
+                "Action journal row failed read-back check."
+            )
+        return {
+            "created": True,
+            "blocked": False,
+            "entry": persisted,
+        }
+
+
+def finish_action(
+    action_id: str,
+    *,
+    status: str,
+    result=None,
+    error: str = "",
+    system_check: str,
+) -> dict:
+    if status not in {
+        ACTION_STATUS_SUCCEEDED,
+        ACTION_STATUS_FAILED,
+    }:
+        raise ValueError("Unsupported final action status.")
+
+    with action_journal_thread_lock:
+        _, worksheet = ensure_action_journal_sheet()
+        entry = next(
+            (
+                candidate
+                for candidate in read_action_journal_entries()
+                if candidate["action_id"] == action_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise LookupError(
+                f"Action journal entry {action_id} was not found."
+            )
+        if entry["status"] != ACTION_STATUS_STARTED:
+            raise RuntimeError(
+                f"Action {action_id} is already final: "
+                f"{entry['status']}."
+            )
+
+        entry["status"] = status
+        entry["result_json"] = (
+            _stable_json(result) if result is not None else ""
+        )
+        entry["finished_at"] = datetime.now(
+            MOSCOW_TZ
+        ).replace(microsecond=0).isoformat()
+        entry["error"] = error[:1000]
+        entry["system_check"] = system_check
+        _write_action_journal_entry(
+            worksheet,
+            entry,
+        )
+        return entry
+
+
+def execute_action_once(
+    *,
+    idempotency_key: str,
+    operation: str,
+    object_type: str,
+    object_id: str,
+    source: str,
+    target: str,
+    payload,
+    action_callable,
+) -> dict:
+    claim = begin_action_once(
+        idempotency_key=idempotency_key,
+        operation=operation,
+        object_type=object_type,
+        object_id=object_id,
+        source=source,
+        target=target,
+        payload=payload,
+    )
+    if claim["blocked"]:
+        return {
+            "executed": False,
+            "blocked": True,
+            "entry": claim["entry"],
+            "result": None,
+        }
+
+    action_id = claim["entry"]["action_id"]
+    try:
+        result = action_callable()
+    except Exception as exc:
+        try:
+            finish_action(
+                action_id,
+                status=ACTION_STATUS_FAILED,
+                result=None,
+                error=f"{type(exc).__name__}: {str(exc)}",
+                system_check="FAILED_RECORDED",
+            )
+        except Exception:
+            logger.exception(
+                "Could not finalize failed action %s",
+                action_id,
+            )
+        raise
+
+    final_entry = finish_action(
+        action_id,
+        status=ACTION_STATUS_SUCCEEDED,
+        result=result,
+        error="",
+        system_check="EXECUTED_ONCE",
+    )
+    return {
+        "executed": True,
+        "blocked": False,
+        "entry": final_entry,
+        "result": result,
+    }
+
+
+def run_action_journal_test() -> dict:
+    spreadsheet = get_spreadsheet()
+    worksheet = spreadsheet.worksheet(JOURNAL_TEST_SHEET)
+
+    original_cell = _single_cell_value(
+        worksheet.get(
+            JOURNAL_TEST_CELL,
+            value_render_option="FORMATTED_VALUE",
+        )
+    )
+    if original_cell.strip():
+        raise RuntimeError(
+            f"Reserved test cell "
+            f"{JOURNAL_TEST_SHEET}!{JOURNAL_TEST_CELL} "
+            "is not empty."
+        )
+
+    before_row = _padded_row(
+        worksheet.get(
+            JOURNAL_TEST_ROW_RANGE,
+            value_render_option="FORMULA",
+        )
+    )
+    formulas_before = _formula_snapshot(before_row)
+
+    now = datetime.now(MOSCOW_TZ)
+    run_token = (
+        f"{now.strftime('%Y%m%d-%H%M%S-%f')}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    marker = f"MC3-JOURNAL-TEST-{run_token}"
+    idempotency_key = f"journal-test:{run_token}"
+    execution_counter = {"count": 0}
+
+    def isolated_action():
+        execution_counter["count"] += 1
+        try:
+            worksheet.update(
+                range_name=JOURNAL_TEST_CELL,
+                values=[[marker]],
+                value_input_option="RAW",
+            )
+            read_back = _single_cell_value(
+                worksheet.get(
+                    JOURNAL_TEST_CELL,
+                    value_render_option="FORMATTED_VALUE",
+                )
+            )
+            if read_back != marker:
+                raise RuntimeError(
+                    "Journal test marker failed read-back."
+                )
+
+            after_write_row = _padded_row(
+                worksheet.get(
+                    JOURNAL_TEST_ROW_RANGE,
+                    value_render_option="FORMULA",
+                )
+            )
+            if _formula_snapshot(after_write_row) != formulas_before:
+                raise RuntimeError(
+                    "Formula integrity failed during journal test."
+                )
+            return {
+                "marker": marker,
+                "cell": (
+                    f"{JOURNAL_TEST_SHEET}!"
+                    f"{JOURNAL_TEST_CELL}"
+                ),
+                "write_verified": True,
+            }
+        finally:
+            worksheet.batch_clear([JOURNAL_TEST_CELL])
+
+    first = execute_action_once(
+        idempotency_key=idempotency_key,
+        operation="TEST_TECHNICAL_WRITE",
+        object_type="SHEET_CELL",
+        object_id=(
+            f"{JOURNAL_TEST_SHEET}!{JOURNAL_TEST_CELL}"
+        ),
+        source="/journaltest",
+        target=spreadsheet.title,
+        payload={
+            "marker": marker,
+            "purpose": "block_25_idempotency_test",
+        },
+        action_callable=isolated_action,
+    )
+    second = execute_action_once(
+        idempotency_key=idempotency_key,
+        operation="TEST_TECHNICAL_WRITE",
+        object_type="SHEET_CELL",
+        object_id=(
+            f"{JOURNAL_TEST_SHEET}!{JOURNAL_TEST_CELL}"
+        ),
+        source="/journaltest duplicate",
+        target=spreadsheet.title,
+        payload={
+            "marker": marker,
+            "purpose": "block_25_idempotency_test",
+        },
+        action_callable=isolated_action,
+    )
+
+    cleared = _single_cell_value(
+        worksheet.get(
+            JOURNAL_TEST_CELL,
+            value_render_option="FORMATTED_VALUE",
+        )
+    )
+    if cleared.strip():
+        raise RuntimeError(
+            "Journal test cell was not cleared."
+        )
+
+    after_clear_row = _padded_row(
+        worksheet.get(
+            JOURNAL_TEST_ROW_RANGE,
+            value_render_option="FORMULA",
+        )
+    )
+    if _formula_snapshot(after_clear_row) != formulas_before:
+        raise RuntimeError(
+            "Formula integrity failed after journal cleanup."
+        )
+
+    final_entry = next(
+        (
+            entry
+            for entry in read_action_journal_entries()
+            if entry["idempotency_key"] == idempotency_key
+        ),
+        None,
+    )
+    if final_entry is None:
+        raise RuntimeError(
+            "Journal test entry was not found."
+        )
+    if not first["executed"]:
+        raise RuntimeError(
+            "First journal test action was not executed."
+        )
+    if not second["blocked"]:
+        raise RuntimeError(
+            "Duplicate journal test action was not blocked."
+        )
+    if execution_counter["count"] != 1:
+        raise RuntimeError(
+            "Test action executed more than once."
+        )
+    if final_entry["status"] != ACTION_STATUS_SUCCEEDED:
+        raise RuntimeError(
+            "Final journal action status is not SUCCEEDED."
+        )
+    if final_entry["duplicate_count"] != 1:
+        raise RuntimeError(
+            "Duplicate attempt counter is incorrect."
+        )
+
+    return {
+        "spreadsheet_title": spreadsheet.title,
+        "journal_sheet": ACTION_JOURNAL_SHEET,
+        "action_id": final_entry["action_id"],
+        "status": final_entry["status"],
+        "idempotency_key": idempotency_key,
+        "execution_count": execution_counter["count"],
+        "duplicate_count": final_entry["duplicate_count"],
+        "test_cell": (
+            f"{JOURNAL_TEST_SHEET}!{JOURNAL_TEST_CELL}"
+        ),
+        "formula_count": len(formulas_before),
+    }
 
 
 def ensure_scheduler_sheet():
@@ -1682,6 +2278,107 @@ async def schedulerstatus(
     await update.effective_message.reply_text("\n".join(lines))
 
 
+
+async def journaltest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /journaltest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Проверяю журнал действий и защиту от дублей…"
+    )
+    try:
+        result = await asyncio.to_thread(
+            run_action_journal_test
+        )
+    except Exception as exc:
+        logger.exception(
+            "Action journal and duplicate test failed"
+        )
+        await update.effective_message.reply_text(
+            "Тест журнала действий не пройден ❌\n"
+            f"Ошибка: {type(exc).__name__}"
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Журнал действий и защита от дублей работают ✅\n\n"
+        f"Таблица: {result['spreadsheet_title']}\n"
+        f"Журнал: {result['journal_sheet']}\n"
+        f"ACTION_ID: {result['action_id']}\n"
+        f"Статус: {result['status']}\n"
+        f"Тестовая ячейка: {result['test_cell']}\n\n"
+        "Проверки:\n"
+        "• действие зарегистрировано до исполнения;\n"
+        "• техническая запись выполнена один раз;\n"
+        "• результат записан в журнал;\n"
+        "• повтор с тем же ключом заблокирован;\n"
+        f"• заблокировано дублей: {result['duplicate_count']};\n"
+        f"• фактических исполнений: {result['execution_count']};\n"
+        f"• проверено формул: {result['formula_count']};\n"
+        "• тестовая запись очищена;\n"
+        "• рабочие данные не изменены."
+    )
+
+
+async def journalstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /journalstatus attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    try:
+        entries = await asyncio.to_thread(
+            read_action_journal_entries
+        )
+    except Exception as exc:
+        logger.exception("Action journal status read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать журнал действий ❌\n"
+            f"Ошибка: {type(exc).__name__}"
+        )
+        return
+
+    if not entries:
+        await update.effective_message.reply_text(
+            "Журнал действий пока пуст."
+        )
+        return
+
+    latest = entries[-8:][::-1]
+    lines = [
+        "📋 Последние действия",
+        "",
+    ]
+    for entry in latest:
+        lines.append(
+            f"• {entry['operation']} | {entry['status']} | "
+            f"дубли {entry['duplicate_count']} | "
+            f"{entry['action_id']}"
+        )
+    lines.extend(
+        [
+            "",
+            f"Хранилище: {ACTION_JOURNAL_SHEET}",
+            f"Всего записей: {len(entries)}",
+        ]
+    )
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+    )
+
+
 async def deliver_test_notification(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     key = data["key"]
@@ -1878,6 +2575,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
     telegram_app.add_handler(CommandHandler("schedulertest", schedulertest))
     telegram_app.add_handler(CommandHandler("schedulerstatus", schedulerstatus))
+    telegram_app.add_handler(CommandHandler("journaltest", journaltest))
+    telegram_app.add_handler(CommandHandler("journalstatus", journalstatus))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
         CallbackQueryHandler(
