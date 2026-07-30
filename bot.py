@@ -49,6 +49,7 @@ scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
 write_test_lock = asyncio.Lock()
 event_test_lock = asyncio.Lock()
+journal_test_lock = asyncio.Lock()
 scheduler_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
@@ -106,8 +107,8 @@ ACTION_EXECUTOR = "EverestMacrocycleBot"
 action_journal_thread_lock = threading.Lock()
 
 JOURNAL_TEST_SHEET = "10_План_факт_дня"
-JOURNAL_TEST_CELL = "R505"
-JOURNAL_TEST_ROW_RANGE = "A505:Z505"
+JOURNAL_TEST_CELL = "R503"
+JOURNAL_TEST_ROW_RANGE = "A503:Z503"
 
 WRITE_TEST_SHEET = "10_План_факт_дня"
 WRITE_TEST_CELL = "R504"
@@ -2290,41 +2291,49 @@ async def journaltest(
         )
         return
 
-    await update.effective_message.reply_text(
-        "Проверяю журнал действий и защиту от дублей…"
-    )
-    try:
-        result = await asyncio.to_thread(
-            run_action_journal_test
-        )
-    except Exception as exc:
-        logger.exception(
-            "Action journal and duplicate test failed"
-        )
+    if journal_test_lock.locked():
         await update.effective_message.reply_text(
-            "Тест журнала действий не пройден ❌\n"
-            f"Ошибка: {type(exc).__name__}"
+            "Тест журнала уже выполняется. Подожди несколько секунд."
         )
         return
 
     await update.effective_message.reply_text(
-        "Журнал действий и защита от дублей работают ✅\n\n"
-        f"Таблица: {result['spreadsheet_title']}\n"
-        f"Журнал: {result['journal_sheet']}\n"
-        f"ACTION_ID: {result['action_id']}\n"
-        f"Статус: {result['status']}\n"
-        f"Тестовая ячейка: {result['test_cell']}\n\n"
-        "Проверки:\n"
-        "• действие зарегистрировано до исполнения;\n"
-        "• техническая запись выполнена один раз;\n"
-        "• результат записан в журнал;\n"
-        "• повтор с тем же ключом заблокирован;\n"
-        f"• заблокировано дублей: {result['duplicate_count']};\n"
-        f"• фактических исполнений: {result['execution_count']};\n"
-        f"• проверено формул: {result['formula_count']};\n"
-        "• тестовая запись очищена;\n"
-        "• рабочие данные не изменены."
+        "Проверяю журнал действий и защиту от дублей…"
     )
+
+    async with journal_test_lock:
+        try:
+            result = await asyncio.to_thread(
+                run_action_journal_test
+            )
+        except Exception as exc:
+            logger.exception(
+                "Action journal and duplicate test failed"
+            )
+            await update.effective_message.reply_text(
+                "Тест журнала действий не пройден ❌\n"
+                f"Ошибка: {type(exc).__name__}"
+            )
+            return
+
+        await update.effective_message.reply_text(
+            "Журнал действий и защита от дублей работают ✅\n\n"
+            f"Таблица: {result['spreadsheet_title']}\n"
+            f"Журнал: {result['journal_sheet']}\n"
+            f"ACTION_ID: {result['action_id']}\n"
+            f"Статус: {result['status']}\n"
+            f"Тестовая ячейка: {result['test_cell']}\n\n"
+            "Проверки:\n"
+            "• действие зарегистрировано до исполнения;\n"
+            "• техническая запись выполнена один раз;\n"
+            "• результат записан в журнал;\n"
+            "• повтор с тем же ключом заблокирован;\n"
+            f"• заблокировано дублей: {result['duplicate_count']};\n"
+            f"• фактических исполнений: {result['execution_count']};\n"
+            f"• проверено формул: {result['formula_count']};\n"
+            "• тестовая запись очищена;\n"
+            "• рабочие данные не изменены."
+        )
 
 
 async def journalstatus(
