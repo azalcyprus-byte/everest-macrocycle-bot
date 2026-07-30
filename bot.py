@@ -51,6 +51,7 @@ write_test_lock = asyncio.Lock()
 event_test_lock = asyncio.Lock()
 journal_test_lock = asyncio.Lock()
 scheduler_lock = asyncio.Lock()
+day_plan_test_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
 SCHEDULER_SHEET = "15_Планировщик"
@@ -105,6 +106,17 @@ ACTION_STATUS_FAILED = "FAILED"
 ACTION_STATUS_BLOCKED = "BLOCKED"
 ACTION_EXECUTOR = "EverestMacrocycleBot"
 action_journal_thread_lock = threading.Lock()
+
+MORNING_SHEET = "Утро"
+MORNING_60_SHEET = "Утро 60 мин"
+MORNING_90_SHEET = "Утро 90 мин"
+DAY_PLAN_TEST_SOURCE = "/dayplantest"
+DAY_PLAN_TEST_OPERATION = "DAY_PLAN_TEST"
+DAY_PLAN_TEST_ITEM_TYPE = "DAY_PLAN_TEST"
+DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS = int(
+    os.environ.get("DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS", "10")
+)
+ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 
 JOURNAL_TEST_SHEET = "10_План_факт_дня"
 JOURNAL_TEST_CELL = "R503"
@@ -228,6 +240,534 @@ def read_current_working_data() -> dict:
 def display_value(value: str) -> str:
     value = str(value).strip()
     return value if value else "—"
+
+
+def _normalize_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _parse_date_value(value: object) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%d.%m.%Y", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_timestamp_value(value: object) -> datetime:
+    raw = str(value or "").strip()
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=MOSCOW_TZ)
+        except ValueError:
+            continue
+    return datetime.min.replace(tzinfo=MOSCOW_TZ)
+
+
+def _records_from_values(values: list[list[str]]) -> list[dict[str, str]]:
+    if not values:
+        return []
+    headers = [str(value).strip() for value in values[0]]
+    records: list[dict[str, str]] = []
+    for row in values[1:]:
+        if not any(str(value).strip() for value in row):
+            continue
+        padded = list(row) + [""] * (len(headers) - len(row))
+        record = {
+            header: str(padded[index]).strip()
+            for index, header in enumerate(headers)
+            if header
+        }
+        records.append(record)
+    return records
+
+
+def _latest_record_for_date(
+    worksheet,
+    range_name: str,
+    target_date: date,
+) -> dict[str, str] | None:
+    values = worksheet.get(
+        range_name,
+        value_render_option="FORMATTED_VALUE",
+    )
+    records = _records_from_values(values)
+    matches: list[dict[str, str]] = []
+    for record in records:
+        record_date = _parse_date_value(record.get("Дата", ""))
+        if record_date is None:
+            record_date = _parse_date_value(record.get("Отметка времени", ""))
+        if record_date == target_date:
+            matches.append(record)
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda record: _parse_timestamp_value(
+            record.get("Отметка времени", "")
+        ),
+    )
+
+
+def _record_value(record: dict[str, str], fragment: str) -> str:
+    wanted = _normalize_text(fragment)
+    for key, value in record.items():
+        if wanted in _normalize_text(key):
+            return str(value).strip()
+    return ""
+
+
+def _score(value: object) -> int | None:
+    match = re.match(r"^\s*(\d+)", str(value or ""))
+    return int(match.group(1)) if match else None
+
+
+def _number(value: object) -> float | None:
+    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value or ""))
+    if not match:
+        return None
+    return float(match.group(0).replace(",", "."))
+
+
+def _format_hours(value: float) -> str:
+    rounded = round(value * 2) / 2
+    if rounded.is_integer():
+        number_text = str(int(rounded))
+    else:
+        number_text = str(rounded).replace(".", ",")
+    integer = int(rounded)
+    if rounded == integer:
+        last_two = integer % 100
+        last = integer % 10
+        if last == 1 and last_two != 11:
+            word = "час"
+        elif last in (2, 3, 4) and last_two not in (12, 13, 14):
+            word = "часа"
+        else:
+            word = "часов"
+    else:
+        word = "часа"
+    return f"{number_text} {word}"
+
+
+def _add_hours_to_clock(clock_text: str, hours: float) -> str:
+    if not TIME_PATTERN.fullmatch(clock_text):
+        raise ValueError("ONLINE_GAME_START must use HH:MM format.")
+    hour, minute = map(int, clock_text.split(":"))
+    base = datetime.combine(date(2000, 1, 1), time(hour, minute))
+    return (base + timedelta(hours=hours)).strftime("%H:%M")
+
+
+def _morning_scores(
+    checklist_60: dict[str, str],
+    checklist_90: dict[str, str],
+) -> dict[str, int | None]:
+    return {
+        "thinking": _score(_record_value(
+            checklist_60,
+            "ясно и быстро формулируются мысли",
+        )),
+        "information": _score(_record_value(
+            checklist_60,
+            "легко сейчас воспринимать информацию",
+        )),
+        "attention": _score(_record_value(
+            checklist_60,
+            "устойчиво сейчас внимание",
+        )),
+        "unfinished": _score(_record_value(
+            checklist_60,
+            "голова продолжает быть занята",
+        )),
+        "pressure": _score(_record_value(
+            checklist_60,
+            "внутреннее давление немедленно",
+        )),
+        "head_load": _score(_record_value(
+            checklist_60,
+            "перегруженной или «забитой»",
+        )),
+        "residual_irritation": _score(_record_value(
+            checklist_60,
+            "осталось ли раздражение",
+        )),
+        "morning_irritation": _score(_record_value(
+            checklist_60,
+            "обычные мелочи раздражают",
+        )),
+        "physical": _score(_record_value(
+            checklist_90,
+            "физически сильным и восстановленным",
+        )),
+        "body_freedom": _score(_record_value(
+            checklist_90,
+            "свободно тело от тяжести",
+        )),
+        "sleepiness": _score(_record_value(
+            checklist_90,
+            "хочется снова лечь или уснуть",
+        )),
+        "energy": _score(_record_value(
+            checklist_90,
+            "устойчивым ощущается запас энергии",
+        )),
+    }
+
+
+def assess_online_session(
+    checklist_60: dict[str, str],
+    checklist_90: dict[str, str],
+    planned_game_hours: float,
+) -> dict:
+    scores = _morning_scores(checklist_60, checklist_90)
+    required = (
+        "thinking",
+        "information",
+        "attention",
+        "unfinished",
+        "pressure",
+        "head_load",
+        "residual_irritation",
+        "morning_irritation",
+        "physical",
+        "body_freedom",
+        "sleepiness",
+        "energy",
+    )
+    missing = [name for name in required if scores[name] is None]
+    if missing:
+        return {
+            "status": "INCOMPLETE",
+            "scores": scores,
+            "reasons": ["не удалось прочитать часть оценок чек-листов"],
+            "allowed_hours": None,
+        }
+
+    positive = (
+        scores["thinking"],
+        scores["information"],
+        scores["attention"],
+        scores["physical"],
+        scores["body_freedom"],
+        scores["energy"],
+    )
+    negative = (
+        scores["unfinished"],
+        scores["pressure"],
+        scores["head_load"],
+        scores["residual_irritation"],
+        scores["morning_irritation"],
+    )
+
+    red_reasons: list[str] = []
+    if min(positive) <= 0:
+        red_reasons.append("один из базовых рабочих показателей критически низкий")
+    if max(negative) >= 3:
+        red_reasons.append("выраженная ментальная перегрузка или раздражение")
+    if scores["sleepiness"] >= 4:
+        red_reasons.append("выраженная сонливость через 90 минут после подъёма")
+    if red_reasons:
+        return {
+            "status": "RED",
+            "scores": scores,
+            "reasons": red_reasons,
+            "allowed_hours": 0.0,
+        }
+
+    yellow_reasons: list[str] = []
+    if min(positive) == 1:
+        yellow_reasons.append("один из рабочих показателей ниже обычного уровня")
+    if max(negative) == 2:
+        yellow_reasons.append("есть заметная остаточная перегрузка")
+    if scores["sleepiness"] == 3:
+        yellow_reasons.append("сонливость выше рабочего уровня")
+    if yellow_reasons:
+        reduced = max(2.0, round(planned_game_hours * 2 / 3 * 2) / 2)
+        reduced = min(planned_game_hours, reduced)
+        return {
+            "status": "YELLOW",
+            "scores": scores,
+            "reasons": yellow_reasons,
+            "allowed_hours": reduced,
+        }
+
+    return {
+        "status": "GREEN",
+        "scores": scores,
+        "reasons": [],
+        "allowed_hours": planned_game_hours,
+    }
+
+
+def read_morning_day_plan_test_data() -> dict:
+    spreadsheet = get_spreadsheet()
+    target_date = datetime.now(MOSCOW_TZ).date()
+    target_text = target_date.strftime("%d.%m.%Y")
+
+    morning = _latest_record_for_date(
+        spreadsheet.worksheet(MORNING_SHEET),
+        "A1:O1000",
+        target_date,
+    )
+    checklist_60 = _latest_record_for_date(
+        spreadsheet.worksheet(MORNING_60_SHEET),
+        "A1:Q1000",
+        target_date,
+    )
+    checklist_90 = _latest_record_for_date(
+        spreadsheet.worksheet(MORNING_90_SHEET),
+        "A1:L1000",
+        target_date,
+    )
+
+    missing_checklists = [
+        label
+        for label, record in (
+            ("утренний", morning),
+            ("+60 минут", checklist_60),
+            ("+90 минут", checklist_90),
+        )
+        if record is None
+    ]
+
+    day_rows = spreadsheet.worksheet("02_День").get(
+        "A4:N1000",
+        value_render_option="FORMATTED_VALUE",
+    )
+    day_row = next(
+        (row for row in day_rows if row and str(row[0]).strip() == target_text),
+        None,
+    )
+    if day_row is None:
+        raise LookupError(
+            f"Today row {target_text} was not found in 02_День."
+        )
+    padded = list(day_row) + [""] * (14 - len(day_row))
+    planned_game_hours = _number(padded[10]) or 0.0
+    planned_study_hours = _number(padded[12]) or 0.0
+
+    if planned_game_hours <= 0:
+        assessment = {
+            "status": "NO_GAME",
+            "scores": (
+                _morning_scores(checklist_60, checklist_90)
+                if checklist_60 and checklist_90
+                else {}
+            ),
+            "reasons": [],
+            "allowed_hours": 0.0,
+        }
+    elif missing_checklists:
+        assessment = {
+            "status": "INCOMPLETE",
+            "scores": {},
+            "reasons": [
+                "не заполнены чек-листы: " + ", ".join(missing_checklists)
+            ],
+            "allowed_hours": None,
+        }
+    else:
+        assessment = assess_online_session(
+            checklist_60,
+            checklist_90,
+            planned_game_hours,
+        )
+
+    return {
+        "spreadsheet_title": spreadsheet.title,
+        "date": target_date,
+        "date_text": target_text,
+        "day": {
+            "day_type": padded[6].strip(),
+            "key_task": padded[9].strip(),
+            "game_hours": planned_game_hours,
+            "study_hours": planned_study_hours,
+        },
+        "morning": morning,
+        "checklist_60": checklist_60,
+        "checklist_90": checklist_90,
+        "assessment": assessment,
+    }
+
+
+def format_day_plan_test_message(data: dict) -> str:
+    day = data["day"]
+    assessment = data["assessment"]
+    game_hours = day["game_hours"]
+    status = assessment["status"]
+
+    lines = ["🧪 Тест утреннего планирования", ""]
+    if game_hours > 0:
+        lines.append(
+            "Андрей Николаевич, по плану сегодня онлайн-игра — "
+            f"{_format_hours(game_hours)}."
+        )
+    else:
+        lines.append("Андрей Николаевич, по плану сегодня онлайн-игры нет.")
+
+    lines.append("")
+    if status == "INCOMPLETE":
+        lines.extend([
+            "Решение по сессии пока не принято.",
+            assessment["reasons"][0] + ".",
+        ])
+        return "\n".join(lines)
+
+    if status == "NO_GAME":
+        lines.append("Утренние чек-листы получены.")
+        return "\n".join(lines)
+
+    scores = assessment["scores"]
+    if (
+        min(scores["thinking"], scores["information"], scores["attention"]) >= 2
+        and scores["energy"] >= 2
+    ):
+        lines.append(
+            "Мышление, внимание и запас энергии находятся на рабочем уровне."
+        )
+    body_value = _record_value(
+        data["checklist_90"],
+        "свободно тело от тяжести",
+    )
+    if "небольшая тяжесть" in _normalize_text(body_value):
+        lines.append(
+            "Есть небольшая физическая тяжесть, но она не мешает работе."
+        )
+
+    lines.append("")
+    if status == "GREEN":
+        lines.append("Игровая сессия разрешена. Зелёный свет. 🟢")
+        lines.append("")
+        lines.append("Штаб готов сформировать план дня.")
+    elif status == "YELLOW":
+        allowed = float(assessment["allowed_hours"])
+        finish = _add_hours_to_clock(ONLINE_GAME_START, allowed)
+        lines.append(
+            "Игровую сессию сократить до "
+            f"{_format_hours(allowed)}: {ONLINE_GAME_START}–{finish}. "
+            "Жёлтый свет. 🟡"
+        )
+    else:
+        lines.append("Сегодня лучше не играть. Красный свет. 🔴")
+
+    text = "\n".join(lines)
+    return text[:4000]
+
+
+def prepare_day_plan_test(
+    *,
+    chat_id: int,
+    repeat: bool,
+) -> dict:
+    data = read_morning_day_plan_test_data()
+    text = format_day_plan_test_message(data)
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    run_suffix = now.strftime("%H%M%S") if repeat else "primary"
+    run_key = f"dayplan-test:{data['date'].isoformat()}:{run_suffix}"
+    object_id = f"DAYPLAN-TEST-{data['date'].strftime('%Y%m%d')}-{run_suffix}"
+
+    def create_scheduler_row() -> dict:
+        target = now + timedelta(seconds=DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS)
+        scheduler_result = create_persistent_scheduler_item(
+            item_type=DAY_PLAN_TEST_ITEM_TYPE,
+            chat_id=chat_id,
+            target=target,
+            text=text,
+            source=(
+                f"{DAY_PLAN_TEST_SOURCE} repeat"
+                if repeat
+                else DAY_PLAN_TEST_SOURCE
+            ),
+        )
+        return {
+            "scheduler_created": scheduler_result["created"],
+            "scheduler_item": scheduler_result["item"],
+            "decision": data["assessment"]["status"],
+            "date": data["date_text"],
+            "message": text,
+        }
+
+    execution = execute_action_once(
+        idempotency_key=run_key,
+        operation=DAY_PLAN_TEST_OPERATION,
+        object_type="TELEGRAM_MESSAGE",
+        object_id=object_id,
+        source=(
+            f"{DAY_PLAN_TEST_SOURCE} repeat"
+            if repeat
+            else DAY_PLAN_TEST_SOURCE
+        ),
+        target=f"Telegram chat {chat_id}",
+        payload={
+            "date": data["date_text"],
+            "day_type": data["day"]["day_type"],
+            "game_hours": data["day"]["game_hours"],
+            "study_hours": data["day"]["study_hours"],
+            "decision": data["assessment"]["status"],
+            "repeat": repeat,
+            "message": text,
+        },
+        action_callable=create_scheduler_row,
+    )
+    return execution
+
+
+def read_day_plan_test_records() -> dict:
+    scheduler_items = [
+        item
+        for item in read_scheduler_items()
+        if item["source"].startswith(DAY_PLAN_TEST_SOURCE)
+    ]
+    journal_entries = [
+        entry
+        for entry in read_action_journal_entries()
+        if entry["operation"] == DAY_PLAN_TEST_OPERATION
+        or entry["source"].startswith(DAY_PLAN_TEST_SOURCE)
+    ]
+    return {
+        "scheduler_items": scheduler_items,
+        "journal_entries": journal_entries,
+    }
+
+
+def cleanup_day_plan_test_records() -> dict:
+    spreadsheet, scheduler_sheet = ensure_scheduler_sheet()
+    scheduler_items = [
+        item
+        for item in read_scheduler_items()
+        if item["source"].startswith(DAY_PLAN_TEST_SOURCE)
+    ]
+    for item in sorted(
+        scheduler_items,
+        key=lambda value: value["row_number"],
+        reverse=True,
+    ):
+        scheduler_sheet.delete_rows(item["row_number"])
+
+    with action_journal_thread_lock:
+        _, journal_sheet = ensure_action_journal_sheet()
+        journal_entries = [
+            entry
+            for entry in read_action_journal_entries()
+            if entry["operation"] == DAY_PLAN_TEST_OPERATION
+            or entry["source"].startswith(DAY_PLAN_TEST_SOURCE)
+        ]
+        for entry in sorted(
+            journal_entries,
+            key=lambda value: value["row_number"],
+            reverse=True,
+        ):
+            journal_sheet.delete_rows(entry["row_number"])
+
+    return {
+        "spreadsheet_title": spreadsheet.title,
+        "scheduler_deleted": len(scheduler_items),
+        "journal_deleted": len(journal_entries),
+    }
 
 
 
@@ -2476,6 +3016,134 @@ async def notifytest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def dayplantest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /dayplantest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    repeat = False
+    if context.args:
+        if len(context.args) != 1 or context.args[0].lower() != "repeat":
+            await update.effective_message.reply_text(
+                "Формат команды:\n/dayplantest\n"
+                "Повторный прогон: /dayplantest repeat"
+            )
+            return
+        repeat = True
+
+    if day_plan_test_lock.locked():
+        await update.effective_message.reply_text(
+            "Тест утреннего планирования уже запускается."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Читаю сегодняшний план и три утренних чек-листа…"
+    )
+
+    async with day_plan_test_lock:
+        async with scheduler_lock:
+            try:
+                execution = await asyncio.to_thread(
+                    prepare_day_plan_test,
+                    chat_id=update.effective_chat.id,
+                    repeat=repeat,
+                )
+            except Exception as exc:
+                logger.exception("Morning day-plan test setup failed")
+                await update.effective_message.reply_text(
+                    "Не удалось запустить тест утреннего планирования ❌\n"
+                    f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+                )
+                return
+
+            if not execution["blocked"]:
+                prepared_result = execution["result"]
+                prepared_item = prepared_result["scheduler_item"]
+                prepared_scheduled_now = False
+                if prepared_item["status"] == SCHEDULER_STATUS_SCHEDULED:
+                    prepared_scheduled_now = schedule_persistent_item(
+                        context.application,
+                        prepared_item,
+                    )
+
+    if execution["blocked"]:
+        entry = execution["entry"]
+        await update.effective_message.reply_text(
+            "Основной тест за сегодня уже запускался — дубль заблокирован ✅\n\n"
+            f"ACTION_ID: {entry['action_id']}\n"
+            "Для повторного прогона используй /dayplantest repeat."
+        )
+        return
+
+    result = prepared_result
+    item = prepared_item
+    scheduled_now = prepared_scheduled_now
+
+    await update.effective_message.reply_text(
+        "Тест подготовлен ✅\n\n"
+        f"Дата данных: {result['date']}\n"
+        f"Решение: {result['decision']}\n"
+        f"SCHED_ID: {item['sched_id']}\n"
+        f"ACTION_ID: {execution['entry']['action_id']}\n"
+        f"Поставлено в очередь: {'да' if scheduled_now else 'уже было'}\n\n"
+        "Отдельное сообщение координатора придёт через несколько секунд."
+    )
+
+
+async def dayplancleanup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /dayplancleanup attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    if context.args != ["CONFIRM"]:
+        await update.effective_message.reply_text(
+            "Команда удаляет только тестовые записи /dayplantest "
+            "из планировщика и журнала.\n\n"
+            "Для подтверждения: /dayplancleanup CONFIRM"
+        )
+        return
+
+    async with day_plan_test_lock:
+        async with scheduler_lock:
+            try:
+                records = await asyncio.to_thread(read_day_plan_test_records)
+                for item in records["scheduler_items"]:
+                    for job in context.application.job_queue.get_jobs_by_name(
+                        item["dedup_key"]
+                    ):
+                        job.schedule_removal()
+                    persistent_scheduled_keys.discard(item["dedup_key"])
+
+                result = await asyncio.to_thread(cleanup_day_plan_test_records)
+            except Exception as exc:
+                logger.exception("Morning day-plan test cleanup failed")
+                await update.effective_message.reply_text(
+                    "Не удалось очистить тестовые записи ❌\n"
+                    f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+                )
+                return
+
+    await update.effective_message.reply_text(
+        "Тестовые записи утреннего планирования очищены ✅\n\n"
+        f"Планировщик: удалено {result['scheduler_deleted']}\n"
+        f"Журнал действий: удалено {result['journal_deleted']}\n"
+        "Рабочие показатели и чек-листы не изменены."
+    )
+
+
 async def buttonstest(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2586,6 +3254,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("schedulerstatus", schedulerstatus))
     telegram_app.add_handler(CommandHandler("journaltest", journaltest))
     telegram_app.add_handler(CommandHandler("journalstatus", journalstatus))
+    telegram_app.add_handler(CommandHandler("dayplantest", dayplantest))
+    telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
         CallbackQueryHandler(
