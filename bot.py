@@ -10,6 +10,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
+import aiohttp
 from aiohttp import web
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -53,6 +54,7 @@ journal_test_lock = asyncio.Lock()
 scheduler_lock = asyncio.Lock()
 day_plan_test_lock = asyncio.Lock()
 full_plan_test_lock = asyncio.Lock()
+coordinator_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
 SCHEDULER_SHEET = "15_Планировщик"
@@ -126,6 +128,27 @@ STUDY_AFTER_GAME_GAP_MINUTES = int(
 )
 MEAL_BLOCK_MINUTES = int(os.environ.get("MEAL_BLOCK_MINUTES", "20"))
 ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
+
+# Block 26: coordinator as manager-agent.
+COORDINATOR_SOURCE = "/hq"
+COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
+COORDINATOR_VERSION = "v12.0"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
+OPENAI_BASE_URL = os.environ.get(
+    "OPENAI_BASE_URL",
+    "https://api.openai.com/v1",
+).rstrip("/")
+COORDINATOR_OPENAI_TIMEOUT_SECONDS = int(
+    os.environ.get("COORDINATOR_OPENAI_TIMEOUT_SECONDS", "30")
+)
+COORDINATOR_INTENTS = {
+    "BUILD_DAY_PLAN",
+    "SESSION_STATUS",
+    "MEAL_QUERY",
+    "SYSTEM_STATUS",
+    "REGISTER_REQUEST",
+}
 SLEEP_QUALITY_RED_MAX = float(
     os.environ.get("SLEEP_QUALITY_RED_MAX", "3.0")
 )
@@ -1161,6 +1184,395 @@ def format_full_day_plan_test_message(data: dict) -> str:
         ])
     return "\n".join(lines)[:4000]
 
+
+
+def _coordinator_heuristic_route(request_text: str) -> dict:
+    normalized = _normalize_text(request_text)
+    meal_words = (
+        "завтрак",
+        "второй завтрак",
+        "перекус",
+        "обед",
+        "ужин",
+        "прием пищи",
+        "приём пищи",
+        "что кушать",
+        "что есть",
+        "меню",
+    )
+    if (
+        "план на день" in normalized
+        or "план дня" in normalized
+        or ("состав" in normalized and "план" in normalized and "сегодня" in normalized)
+        or ("сформ" in normalized and "план" in normalized and "день" in normalized)
+    ):
+        intent = "BUILD_DAY_PLAN"
+        specialists = [
+            "poker_manager_adapter",
+            "nutrition_recovery_adapter",
+            "projects_tasks_adapter",
+            "planner_executor_adapter",
+        ]
+    elif any(word in normalized for word in meal_words):
+        intent = "MEAL_QUERY"
+        specialists = ["nutrition_recovery_manager"]
+    elif (
+        any(
+            phrase in normalized
+            for phrase in (
+                "решение по сессии",
+                "можно играть",
+                "сегодня играем",
+                "допуск к игре",
+                "оценить состояние",
+                "статус сессии",
+            )
+        )
+        or ("можно" in normalized and "играт" in normalized)
+        or ("сесс" in normalized and "состояни" in normalized)
+    ):
+        intent = "SESSION_STATUS"
+        specialists = ["poker_manager_adapter"]
+    elif any(
+        phrase in normalized
+        for phrase in (
+            "статус штаба",
+            "что умеет штаб",
+            "что умеешь",
+            "статус координатора",
+        )
+    ):
+        intent = "SYSTEM_STATUS"
+        specialists = []
+    else:
+        intent = "REGISTER_REQUEST"
+        specialists = []
+
+    return {
+        "intent": intent,
+        "action_class": "AUTO" if intent != "REGISTER_REQUEST" else "ESCALATE",
+        "specialists": specialists,
+        "normalized_request": request_text.strip(),
+        "source": "heuristic",
+    }
+
+
+def _extract_responses_api_text(payload: dict) -> str:
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    parts: list[str] = []
+    for output_item in payload.get("output", []) or []:
+        if not isinstance(output_item, dict):
+            continue
+        for content_item in output_item.get("content", []) or []:
+            if not isinstance(content_item, dict):
+                continue
+            value = content_item.get("text")
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+    return "\n".join(parts).strip()
+
+
+def _parse_coordinator_json(raw_text: str) -> dict:
+    stripped = raw_text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+        if not match:
+            raise ValueError("Coordinator model returned no JSON object.")
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("Coordinator model returned a non-object JSON value.")
+    return parsed
+
+
+async def _coordinator_openai_route(request_text: str) -> dict | None:
+    """Classify a request. Execution remains deterministic and permission-bound."""
+    if not OPENAI_API_KEY or not OPENAI_MODEL:
+        return None
+
+    instructions = (
+        "Ты — маршрутизатор личного цифрового штаба Андрея. "
+        "Верни только JSON без markdown. Допустимые intent: "
+        "BUILD_DAY_PLAN, SESSION_STATUS, MEAL_QUERY, SYSTEM_STATUS, "
+        "REGISTER_REQUEST. BUILD_DAY_PLAN — просьба составить расписание дня. "
+        "SESSION_STATUS — вопрос о допуске или длительности игровой сессии. "
+        "MEAL_QUERY — вопрос о времени или меню конкретного приёма пищи. "
+        "SYSTEM_STATUS — вопрос о возможностях штаба. Всё остальное — "
+        "REGISTER_REQUEST. Поля JSON: intent, action_class, specialists, "
+        "normalized_request. action_class для первых четырёх AUTO, "
+        "для REGISTER_REQUEST ESCALATE. specialists — массив из: "
+        "poker_manager_adapter, nutrition_recovery_adapter, "
+        "projects_tasks_adapter, planner_executor_adapter. "
+        "Не придумывай выполненные действия и не расширяй полномочия."
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": request_text.strip(),
+    }
+    timeout = aiohttp.ClientTimeout(total=COORDINATOR_OPENAI_TIMEOUT_SECONDS)
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            f"{OPENAI_BASE_URL}/responses",
+            headers=headers,
+            json=payload,
+        ) as response:
+            response_body = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"OpenAI routing failed with HTTP {response.status}: "
+                    f"{response_body[:300]}"
+                )
+            response_json = json.loads(response_body)
+
+    parsed = _parse_coordinator_json(_extract_responses_api_text(response_json))
+    intent = str(parsed.get("intent", "")).strip().upper()
+    if intent not in COORDINATOR_INTENTS:
+        raise ValueError(f"Unsupported coordinator intent: {intent}")
+
+    specialists_raw = parsed.get("specialists", [])
+    specialists = [
+        str(item).strip()
+        for item in specialists_raw
+        if str(item).strip()
+    ] if isinstance(specialists_raw, list) else []
+    return {
+        "intent": intent,
+        "action_class": (
+            "ESCALATE" if intent == "REGISTER_REQUEST" else "AUTO"
+        ),
+        "specialists": specialists,
+        "normalized_request": str(
+            parsed.get("normalized_request") or request_text
+        ).strip(),
+        "source": "openai",
+    }
+
+
+async def classify_coordinator_request(request_text: str) -> dict:
+    fallback = _coordinator_heuristic_route(request_text)
+    if fallback["intent"] != "REGISTER_REQUEST":
+        return fallback
+    try:
+        routed = await _coordinator_openai_route(request_text)
+    except Exception:
+        logger.exception("OpenAI coordinator routing failed; heuristic fallback used")
+        return fallback
+    return routed or fallback
+
+
+def _coordinator_session_decision_lines(data: dict) -> list[str]:
+    day = data["day"]
+    assessment = data["assessment"]
+    status = assessment["status"]
+    game_hours = float(day.get("game_hours") or 0.0)
+    sleep_quality = assessment.get("sleep_quality")
+
+    lines: list[str] = []
+    if game_hours > 0:
+        lines.append("По плану сегодня онлайн-игра.")
+    else:
+        lines.append("По плану сегодня онлайн-игры нет.")
+
+    if sleep_quality is not None:
+        lines.append(
+            "Качество сна — "
+            f"{_format_score_10(float(sleep_quality))}/10."
+        )
+
+    if status == "GREEN":
+        finish = _add_hours_to_clock(ONLINE_GAME_START, game_hours)
+        lines.append(
+            "Игровая сессия разрешена. "
+            f"Сегодня играем {ONLINE_GAME_START}–{finish}. 🟢"
+        )
+    elif status == "YELLOW":
+        allowed = float(assessment.get("allowed_hours") or 0.0)
+        finish = _add_hours_to_clock(ONLINE_GAME_START, allowed)
+        lines.append(
+            "Игровая сессия разрешена в сокращённом формате: "
+            f"{ONLINE_GAME_START}–{finish}. 🟡"
+        )
+    elif status == "RED":
+        lines.append("Сегодня онлайн-сессию отменяем. 🔴")
+    elif status == "NO_GAME":
+        lines.append("Дополнительное решение по игровой сессии не требуется.")
+    else:
+        reason = assessment.get("reasons", ["не хватает данных"])[0]
+        lines.append(f"Решение по сессии не принято: {reason}.")
+    return lines
+
+
+def _coordinator_day_plan_message(data: dict) -> str:
+    assessment = data["assessment"]
+    full_plan = data["full_plan"]
+    lines = ["Андрей Николаевич, утренние данные проверены.", ""]
+    lines.extend(_coordinator_session_decision_lines(data))
+
+    if assessment["status"] == "INCOMPLETE":
+        return "\n".join(lines)[:4000]
+
+    lines.extend(["", "План на день"])
+    for item in full_plan["timeline"]:
+        start = _minutes_to_clock(item["start"])
+        if item["end"] is None:
+            lines.append(f"{start} — {item['label']}.")
+        else:
+            end = _minutes_to_clock(item["end"])
+            lines.append(f"{start}–{end} — {item['label']}.")
+
+    if full_plan.get("unscheduled_tasks"):
+        lines.extend([
+            "",
+            "Не вошли в день из-за отсутствия допустимого окна: "
+            + ", ".join(full_plan["unscheduled_tasks"])
+            + ".",
+        ])
+    return "\n".join(lines)[:4000]
+
+
+def _detect_meal_number(request_text: str) -> int | None:
+    normalized = _normalize_text(request_text)
+    mappings = (
+        (2, ("второй завтрак",)),
+        (1, ("завтрак", "первый прием пищи", "первый приём пищи")),
+        (3, ("перекус", "третий прием пищи", "третий приём пищи")),
+        (4, ("обед", "четвертый прием пищи", "четвёртый приём пищи")),
+        (5, ("пятый прием пищи", "пятый приём пищи")),
+        (6, ("ужин", "шестой прием пищи", "шестой приём пищи")),
+    )
+    for number, phrases in mappings:
+        if any(phrase in normalized for phrase in phrases):
+            return number
+    match = re.search(r"(?:при[её]м\s+пищи\s*)?№?\s*([1-6])", normalized)
+    return int(match.group(1)) if match else None
+
+
+def _coordinator_meal_message(data: dict, request_text: str) -> str:
+    number = _detect_meal_number(request_text)
+    if number is None:
+        return (
+            "Уточните конкретный приём пищи: завтрак, второй завтрак, "
+            "перекус, обед или ужин."
+        )
+    clock_text = data["sources"]["meal_times"].get(number)
+    if not clock_text:
+        return f"Время приёма пищи №{number} пока не определено."
+    label = _meal_label(
+        number,
+        meal_minutes=_clock_to_minutes(clock_text),
+        game_start=None,
+        game_end=None,
+    )
+    return (
+        f"{label.capitalize()} запланирован на {clock_text}.\n\n"
+        "Состав меню пока не выдаю: полноценный агент питания "
+        "подключается отдельным блоком №28."
+    )
+
+
+def _coordinator_system_status_message() -> str:
+    model_status = (
+        f"подключена модель {OPENAI_MODEL}"
+        if OPENAI_API_KEY and OPENAI_MODEL
+        else "используется безопасная маршрутизация по правилам"
+    )
+    return (
+        f"Координатор штаба {COORDINATOR_VERSION} работает.\n\n"
+        f"Маршрутизация: {model_status}.\n"
+        "Сейчас доступны: оценка игровой сессии, сборка плана дня, "
+        "чтение времени приёмов пищи и допущенных задач.\n"
+        "Не подключены полностью: агент фаз, меню питания, покерный агент "
+        "широкого профиля и финальный планировщик-исполнитель."
+    )
+
+
+def build_coordinator_result(route: dict, request_text: str) -> dict:
+    intent = route["intent"]
+    delegations: list[dict] = []
+
+    if intent == "SYSTEM_STATUS":
+        message = _coordinator_system_status_message()
+    elif intent == "SESSION_STATUS":
+        data = read_morning_day_plan_test_data()
+        delegations = [
+            {"module": "poker_manager_adapter", "status": "completed"},
+        ]
+        message = "\n".join(_coordinator_session_decision_lines(data))
+    elif intent in {"BUILD_DAY_PLAN", "MEAL_QUERY"}:
+        data = read_full_day_plan_test_data()
+        if intent == "BUILD_DAY_PLAN":
+            delegations = [
+                {"module": "poker_manager_adapter", "status": "completed"},
+                {"module": "nutrition_recovery_adapter", "status": "completed"},
+                {"module": "projects_tasks_adapter", "status": "completed"},
+                {"module": "planner_executor_adapter", "status": "completed"},
+            ]
+            message = _coordinator_day_plan_message(data)
+        else:
+            delegations = [
+                {
+                    "module": "nutrition_recovery_adapter",
+                    "status": "partial",
+                    "reason": "menu agent is block 28",
+                },
+            ]
+            message = _coordinator_meal_message(data, request_text)
+    else:
+        message = (
+            "Поручение принято и классифицировано координатором.\n\n"
+            "Автоматическое исполнение этой категории пока не подключено, "
+            "поэтому штаб не будет имитировать результат или менять таблицы. "
+            "Запрос остановлен до подключения соответствующего специалиста."
+        )
+
+    return {
+        "intent": intent,
+        "action_class": route["action_class"],
+        "route_source": route.get("source", "unknown"),
+        "specialists": route.get("specialists", []),
+        "delegations": delegations,
+        "message": message[:4000],
+    }
+
+
+def run_coordinator_request_once(
+    *,
+    request_text: str,
+    route: dict,
+    message_key: str,
+    chat_id: int,
+) -> dict:
+    payload = {
+        "request": request_text.strip(),
+        "route": route,
+        "chat_id": chat_id,
+        "coordinator_version": COORDINATOR_VERSION,
+    }
+    idempotency_key = f"coordinator:{message_key}"
+    object_id = f"COORD-{message_key}"
+
+    return execute_action_once(
+        idempotency_key=idempotency_key,
+        operation=COORDINATOR_OPERATION,
+        object_type="COORDINATOR_REQUEST",
+        object_id=object_id,
+        source=COORDINATOR_SOURCE,
+        target=f"Telegram chat {chat_id}",
+        payload=payload,
+        action_callable=lambda: build_coordinator_result(route, request_text),
+    )
 
 def prepare_full_day_plan_test(
     *,
@@ -3667,6 +4079,108 @@ async def dayplantest(
     )
 
 
+
+async def _process_coordinator_message(
+    update: Update,
+    request_text: str,
+    *,
+    forced_intent: str | None = None,
+) -> None:
+    if coordinator_lock.locked():
+        await update.effective_message.reply_text(
+            "Координатор уже обрабатывает предыдущий запрос."
+        )
+        return
+
+    async with coordinator_lock:
+        if forced_intent:
+            route = _coordinator_heuristic_route(request_text)
+            route["intent"] = forced_intent
+            route["action_class"] = "AUTO"
+            route["source"] = "forced_test"
+        else:
+            route = await classify_coordinator_request(request_text)
+
+        message_id = getattr(update.effective_message, "message_id", 0)
+        message_key = f"{update.effective_chat.id}:{message_id}"
+        try:
+            execution = await asyncio.to_thread(
+                run_coordinator_request_once,
+                request_text=request_text,
+                route=route,
+                message_key=message_key,
+                chat_id=update.effective_chat.id,
+            )
+        except Exception as exc:
+            logger.exception("Coordinator manager-agent request failed")
+            await update.effective_message.reply_text(
+                "Координатор не смог собрать ответ ❌\n"
+                f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+            )
+            return
+
+    if execution.get("blocked"):
+        entry = execution.get("entry", {})
+        result: dict = {}
+        raw_result = entry.get("result_json", "") if isinstance(entry, dict) else ""
+        if raw_result:
+            try:
+                parsed_result = json.loads(raw_result)
+            except json.JSONDecodeError:
+                parsed_result = {}
+            if isinstance(parsed_result, dict):
+                result = parsed_result
+        await update.effective_message.reply_text(
+            result.get("message")
+            or "Повторная обработка этого сообщения заблокирована."
+        )
+        return
+
+    await update.effective_message.reply_text(execution["result"]["message"])
+
+
+async def hqtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /hqtest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+    await _process_coordinator_message(
+        update,
+        "Составь план на день на основании текущих данных.",
+        forced_intent="BUILD_DAY_PLAN",
+    )
+
+
+async def hqstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    await update.effective_message.reply_text(
+        _coordinator_system_status_message()
+    )
+
+
+async def hq(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    request_text = " ".join(context.args).strip()
+    if not request_text:
+        await update.effective_message.reply_text(
+            "Формат: /hq составь план на день"
+        )
+        return
+    await _process_coordinator_message(update, request_text)
+
 async def fullplantest(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3870,10 +4384,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    text = update.effective_message.text or ""
-    await update.effective_message.reply_text(
-        f"Сообщение принято координатором:\n\n{text}"
-    )
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        return
+    await _process_coordinator_message(update, text)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -3909,6 +4423,9 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("journalstatus", journalstatus))
     telegram_app.add_handler(CommandHandler("dayplantest", dayplantest))
     telegram_app.add_handler(CommandHandler("fullplantest", fullplantest))
+    telegram_app.add_handler(CommandHandler("hq", hq))
+    telegram_app.add_handler(CommandHandler("hqtest", hqtest))
+    telegram_app.add_handler(CommandHandler("hqstatus", hqstatus))
     telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
