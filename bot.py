@@ -10,6 +10,7 @@ import gspread
 from aiohttp import web
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -42,6 +43,7 @@ TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
 write_test_lock = asyncio.Lock()
+event_test_lock = asyncio.Lock()
 
 WRITE_TEST_SHEET = "10_План_факт_дня"
 WRITE_TEST_CELL = "R504"
@@ -434,6 +436,218 @@ def read_calendar_and_conflicts(days: int = 7) -> dict:
     }
 
 
+
+
+def _calendar_marker_matches(
+    service,
+    marker: str,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[dict]:
+    response = service.events().list(
+        calendarId=GOOGLE_CALENDAR_ID,
+        timeMin=period_start.isoformat(),
+        timeMax=period_end.isoformat(),
+        singleEvents=True,
+        showDeleted=False,
+        maxResults=20,
+        privateExtendedProperty=f"mc3_test_marker={marker}",
+    ).execute()
+    return response.get("items", [])
+
+
+def run_calendar_event_write_test() -> dict:
+    """Create, read, update and delete one isolated calendar event."""
+    service = get_calendar_service()
+    calendar = service.calendars().get(
+        calendarId=GOOGLE_CALENDAR_ID,
+    ).execute()
+
+    now = datetime.now(MOSCOW_TZ)
+    original_start = (
+        now.replace(second=0, microsecond=0) + timedelta(minutes=15)
+    )
+    original_end = original_start + timedelta(minutes=15)
+    updated_start = original_start + timedelta(minutes=30)
+    updated_end = updated_start + timedelta(minutes=20)
+
+    marker = f"MC3-CAL-{now.strftime('%Y%m%d-%H%M%S-%f')}"
+    original_title = "MC3 BOT TEST — будет удалено"
+    updated_title = "MC3 BOT TEST — обновлено и будет удалено"
+    search_start = original_start - timedelta(days=1)
+    search_end = updated_end + timedelta(days=1)
+
+    event_id = ""
+    created_ok = False
+    duplicate_check_ok = False
+    updated_ok = False
+    deleted_ok = False
+
+    body = {
+        "summary": original_title,
+        "description": (
+            "Технический тест блока №23. "
+            "Событие создаётся, проверяется, изменяется и удаляется автоматически."
+        ),
+        "start": {
+            "dateTime": original_start.isoformat(),
+            "timeZone": "Europe/Moscow",
+        },
+        "end": {
+            "dateTime": original_end.isoformat(),
+            "timeZone": "Europe/Moscow",
+        },
+        # Тест не должен блокировать реальное расписание даже на несколько секунд.
+        "transparency": "transparent",
+        "reminders": {"useDefault": False},
+        "extendedProperties": {
+            "private": {
+                "mc3_test_marker": marker,
+                "mc3_purpose": "block_23_calendar_write_test",
+            }
+        },
+    }
+
+    try:
+        created = service.events().insert(
+            calendarId=GOOGLE_CALENDAR_ID,
+            body=body,
+            sendUpdates="none",
+        ).execute()
+        event_id = created.get("id", "")
+        if not event_id:
+            raise RuntimeError("Calendar API did not return an event ID.")
+
+        read_created = service.events().get(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id,
+        ).execute()
+        created_interval = _event_interval(read_created)
+        created_marker = (
+            read_created.get("extendedProperties", {})
+            .get("private", {})
+            .get("mc3_test_marker")
+        )
+        if (
+            read_created.get("summary") != original_title
+            or created_marker != marker
+            or created_interval["start"] != original_start
+            or created_interval["end"] != original_end
+        ):
+            raise RuntimeError("Created calendar event failed read-back check.")
+        created_ok = True
+
+        matches = _calendar_marker_matches(
+            service,
+            marker,
+            search_start,
+            search_end,
+        )
+        if len(matches) != 1 or matches[0].get("id") != event_id:
+            raise RuntimeError(
+                "Duplicate protection check failed after event creation."
+            )
+        duplicate_check_ok = True
+
+        patch_body = {
+            "summary": updated_title,
+            "start": {
+                "dateTime": updated_start.isoformat(),
+                "timeZone": "Europe/Moscow",
+            },
+            "end": {
+                "dateTime": updated_end.isoformat(),
+                "timeZone": "Europe/Moscow",
+            },
+        }
+        service.events().patch(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id,
+            body=patch_body,
+            sendUpdates="none",
+        ).execute()
+
+        read_updated = service.events().get(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id,
+        ).execute()
+        updated_interval = _event_interval(read_updated)
+        preserved_marker = (
+            read_updated.get("extendedProperties", {})
+            .get("private", {})
+            .get("mc3_test_marker")
+        )
+        if (
+            read_updated.get("summary") != updated_title
+            or preserved_marker != marker
+            or updated_interval["start"] != updated_start
+            or updated_interval["end"] != updated_end
+        ):
+            raise RuntimeError("Updated calendar event failed read-back check.")
+        updated_ok = True
+
+        service.events().delete(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id,
+            sendUpdates="none",
+        ).execute()
+
+        # A deleted event must no longer be readable as an active object.
+        try:
+            service.events().get(
+                calendarId=GOOGLE_CALENDAR_ID,
+                eventId=event_id,
+            ).execute()
+        except HttpError as exc:
+            if exc.resp.status not in (404, 410):
+                raise
+        else:
+            raise RuntimeError("Deleted calendar event is still readable.")
+
+        remaining = _calendar_marker_matches(
+            service,
+            marker,
+            search_start,
+            search_end,
+        )
+        if remaining:
+            raise RuntimeError("Test event or duplicate remained after cleanup.")
+        deleted_ok = True
+        event_id = ""
+
+    finally:
+        if event_id:
+            try:
+                service.events().delete(
+                    calendarId=GOOGLE_CALENDAR_ID,
+                    eventId=event_id,
+                    sendUpdates="none",
+                ).execute()
+            except HttpError as exc:
+                if exc.resp.status not in (404, 410):
+                    logger.exception(
+                        "Emergency cleanup of test calendar event failed"
+                    )
+            except Exception:
+                logger.exception(
+                    "Emergency cleanup of test calendar event failed"
+                )
+
+    if not all((created_ok, duplicate_check_ok, updated_ok, deleted_ok)):
+        raise RuntimeError("Calendar write test did not complete all checks.")
+
+    return {
+        "calendar_summary": calendar.get("summary") or GOOGLE_CALENDAR_ID,
+        "marker": marker,
+        "original_start": original_start,
+        "updated_start": updated_start,
+        "created_ok": created_ok,
+        "duplicate_check_ok": duplicate_check_ok,
+        "updated_ok": updated_ok,
+        "deleted_ok": deleted_ok,
+    }
+
+
 def _format_event_line(event: dict) -> str:
     if event["all_day"]:
         end_inclusive = event["end"] - timedelta(days=1)
@@ -740,6 +954,60 @@ async def calendartest(
         )
 
 
+
+
+async def eventtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /eventtest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    if event_test_lock.locked():
+        await update.effective_message.reply_text(
+            "Тест календарного события уже выполняется. "
+            "Подожди несколько секунд."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Создаю изолированное тестовое событие, "
+        "проверяю изменение и удаляю его…"
+    )
+
+    async with event_test_lock:
+        try:
+            result = await asyncio.to_thread(run_calendar_event_write_test)
+            await update.effective_message.reply_text(
+                "Создание и изменение событий работает ✅\n\n"
+                f"Календарь: {result['calendar_summary']}\n"
+                f"Первичное время: "
+                f"{result['original_start'].strftime('%d.%m.%Y %H:%M')}\n"
+                f"Изменённое время: "
+                f"{result['updated_start'].strftime('%d.%m.%Y %H:%M')}\n\n"
+                "Проверки:\n"
+                "• событие создано и прочитано обратно;\n"
+                "• обнаружен ровно один экземпляр;\n"
+                "• название и время изменены;\n"
+                "• изменения прочитаны обратно;\n"
+                "• событие удалено;\n"
+                "• тестовых дублей не осталось.\n\n"
+                "Реальные события календаря не изменены."
+            )
+        except Exception as exc:
+            logger.exception("Calendar event write test failed")
+            await update.effective_message.reply_text(
+                "Тест создания и изменения события не пройден ❌\n"
+                f"Ошибка: {type(exc).__name__}\n"
+                "Тестовое событие будет удалено аварийной очисткой, "
+                "если оно успело создаться."
+            )
+
+
 async def deliver_test_notification(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     key = data["key"]
@@ -932,6 +1200,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("readtest", readtest))
     telegram_app.add_handler(CommandHandler("writetest", writetest))
     telegram_app.add_handler(CommandHandler("calendartest", calendartest))
+    telegram_app.add_handler(CommandHandler("eventtest", eventtest))
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
