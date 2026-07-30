@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,6 +28,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TELEGRAM_USER_ID_RAW = os.environ.get("TELEGRAM_USER_ID")
@@ -44,6 +48,33 @@ scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
 write_test_lock = asyncio.Lock()
 event_test_lock = asyncio.Lock()
+scheduler_lock = asyncio.Lock()
+persistent_scheduled_keys: set[str] = set()
+
+SCHEDULER_SHEET = "15_Планировщик"
+SCHEDULER_HEADERS = [
+    "SCHED_ID",
+    "Тип",
+    "Статус",
+    "Плановое время ISO",
+    "Часовой пояс",
+    "Chat ID",
+    "Текст",
+    "DEDUP_KEY",
+    "Создано",
+    "Отправлено",
+    "Попытки",
+    "Последняя ошибка",
+    "Источник",
+    "Системная проверка",
+]
+SCHEDULER_STATUS_SCHEDULED = "SCHEDULED"
+SCHEDULER_STATUS_DELIVERING = "DELIVERING"
+SCHEDULER_STATUS_SENT = "SENT"
+SCHEDULER_STATUS_EXPIRED = "EXPIRED"
+SCHEDULER_STATUS_FAILED = "FAILED"
+SCHEDULER_STATUS_CANCELLED = "CANCELLED"
+SCHEDULER_RESTORE_GRACE_MINUTES = 15
 
 WRITE_TEST_SHEET = "10_План_факт_дня"
 WRITE_TEST_CELL = "R504"
@@ -269,6 +300,379 @@ def run_plan_fact_write_test() -> dict:
     }
 
 
+
+
+
+def ensure_scheduler_sheet():
+    spreadsheet = get_spreadsheet()
+    try:
+        worksheet = spreadsheet.worksheet(SCHEDULER_SHEET)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=SCHEDULER_SHEET,
+            rows=1000,
+            cols=len(SCHEDULER_HEADERS),
+        )
+        worksheet.update(
+            range_name=f"A1:N1",
+            values=[SCHEDULER_HEADERS],
+            value_input_option="RAW",
+        )
+        worksheet.freeze(rows=1)
+        worksheet.format(
+            "A1:N1",
+            {
+                "backgroundColor": {
+                    "red": 0.18,
+                    "green": 0.27,
+                    "blue": 0.40,
+                },
+                "textFormat": {
+                    "foregroundColor": {
+                        "red": 1,
+                        "green": 1,
+                        "blue": 1,
+                    },
+                    "bold": True,
+                },
+                "horizontalAlignment": "CENTER",
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
+            },
+        )
+        worksheet.format(
+            "A2:N1000",
+            {
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
+            },
+        )
+        logger.info("Scheduler sheet created: %s", SCHEDULER_SHEET)
+        return spreadsheet, worksheet
+
+    current_headers = worksheet.get(
+        "A1:N1",
+        value_render_option="FORMATTED_VALUE",
+    )
+    found = list(current_headers[0]) if current_headers else []
+    found += [""] * (len(SCHEDULER_HEADERS) - len(found))
+    if found[:len(SCHEDULER_HEADERS)] != SCHEDULER_HEADERS:
+        raise RuntimeError(
+            f"Scheduler sheet {SCHEDULER_SHEET} has unexpected headers."
+        )
+    return spreadsheet, worksheet
+
+
+def _scheduler_target_from_iso(raw: str) -> datetime:
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=MOSCOW_TZ)
+    return parsed.astimezone(MOSCOW_TZ)
+
+
+def _scheduler_dedup_key(
+    item_type: str,
+    chat_id: int,
+    target: datetime,
+    text: str,
+) -> str:
+    material = "|".join(
+        [
+            item_type.strip().upper(),
+            str(chat_id),
+            target.astimezone(MOSCOW_TZ).replace(microsecond=0).isoformat(),
+            text.strip(),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _scheduler_row_to_item(row_number: int, row: list[str]) -> dict:
+    padded = list(row) + [""] * (len(SCHEDULER_HEADERS) - len(row))
+    attempts_raw = padded[10].strip()
+    try:
+        attempts = int(attempts_raw) if attempts_raw else 0
+    except ValueError:
+        attempts = 0
+
+    return {
+        "row_number": row_number,
+        "sched_id": padded[0].strip(),
+        "item_type": padded[1].strip(),
+        "status": padded[2].strip(),
+        "target_iso": padded[3].strip(),
+        "timezone": padded[4].strip(),
+        "chat_id": padded[5].strip(),
+        "text": padded[6],
+        "dedup_key": padded[7].strip(),
+        "created_at": padded[8].strip(),
+        "sent_at": padded[9].strip(),
+        "attempts": attempts,
+        "last_error": padded[11],
+        "source": padded[12].strip(),
+        "system_check": padded[13].strip(),
+    }
+
+
+def read_scheduler_items() -> list[dict]:
+    _, worksheet = ensure_scheduler_sheet()
+    rows = worksheet.get(
+        "A2:N1000",
+        value_render_option="FORMATTED_VALUE",
+    )
+    items = []
+    for offset, row in enumerate(rows, start=2):
+        if not row or not str(row[0]).strip():
+            continue
+        items.append(_scheduler_row_to_item(offset, row))
+    return items
+
+
+def _write_scheduler_item_row(
+    worksheet,
+    row_number: int,
+    item: dict,
+) -> None:
+    values = [[
+        item["sched_id"],
+        item["item_type"],
+        item["status"],
+        item["target_iso"],
+        item["timezone"],
+        str(item["chat_id"]),
+        item["text"],
+        item["dedup_key"],
+        item["created_at"],
+        item["sent_at"],
+        str(item["attempts"]),
+        item["last_error"],
+        item["source"],
+        item["system_check"],
+    ]]
+    worksheet.update(
+        range_name=f"A{row_number}:N{row_number}",
+        values=values,
+        value_input_option="RAW",
+    )
+
+
+def create_persistent_scheduler_item(
+    *,
+    item_type: str,
+    chat_id: int,
+    target: datetime,
+    text: str,
+    source: str,
+) -> dict:
+    _, worksheet = ensure_scheduler_sheet()
+    target = target.astimezone(MOSCOW_TZ).replace(microsecond=0)
+    dedup_key = _scheduler_dedup_key(
+        item_type,
+        chat_id,
+        target,
+        text,
+    )
+
+    existing_items = read_scheduler_items()
+    for existing in existing_items:
+        if existing["dedup_key"] != dedup_key:
+            continue
+        if existing["status"] in {
+            SCHEDULER_STATUS_SCHEDULED,
+            SCHEDULER_STATUS_DELIVERING,
+            SCHEDULER_STATUS_SENT,
+        }:
+            return {
+                "created": False,
+                "item": existing,
+            }
+
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    sched_id = (
+        f"SCH-{now.strftime('%Y%m%d-%H%M%S')}-"
+        f"{uuid.uuid4().hex[:8].upper()}"
+    )
+    item = {
+        "sched_id": sched_id,
+        "item_type": item_type.strip().upper(),
+        "status": SCHEDULER_STATUS_SCHEDULED,
+        "target_iso": target.isoformat(),
+        "timezone": "Europe/Moscow",
+        "chat_id": str(chat_id),
+        "text": text.strip(),
+        "dedup_key": dedup_key,
+        "created_at": now.isoformat(),
+        "sent_at": "",
+        "attempts": 0,
+        "last_error": "",
+        "source": source,
+        "system_check": "PERSISTED",
+    }
+    worksheet.append_row(
+        [
+            item["sched_id"],
+            item["item_type"],
+            item["status"],
+            item["target_iso"],
+            item["timezone"],
+            item["chat_id"],
+            item["text"],
+            item["dedup_key"],
+            item["created_at"],
+            item["sent_at"],
+            str(item["attempts"]),
+            item["last_error"],
+            item["source"],
+            item["system_check"],
+        ],
+        value_input_option="RAW",
+    )
+    created_item = next(
+        (
+            candidate
+            for candidate in read_scheduler_items()
+            if candidate["sched_id"] == sched_id
+        ),
+        None,
+    )
+    if created_item is None:
+        raise RuntimeError("Persistent scheduler row failed read-back check.")
+    return {
+        "created": True,
+        "item": created_item,
+    }
+
+
+def update_scheduler_item(
+    sched_id: str,
+    *,
+    status: str | None = None,
+    sent_at: str | None = None,
+    attempts: int | None = None,
+    last_error: str | None = None,
+    system_check: str | None = None,
+) -> dict:
+    _, worksheet = ensure_scheduler_sheet()
+    item = next(
+        (
+            candidate
+            for candidate in read_scheduler_items()
+            if candidate["sched_id"] == sched_id
+        ),
+        None,
+    )
+    if item is None:
+        raise LookupError(f"Scheduler item {sched_id} was not found.")
+
+    if status is not None:
+        item["status"] = status
+    if sent_at is not None:
+        item["sent_at"] = sent_at
+    if attempts is not None:
+        item["attempts"] = attempts
+    if last_error is not None:
+        item["last_error"] = last_error
+    if system_check is not None:
+        item["system_check"] = system_check
+
+    _write_scheduler_item_row(
+        worksheet,
+        item["row_number"],
+        item,
+    )
+    return item
+
+
+def claim_scheduler_item(sched_id: str) -> dict | None:
+    item = next(
+        (
+            candidate
+            for candidate in read_scheduler_items()
+            if candidate["sched_id"] == sched_id
+        ),
+        None,
+    )
+    if item is None:
+        raise LookupError(f"Scheduler item {sched_id} was not found.")
+
+    if item["status"] != SCHEDULER_STATUS_SCHEDULED:
+        return None
+
+    claimed = update_scheduler_item(
+        sched_id,
+        status=SCHEDULER_STATUS_DELIVERING,
+        attempts=item["attempts"] + 1,
+        last_error="",
+        system_check="CLAIMED",
+    )
+    if claimed["status"] != SCHEDULER_STATUS_DELIVERING:
+        raise RuntimeError("Scheduler item claim verification failed.")
+    return claimed
+
+
+def prepare_scheduler_restore() -> dict:
+    now = datetime.now(MOSCOW_TZ)
+    future_items: list[dict] = []
+    expired_ids: list[str] = []
+    stale_delivering_ids: list[str] = []
+
+    for item in read_scheduler_items():
+        if item["status"] == SCHEDULER_STATUS_SCHEDULED:
+            try:
+                target = _scheduler_target_from_iso(item["target_iso"])
+            except (TypeError, ValueError):
+                update_scheduler_item(
+                    item["sched_id"],
+                    status=SCHEDULER_STATUS_FAILED,
+                    last_error="Invalid target ISO datetime.",
+                    system_check="INVALID_TIME",
+                )
+                continue
+
+            overdue = now - target
+            if target > now:
+                item["target"] = target
+                future_items.append(item)
+            elif overdue <= timedelta(
+                minutes=SCHEDULER_RESTORE_GRACE_MINUTES
+            ):
+                item["target"] = now + timedelta(seconds=5)
+                item["restored_late"] = True
+                future_items.append(item)
+            else:
+                expired_ids.append(item["sched_id"])
+
+        elif item["status"] == SCHEDULER_STATUS_DELIVERING:
+            try:
+                created = _scheduler_target_from_iso(item["created_at"])
+            except (TypeError, ValueError):
+                created = now - timedelta(hours=1)
+            if now - created > timedelta(minutes=10):
+                stale_delivering_ids.append(item["sched_id"])
+
+    for sched_id in expired_ids:
+        update_scheduler_item(
+            sched_id,
+            status=SCHEDULER_STATUS_EXPIRED,
+            last_error="Planned time passed outside restore grace window.",
+            system_check="EXPIRED_ON_RESTORE",
+        )
+
+    for sched_id in stale_delivering_ids:
+        update_scheduler_item(
+            sched_id,
+            status=SCHEDULER_STATUS_FAILED,
+            last_error=(
+                "Delivery state was interrupted; automatic resend blocked."
+            ),
+            system_check="AT_MOST_ONCE_BLOCK",
+        )
+
+    return {
+        "items": future_items,
+        "expired": len(expired_ids),
+        "stale_delivering": len(stale_delivering_ids),
+    }
 
 
 def get_calendar_service():
@@ -1013,6 +1417,271 @@ async def eventtest(
             )
 
 
+
+def schedule_persistent_item(application: Application, item: dict) -> bool:
+    dedup_key = item["dedup_key"]
+    existing_jobs = application.job_queue.get_jobs_by_name(dedup_key)
+    if existing_jobs:
+        persistent_scheduled_keys.add(dedup_key)
+        return False
+
+    target = item.get("target")
+    if target is None:
+        target = _scheduler_target_from_iso(item["target_iso"])
+
+    application.job_queue.run_once(
+        deliver_persistent_scheduler_item,
+        when=target,
+        data={
+            "sched_id": item["sched_id"],
+            "dedup_key": dedup_key,
+            "chat_id": int(item["chat_id"]),
+            "text": item["text"],
+            "item_type": item["item_type"],
+            "planned_time": item["target_iso"],
+        },
+        name=dedup_key,
+        chat_id=int(item["chat_id"]),
+    )
+    persistent_scheduled_keys.add(dedup_key)
+    return True
+
+
+async def restore_persistent_scheduler(application: Application) -> dict:
+    prepared = await asyncio.to_thread(prepare_scheduler_restore)
+    restored = 0
+    already_present = 0
+
+    for item in prepared["items"]:
+        if schedule_persistent_item(application, item):
+            restored += 1
+        else:
+            already_present += 1
+
+    result = {
+        "restored": restored,
+        "already_present": already_present,
+        "expired": prepared["expired"],
+        "stale_delivering": prepared["stale_delivering"],
+    }
+    logger.info("Persistent scheduler restore: %s", result)
+    return result
+
+
+async def deliver_persistent_scheduler_item(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    data = context.job.data
+    sched_id = data["sched_id"]
+    dedup_key = data["dedup_key"]
+
+    async with scheduler_lock:
+        try:
+            claimed = await asyncio.to_thread(
+                claim_scheduler_item,
+                sched_id,
+            )
+        except Exception:
+            logger.exception(
+                "Persistent scheduler claim failed: %s",
+                sched_id,
+            )
+            persistent_scheduled_keys.discard(dedup_key)
+            return
+
+        if claimed is None:
+            logger.warning(
+                "Persistent scheduler duplicate delivery blocked: %s",
+                sched_id,
+            )
+            persistent_scheduled_keys.discard(dedup_key)
+            return
+
+    try:
+        await context.bot.send_message(
+            chat_id=data["chat_id"],
+            text=data["text"],
+        )
+    except Exception as exc:
+        logger.exception(
+            "Persistent scheduler delivery failed: %s",
+            sched_id,
+        )
+        await asyncio.to_thread(
+            update_scheduler_item,
+            sched_id,
+            status=SCHEDULER_STATUS_FAILED,
+            last_error=f"{type(exc).__name__}: {str(exc)[:300]}",
+            system_check="DELIVERY_FAILED",
+        )
+    else:
+        sent_at = datetime.now(MOSCOW_TZ).replace(
+            microsecond=0
+        ).isoformat()
+        await asyncio.to_thread(
+            update_scheduler_item,
+            sched_id,
+            status=SCHEDULER_STATUS_SENT,
+            sent_at=sent_at,
+            last_error="",
+            system_check="DELIVERED_ONCE",
+        )
+        logger.info(
+            "Persistent scheduler item delivered: %s",
+            sched_id,
+        )
+    finally:
+        persistent_scheduled_keys.discard(dedup_key)
+
+
+async def schedulertest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /schedulertest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    if len(context.args) != 1 or not TIME_PATTERN.fullmatch(context.args[0]):
+        await update.effective_message.reply_text(
+            "Укажи время по Москве в формате:\n"
+            "/schedulertest 13:20"
+        )
+        return
+
+    requested_time = context.args[0]
+    hour, minute = map(int, requested_time.split(":"))
+    now = datetime.now(MOSCOW_TZ)
+    target = now.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+    if target <= now:
+        await update.effective_message.reply_text(
+            f"Время {requested_time} по Москве уже прошло.\n"
+            "Выбери время минимум на несколько минут вперёд."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    message = (
+        "📥 Тестовый запрос данных\n\n"
+        f"Плановое время: {requested_time} по Москве.\n"
+        "Планировщик сохранил задание в Google Sheets, "
+        "восстановил его после запуска и доставил один раз ✅"
+    )
+
+    async with scheduler_lock:
+        try:
+            result = await asyncio.to_thread(
+                create_persistent_scheduler_item,
+                item_type="REQUEST",
+                chat_id=chat_id,
+                target=target,
+                text=message,
+                source="/schedulertest",
+            )
+            item = result["item"]
+
+            if item["status"] == SCHEDULER_STATUS_SCHEDULED:
+                scheduled_now = schedule_persistent_item(
+                    context.application,
+                    item,
+                )
+            else:
+                scheduled_now = False
+
+        except Exception as exc:
+            logger.exception("Persistent scheduler test setup failed")
+            await update.effective_message.reply_text(
+                "Не удалось сохранить плановое задание ❌\n"
+                f"Ошибка: {type(exc).__name__}"
+            )
+            return
+
+    if not result["created"]:
+        await update.effective_message.reply_text(
+            "Дубль планового задания заблокирован ✅\n\n"
+            f"ID: {item['sched_id']}\n"
+            f"Статус: {item['status']}\n"
+            f"Время: {requested_time} по Москве\n"
+            "Новая строка и второе уведомление не созданы."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Плановое задание сохранено ✅\n\n"
+        f"ID: {item['sched_id']}\n"
+        f"Вкладка: {SCHEDULER_SHEET}\n"
+        f"Тип: {item['item_type']}\n"
+        f"Статус: {item['status']}\n"
+        f"Время: {requested_time} по Москве\n"
+        f"Поставлено в очередь: {'да' if scheduled_now else 'уже было'}\n\n"
+        "Повтори ту же команду — дубль должен блокироваться.\n"
+        "После перезапуска Railway задание будет восстановлено "
+        "из таблицы автоматически."
+    )
+
+
+async def schedulerstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /schedulerstatus attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    try:
+        items = await asyncio.to_thread(read_scheduler_items)
+    except Exception as exc:
+        logger.exception("Scheduler status read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать планировщик ❌\n"
+            f"Ошибка: {type(exc).__name__}"
+        )
+        return
+
+    if not items:
+        await update.effective_message.reply_text(
+            "Планировщик пуст: заданий пока нет."
+        )
+        return
+
+    latest = items[-8:][::-1]
+    lines = [
+        "⏰ Последние задания планировщика",
+        "",
+    ]
+    for item in latest:
+        try:
+            target = _scheduler_target_from_iso(
+                item["target_iso"]
+            ).strftime("%d.%m %H:%M")
+        except (TypeError, ValueError):
+            target = item["target_iso"] or "—"
+        lines.append(
+            f"• {target} | {item['item_type']} | "
+            f"{item['status']} | {item['sched_id']}"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"В очереди процесса: {len(persistent_scheduled_keys)}",
+            f"Хранилище: {SCHEDULER_SHEET}",
+        ]
+    )
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def deliver_test_notification(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     key = data["key"]
@@ -1207,6 +1876,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("calendartest", calendartest))
     telegram_app.add_handler(CommandHandler("eventtest", eventtest))
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
+    telegram_app.add_handler(CommandHandler("schedulertest", schedulertest))
+    telegram_app.add_handler(CommandHandler("schedulerstatus", schedulerstatus))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
         CallbackQueryHandler(
@@ -1223,6 +1894,7 @@ async def main() -> None:
     try:
         await telegram_app.initialize()
         await telegram_app.start()
+        await restore_persistent_scheduler(telegram_app)
         await telegram_app.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
