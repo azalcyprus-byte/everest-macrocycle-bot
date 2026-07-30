@@ -592,9 +592,11 @@ def run_calendar_event_write_test() -> dict:
             sendUpdates="none",
         ).execute()
 
-        # A deleted event must no longer be readable as an active object.
+        # После удаления Google Calendar может вернуть 404/410 либо
+        # оставить объект доступным только как cancelled. Оба варианта
+        # означают успешное удаление из активного календаря.
         try:
-            service.events().get(
+            deleted_event = service.events().get(
                 calendarId=GOOGLE_CALENDAR_ID,
                 eventId=event_id,
             ).execute()
@@ -602,7 +604,10 @@ def run_calendar_event_write_test() -> dict:
             if exc.resp.status not in (404, 410):
                 raise
         else:
-            raise RuntimeError("Deleted calendar event is still readable.")
+            if deleted_event.get("status") != "cancelled":
+                raise RuntimeError(
+                    "Deleted calendar event is still active."
+                )
 
         remaining = _calendar_marker_matches(
             service,
@@ -994,7 +999,7 @@ async def eventtest(
                 "• обнаружен ровно один экземпляр;\n"
                 "• название и время изменены;\n"
                 "• изменения прочитаны обратно;\n"
-                "• событие удалено;\n"
+                "• событие удалено из активного календаря;\n"
                 "• тестовых дублей не осталось.\n\n"
                 "Реальные события календаря не изменены."
             )
