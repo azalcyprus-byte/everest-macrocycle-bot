@@ -54,6 +54,7 @@ journal_test_lock = asyncio.Lock()
 scheduler_lock = asyncio.Lock()
 day_plan_test_lock = asyncio.Lock()
 full_plan_test_lock = asyncio.Lock()
+morning_test_lock = asyncio.Lock()
 coordinator_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
@@ -155,6 +156,13 @@ MORNING_ORCHESTRATOR_TICK_SECONDS = int(
 MORNING_SESSION_OPERATION = "MORNING_SESSION"
 MORNING_SESSION_OBJECT_TYPE = "MORNING_SESSION"
 MORNING_SESSION_SOURCE = "telegram:доброе утро"
+MORNING_TEST_OPERATION = "MORNING_ORCHESTRATOR_TEST"
+MORNING_TEST_SOURCE = "/morningtest"
+MORNING_TEST_STEP_SECONDS = int(
+    os.environ.get("MORNING_TEST_STEP_SECONDS", "5")
+)
+if MORNING_TEST_STEP_SECONDS <= 0:
+    raise RuntimeError("MORNING_TEST_STEP_SECONDS must be positive.")
 MORNING_TRIGGER_PATTERN = re.compile(r"\bдоброе\s+утро\b", re.IGNORECASE)
 MORNING_DEFER_PATTERN = re.compile(
     r"буду\s+готов(?:а)?\s+через\s+"
@@ -204,7 +212,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.2.1"
+COORDINATOR_VERSION = "v12.3"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -753,6 +761,86 @@ def _morning_reminder_key(
 
 def _morning_wish(target_date: date) -> str:
     return MORNING_WISHES[target_date.toordinal() % len(MORNING_WISHES)]
+
+
+def run_morning_orchestrator_self_check() -> dict:
+    """Validate the restored morning flow without changing real checklist data."""
+    urls = {
+        1: MORNING_FORM_URL,
+        2: MORNING_60_FORM_URL,
+        3: MORNING_90_FORM_URL,
+    }
+    checks = {
+        "forms_configured": _morning_form_urls_configured() == 3,
+        "responder_urls": all(
+            url.startswith("https://docs.google.com/forms/")
+            and url.endswith("/viewform")
+            for url in urls.values()
+        ),
+        "second_after_start": MORNING_SECOND_DELAY_MINUTES == 60,
+        "third_after_start": MORNING_THIRD_DELAY_MINUTES == 90,
+        "reminder_interval": MORNING_REMINDER_INTERVAL_MINUTES == 15,
+        "ready_delay": MORNING_READY_DELAY_MINUTES == 5,
+    }
+
+    base = datetime(2026, 7, 31, 4, 0, tzinfo=MOSCOW_TZ)
+    checks["reminder_bucket_due"] = (
+        _morning_reminder_bucket(now=base, first_due=base) == 0
+    )
+    checks["reminder_bucket_next"] = (
+        _morning_reminder_bucket(
+            now=base + timedelta(minutes=15),
+            first_due=base,
+        )
+        == 1
+    )
+    checks["reminder_not_early"] = (
+        _morning_reminder_bucket(
+            now=base - timedelta(seconds=1),
+            first_due=base,
+        )
+        is None
+    )
+
+    fake_snapshot = {
+        "state": {"filled": {1: False, 2: False, 3: False}},
+        "second_due_at": base + timedelta(minutes=60),
+        "third_due_at": base + timedelta(minutes=90),
+    }
+    checks["first_is_initial"] = (
+        _morning_next_due_checklist(fake_snapshot, base) == 1
+    )
+    fake_snapshot["state"]["filled"][1] = True
+    checks["second_not_early"] = (
+        _morning_next_due_checklist(
+            fake_snapshot,
+            base + timedelta(minutes=59),
+        )
+        is None
+    )
+    checks["second_at_due"] = (
+        _morning_next_due_checklist(
+            fake_snapshot,
+            base + timedelta(minutes=60),
+        )
+        == 2
+    )
+    fake_snapshot["state"]["filled"][2] = True
+    checks["third_at_due"] = (
+        _morning_next_due_checklist(
+            fake_snapshot,
+            base + timedelta(minutes=90),
+        )
+        == 3
+    )
+
+    failed = [name for name, passed in checks.items() if not passed]
+    return {
+        "passed": not failed,
+        "checks": checks,
+        "failed": failed,
+        "configured_forms": _morning_form_urls_configured(),
+    }
 
 
 def _record_value(record: dict[str, str], fragment: str) -> str:
@@ -2029,7 +2117,8 @@ def _coordinator_system_status_message() -> str:
         f"Маршрутизация: {model_status}.\n"
         f"Утро: {morning_status}.\n"
         "Сейчас доступны: запуск дня фразой «Доброе утро», контроль трёх "
-        "чек-листов и напоминаний, оценка игровой сессии, сборка плана дня "
+        "чек-листов и напоминаний, ускоренный тест /morningtest, "
+        "оценка игровой сессии, сборка плана дня "
         "с учётом текущего времени, чтение времени приёмов пищи и "
         "допущенных задач.\n"
         "Не подключены полностью: агент фаз, меню питания, покерный агент "
@@ -4843,6 +4932,229 @@ async def morning_orchestrator_tick(
             )
 
 
+def _morning_test_keyboard(checklist_number: int) -> InlineKeyboardMarkup:
+    url = _morning_form_url(checklist_number)
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(
+            f"🔗 Открыть форму {checklist_number}",
+            url=url,
+        )]]
+    )
+
+
+def _morning_test_jobs(application: Application, run_id: str):
+    prefix = f"morning-test:{run_id}:"
+    return [
+        job
+        for job in application.job_queue.jobs()
+        if (job.name or "").startswith(prefix)
+    ]
+
+
+async def deliver_morning_test_step(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    data = context.job.data
+    run_id = data["run_id"]
+    run = context.application.bot_data.get("morning_test_runs", {}).get(run_id)
+    if not run or run.get("cancelled"):
+        return
+
+    kind = data["kind"]
+    checklist_number = data.get("checklist_number")
+    chat_id = run["chat_id"]
+    if kind == "prompt":
+        text = (
+            f"🧪 Ускоренный тест: чек-лист №{checklist_number}.\n\n"
+            "Кнопка должна открыть реальную Google Form. "
+            "Тест не создаёт и не изменяет ответы формы."
+        )
+        markup = _morning_test_keyboard(checklist_number)
+    elif kind == "reminder":
+        text = (
+            f"🧪 Тестовое напоминание: чек-лист №{checklist_number} "
+            "ещё не подтверждён в изолированном сценарии.\n\n"
+            "В рабочем режиме такое напоминание повторяется каждые 15 минут "
+            "только пока соответствующей записи нет в таблице."
+        )
+        markup = _morning_test_keyboard(checklist_number)
+    else:
+        try:
+            actual_state = await asyncio.to_thread(read_morning_checklist_state)
+            self_check = await asyncio.to_thread(
+                run_morning_orchestrator_self_check
+            )
+            execution = await asyncio.to_thread(
+                execute_action_once,
+                idempotency_key=f"morning-test:{run_id}",
+                operation=MORNING_TEST_OPERATION,
+                object_type="MORNING_TEST",
+                object_id=f"MORNING-TEST-{run_id}",
+                source=MORNING_TEST_SOURCE,
+                target=str(chat_id),
+                payload={
+                    "run_id": run_id,
+                    "steps_delivered": list(run.get("delivered", [])),
+                    "actual_filled": actual_state["filled"],
+                    "self_check": self_check,
+                },
+                action_callable=lambda: {
+                    "passed": self_check["passed"],
+                    "configured_forms": self_check["configured_forms"],
+                    "actual_filled_count": sum(actual_state["filled"].values()),
+                    "messages_expected": 7,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Morning accelerated test finalization failed")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Ускоренный тест утреннего сценария завершился ошибкой ❌\n"
+                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                ),
+            )
+            run["completed"] = True
+            return
+
+        run["completed"] = True
+        passed = self_check["passed"]
+        text = (
+            "🧪 Ускоренный тест утреннего сценария завершён "
+            f"{'✅' if passed else '❌'}\n\n"
+            "Проверено:\n"
+            "• три реальные кнопки Google Forms;\n"
+            "• последовательность 1 → 2 → 3;\n"
+            "• отдельное напоминание по каждому чек-листу;\n"
+            "• расчёт +60/+90 минут и интервала 15 минут;\n"
+            "• готовность через 5 минут после последней записи;\n"
+            "• изоляция от рабочих ответов форм.\n\n"
+            f"Формы настроены: {self_check['configured_forms']}/3.\n"
+            f"Сегодня реально найдено записей: "
+            f"{sum(actual_state['filled'].values())}/3.\n"
+            f"ACTION_ID: {execution['entry']['action_id']}\n\n"
+            "Проверьте, что все семь тестовых сообщений пришли и каждая "
+            "кнопка открывает нужную форму."
+        )
+        markup = None
+
+    run.setdefault("delivered", []).append(kind + (str(checklist_number) if checklist_number else ""))
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=markup,
+    )
+
+
+async def morningtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+
+    command = context.args[0].lower() if context.args else "start"
+    runs = context.application.bot_data.setdefault("morning_test_runs", {})
+    active = next(
+        (
+            (run_id, run)
+            for run_id, run in runs.items()
+            if run.get("chat_id") == update.effective_chat.id
+            and not run.get("completed")
+            and not run.get("cancelled")
+        ),
+        None,
+    )
+
+    if command == "status":
+        if active is None:
+            await update.effective_message.reply_text(
+                "Активного ускоренного утреннего теста нет."
+            )
+            return
+        run_id, run = active
+        await update.effective_message.reply_text(
+            "Ускоренный утренний тест выполняется.\n\n"
+            f"RUN_ID: {run_id}\n"
+            f"Доставлено этапов: {len(run.get('delivered', []))}/7."
+        )
+        return
+
+    if command == "cancel":
+        if active is None:
+            await update.effective_message.reply_text(
+                "Активного теста для отмены нет."
+            )
+            return
+        run_id, run = active
+        run["cancelled"] = True
+        for job in _morning_test_jobs(context.application, run_id):
+            job.schedule_removal()
+        await update.effective_message.reply_text(
+            f"Ускоренный утренний тест {run_id} отменён."
+        )
+        return
+
+    if command != "start":
+        await update.effective_message.reply_text(
+            "Формат: /morningtest\n"
+            "/morningtest status\n"
+            "/morningtest cancel"
+        )
+        return
+
+    if active is not None:
+        await update.effective_message.reply_text(
+            "Ускоренный утренний тест уже выполняется. "
+            "Статус: /morningtest status"
+        )
+        return
+    if _morning_form_urls_configured() != 3:
+        await update.effective_message.reply_text(
+            "Тест не запущен: настроены не все три ссылки Google Forms."
+        )
+        return
+
+    async with morning_test_lock:
+        run_id = uuid.uuid4().hex[:8]
+        runs[run_id] = {
+            "chat_id": update.effective_chat.id,
+            "started_at": datetime.now(MOSCOW_TZ).isoformat(),
+            "delivered": [],
+            "completed": False,
+            "cancelled": False,
+        }
+        await update.effective_message.reply_text(
+            "Запускаю изолированный ускоренный тест утреннего сценария.\n\n"
+            f"RUN_ID: {run_id}\n"
+            f"Продолжительность: около {MORNING_TEST_STEP_SECONDS * 6} секунд.\n"
+            "Придут три кнопки форм, три тестовых напоминания и итог. "
+            "Рабочие чек-листы и сегодняшняя утренняя сессия не изменяются."
+        )
+
+        steps = (
+            (0, "prompt", 1),
+            (1, "reminder", 1),
+            (2, "prompt", 2),
+            (3, "reminder", 2),
+            (4, "prompt", 3),
+            (5, "reminder", 3),
+            (6, "ready", None),
+        )
+        for multiplier, kind, checklist_number in steps:
+            context.job_queue.run_once(
+                deliver_morning_test_step,
+                when=max(1, multiplier * MORNING_TEST_STEP_SECONDS),
+                data={
+                    "run_id": run_id,
+                    "kind": kind,
+                    "checklist_number": checklist_number,
+                },
+                name=f"morning-test:{run_id}:{multiplier}:{kind}",
+                chat_id=update.effective_chat.id,
+            )
+
+
 async def start_or_continue_morning_session(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -5378,6 +5690,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("hqstatus", hqstatus))
     telegram_app.add_handler(CommandHandler("morningstatus", morningstatus))
     telegram_app.add_handler(CommandHandler("morningcheck", morningcheck))
+    telegram_app.add_handler(CommandHandler("morningtest", morningtest))
     telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
