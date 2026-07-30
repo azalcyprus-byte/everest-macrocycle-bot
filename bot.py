@@ -3,12 +3,13 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
 from aiohttp import web
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -29,6 +30,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TELEGRAM_USER_ID_RAW = os.environ.get("TELEGRAM_USER_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_CALENDAR_ID = os.environ.get(
+    "GOOGLE_CALENDAR_ID",
+    "azalcyprus@gmail.com",
+)
 PORT = int(os.environ.get("PORT", "8000"))
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -262,6 +267,244 @@ def run_plan_fact_write_test() -> dict:
     }
 
 
+
+
+def get_calendar_service():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing.")
+
+    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    credentials = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/calendar"],
+    )
+    return build(
+        "calendar",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+def _parse_calendar_boundary(raw: dict, *, is_end: bool = False) -> datetime:
+    date_time = raw.get("dateTime")
+    if date_time:
+        normalized = date_time.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=MOSCOW_TZ)
+        return parsed.astimezone(MOSCOW_TZ)
+
+    date_value = raw.get("date")
+    if not date_value:
+        raise ValueError("Calendar event boundary has no date or dateTime.")
+
+    parsed_date = date.fromisoformat(date_value)
+    # Для all-day событий Google передаёт конец как исключающую дату.
+    return datetime.combine(parsed_date, time.min, tzinfo=MOSCOW_TZ)
+
+
+def _event_interval(item: dict) -> dict:
+    start_raw = item.get("start", {})
+    end_raw = item.get("end", {})
+    start = _parse_calendar_boundary(start_raw)
+    end = _parse_calendar_boundary(end_raw, is_end=True)
+
+    if end <= start:
+        raise ValueError("Calendar event has an invalid time interval.")
+
+    return {
+        "id": item.get("id", ""),
+        "title": item.get("summary") or "Без названия",
+        "start": start,
+        "end": end,
+        "all_day": "date" in start_raw,
+        "transparent": item.get("transparency") == "transparent",
+        "status": item.get("status", "confirmed"),
+    }
+
+
+def _find_calendar_conflicts(events: list[dict]) -> list[tuple[dict, dict]]:
+    blocking = [
+        event
+        for event in events
+        if event["status"] != "cancelled" and not event["transparent"]
+    ]
+    blocking.sort(key=lambda event: (event["start"], event["end"]))
+
+    conflicts: list[tuple[dict, dict]] = []
+    for index, left in enumerate(blocking):
+        for right in blocking[index + 1:]:
+            if right["start"] >= left["end"]:
+                break
+            if left["start"] < right["end"] and right["start"] < left["end"]:
+                conflicts.append((left, right))
+    return conflicts
+
+
+def _conflict_engine_self_test() -> bool:
+    base = datetime(2026, 1, 1, 10, 0, tzinfo=MOSCOW_TZ)
+    first = {
+        "id": "self-1",
+        "title": "A",
+        "start": base,
+        "end": base + timedelta(hours=2),
+        "all_day": False,
+        "transparent": False,
+        "status": "confirmed",
+    }
+    second = {
+        "id": "self-2",
+        "title": "B",
+        "start": base + timedelta(hours=1),
+        "end": base + timedelta(hours=3),
+        "all_day": False,
+        "transparent": False,
+        "status": "confirmed",
+    }
+    third = {
+        "id": "self-3",
+        "title": "C",
+        "start": base + timedelta(hours=3),
+        "end": base + timedelta(hours=4),
+        "all_day": False,
+        "transparent": False,
+        "status": "confirmed",
+    }
+    return len(_find_calendar_conflicts([first, second, third])) == 1
+
+
+def read_calendar_and_conflicts(days: int = 7) -> dict:
+    if days < 1 or days > 30:
+        raise ValueError("Calendar test period must be between 1 and 30 days.")
+
+    service = get_calendar_service()
+    calendar = service.calendars().get(
+        calendarId=GOOGLE_CALENDAR_ID,
+    ).execute()
+
+    now = datetime.now(MOSCOW_TZ)
+    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    period_end = period_start + timedelta(days=days)
+
+    items: list[dict] = []
+    page_token = None
+    while True:
+        response = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=period_start.isoformat(),
+            timeMax=period_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=250,
+            pageToken=page_token,
+        ).execute()
+        items.extend(response.get("items", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    events: list[dict] = []
+    invalid_events = 0
+    for item in items:
+        if item.get("status") == "cancelled":
+            continue
+        try:
+            events.append(_event_interval(item))
+        except (TypeError, ValueError):
+            invalid_events += 1
+            logger.exception(
+                "Could not parse calendar event id=%s",
+                item.get("id"),
+            )
+
+    conflicts = _find_calendar_conflicts(events)
+    if not _conflict_engine_self_test():
+        raise RuntimeError("Calendar conflict engine self-test failed.")
+
+    return {
+        "calendar_summary": calendar.get("summary") or GOOGLE_CALENDAR_ID,
+        "calendar_id": GOOGLE_CALENDAR_ID,
+        "calendar_timezone": calendar.get("timeZone") or "не указана",
+        "period_start": period_start,
+        "period_end": period_end,
+        "events": events,
+        "conflicts": conflicts,
+        "invalid_events": invalid_events,
+    }
+
+
+def _format_event_line(event: dict) -> str:
+    if event["all_day"]:
+        end_inclusive = event["end"] - timedelta(days=1)
+        if event["start"].date() == end_inclusive.date():
+            period = event["start"].strftime("%d.%m, весь день")
+        else:
+            period = (
+                f"{event['start'].strftime('%d.%m')}–"
+                f"{end_inclusive.strftime('%d.%m')}, весь день"
+            )
+    else:
+        if event["start"].date() == event["end"].date():
+            period = (
+                f"{event['start'].strftime('%d.%m %H:%M')}–"
+                f"{event['end'].strftime('%H:%M')}"
+            )
+        else:
+            period = (
+                f"{event['start'].strftime('%d.%m %H:%M')}–"
+                f"{event['end'].strftime('%d.%m %H:%M')}"
+            )
+    return f"• {period} — {event['title']}"
+
+
+def _format_calendar_report(data: dict) -> str:
+    events = data["events"]
+    conflicts = data["conflicts"]
+    period_end_inclusive = data["period_end"] - timedelta(days=1)
+
+    lines = [
+        "Чтение Google Calendar работает ✅",
+        "",
+        f"Календарь: {data['calendar_summary']}",
+        f"Период: {data['period_start'].strftime('%d.%m.%Y')}–"
+        f"{period_end_inclusive.strftime('%d.%m.%Y')}",
+        f"Событий: {len(events)}",
+        f"Конфликтов: {len(conflicts)}",
+        "Механизм поиска пересечений: PASS ✅",
+    ]
+
+    if data["invalid_events"]:
+        lines.append(
+            f"Не удалось разобрать событий: {data['invalid_events']}"
+        )
+
+    lines.extend(["", "📅 Ближайшие события"])
+    if events:
+        for event in events[:15]:
+            lines.append(_format_event_line(event))
+        if len(events) > 15:
+            lines.append(f"…и ещё {len(events) - 15}")
+    else:
+        lines.append("• На выбранный период событий нет.")
+
+    lines.extend(["", "⚠️ Пересечения"])
+    if conflicts:
+        for left, right in conflicts[:10]:
+            lines.append(
+                f"• «{left['title']}» пересекается с «{right['title']}»"
+            )
+        if len(conflicts) > 10:
+            lines.append(f"…и ещё {len(conflicts) - 10}")
+    else:
+        lines.append("• Пересечений не найдено.")
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3850] + "\n…Ответ сокращён из-за лимита Telegram."
+    return text
+
+
 def test_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -450,6 +693,51 @@ async def writetest(
                 "Тест записи в план-факт не пройден ❌\n"
                 f"Ошибка: {type(exc).__name__}"
             )
+
+
+
+
+async def calendartest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /calendartest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    days = 7
+    if context.args:
+        if len(context.args) != 1 or not context.args[0].isdigit():
+            await update.effective_message.reply_text(
+                "Формат команды:\n/calendartest\n"
+                "или /calendartest 14"
+            )
+            return
+        days = int(context.args[0])
+        if days < 1 or days > 30:
+            await update.effective_message.reply_text(
+                "Период должен быть от 1 до 30 дней."
+            )
+            return
+
+    await update.effective_message.reply_text(
+        "Читаю календарь и проверяю пересечения…"
+    )
+
+    try:
+        data = await asyncio.to_thread(read_calendar_and_conflicts, days)
+        await update.effective_message.reply_text(
+            _format_calendar_report(data)
+        )
+    except Exception as exc:
+        logger.exception("Calendar read test failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать Google Calendar ❌\n"
+            f"Ошибка: {type(exc).__name__}"
+        )
 
 
 async def deliver_test_notification(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -643,6 +931,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
     telegram_app.add_handler(CommandHandler("writetest", writetest))
+    telegram_app.add_handler(CommandHandler("calendartest", calendartest))
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
