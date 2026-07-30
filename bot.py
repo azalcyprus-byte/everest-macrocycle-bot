@@ -114,11 +114,29 @@ MORNING_SHEET = "Утро"
 MORNING_60_SHEET = "Утро 60 мин"
 MORNING_90_SHEET = "Утро 90 мин"
 
+
+def _normalize_google_form_url(raw_url: str) -> str:
+    """Return a responder-facing Google Form URL safe for Telegram buttons."""
+    url = str(raw_url or "").strip()
+    if not url:
+        return ""
+    url = url.split("#", 1)[0]
+    if url.endswith("/formResponse"):
+        url = url[: -len("/formResponse")] + "/viewform"
+    return url
+
+
 # Restored morning checklist orchestrator. Form URLs are kept outside code
 # so bot updates cannot erase or expose them.
-MORNING_FORM_URL = os.environ.get("MORNING_FORM_URL", "").strip()
-MORNING_60_FORM_URL = os.environ.get("MORNING_60_FORM_URL", "").strip()
-MORNING_90_FORM_URL = os.environ.get("MORNING_90_FORM_URL", "").strip()
+MORNING_FORM_URL = _normalize_google_form_url(
+    os.environ.get("MORNING_FORM_URL", "")
+)
+MORNING_60_FORM_URL = _normalize_google_form_url(
+    os.environ.get("MORNING_60_FORM_URL", "")
+)
+MORNING_90_FORM_URL = _normalize_google_form_url(
+    os.environ.get("MORNING_90_FORM_URL", "")
+)
 MORNING_SECOND_DELAY_MINUTES = int(
     os.environ.get("MORNING_SECOND_DELAY_MINUTES", "60")
 )
@@ -186,7 +204,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.2"
+COORDINATOR_VERSION = "v12.2.1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
