@@ -36,6 +36,22 @@ TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
+write_test_lock = asyncio.Lock()
+
+WRITE_TEST_SHEET = "10_План_факт_дня"
+WRITE_TEST_CELL = "R504"
+WRITE_TEST_ROW_RANGE = "A504:Z504"
+FORMULA_COLUMN_INDEXES = {
+    "B": 1,
+    "C": 2,
+    "I": 8,
+    "L": 11,
+    "M": 12,
+    "N": 13,
+    "S": 18,
+    "Y": 24,
+    "Z": 25,
+}
 
 BUTTON_LABELS = {
     "view": "Посмотреть",
@@ -140,6 +156,110 @@ def read_current_working_data() -> dict:
 def display_value(value: str) -> str:
     value = str(value).strip()
     return value if value else "—"
+
+
+
+def _single_cell_value(rows: list[list[str]]) -> str:
+    if not rows or not rows[0]:
+        return ""
+    return str(rows[0][0])
+
+
+def _padded_row(rows: list[list[str]], width: int = 26) -> list[str]:
+    row = list(rows[0]) if rows else []
+    return row + [""] * (width - len(row))
+
+
+def _formula_snapshot(row: list[str]) -> dict[str, str]:
+    return {
+        column: str(row[index])
+        for column, index in FORMULA_COLUMN_INDEXES.items()
+    }
+
+
+def run_plan_fact_write_test() -> dict:
+    """Write, read back, clear and verify one reserved plan-fact cell."""
+    spreadsheet = get_spreadsheet()
+    worksheet = spreadsheet.worksheet(WRITE_TEST_SHEET)
+
+    original_cell = _single_cell_value(
+        worksheet.get(
+            WRITE_TEST_CELL,
+            value_render_option="FORMATTED_VALUE",
+        )
+    )
+    if original_cell.strip():
+        raise RuntimeError(
+            f"Reserved test cell {WRITE_TEST_SHEET}!{WRITE_TEST_CELL} "
+            "is not empty."
+        )
+
+    before_row = _padded_row(
+        worksheet.get(
+            WRITE_TEST_ROW_RANGE,
+            value_render_option="FORMULA",
+        )
+    )
+    formulas_before = _formula_snapshot(before_row)
+
+    timestamp = datetime.now(MOSCOW_TZ).strftime("%Y%m%d-%H%M%S")
+    marker = f"MC3-BOT-WRITE-TEST-{timestamp}"
+
+    try:
+        worksheet.update(
+            range_name=WRITE_TEST_CELL,
+            values=[[marker]],
+            value_input_option="RAW",
+        )
+
+        written_value = _single_cell_value(
+            worksheet.get(
+                WRITE_TEST_CELL,
+                value_render_option="FORMATTED_VALUE",
+            )
+        )
+        if written_value != marker:
+            raise RuntimeError("Read-back value does not match written value.")
+
+        after_write_row = _padded_row(
+            worksheet.get(
+                WRITE_TEST_ROW_RANGE,
+                value_render_option="FORMULA",
+            )
+        )
+        formulas_after_write = _formula_snapshot(after_write_row)
+        if formulas_after_write != formulas_before:
+            raise RuntimeError("Formula integrity check failed after writing.")
+
+    finally:
+        worksheet.batch_clear([WRITE_TEST_CELL])
+
+    cleared_value = _single_cell_value(
+        worksheet.get(
+            WRITE_TEST_CELL,
+            value_render_option="FORMATTED_VALUE",
+        )
+    )
+    if cleared_value.strip():
+        raise RuntimeError("Reserved test cell was not cleared.")
+
+    after_clear_row = _padded_row(
+        worksheet.get(
+            WRITE_TEST_ROW_RANGE,
+            value_render_option="FORMULA",
+        )
+    )
+    formulas_after_clear = _formula_snapshot(after_clear_row)
+    if formulas_after_clear != formulas_before:
+        raise RuntimeError("Formula integrity check failed after cleanup.")
+
+    return {
+        "spreadsheet_title": spreadsheet.title,
+        "sheet": WRITE_TEST_SHEET,
+        "cell": WRITE_TEST_CELL,
+        "marker": marker,
+        "formula_count": len(formulas_before),
+    }
 
 
 def test_keyboard() -> InlineKeyboardMarkup:
@@ -283,6 +403,53 @@ async def readtest(
             "Не удалось прочитать рабочие данные ❌\n"
             f"Ошибка: {type(exc).__name__}"
         )
+
+
+
+
+async def writetest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /writetest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    if write_test_lock.locked():
+        await update.effective_message.reply_text(
+            "Тест записи уже выполняется. Подожди несколько секунд."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Проверяю безопасную запись в план-факт…"
+    )
+
+    async with write_test_lock:
+        try:
+            result = await asyncio.to_thread(run_plan_fact_write_test)
+            await update.effective_message.reply_text(
+                "Запись в план-факт работает ✅\n\n"
+                f"Таблица: {result['spreadsheet_title']}\n"
+                f"Вкладка: {result['sheet']}\n"
+                f"Тестовая ячейка: {result['cell']}\n\n"
+                "Проверки:\n"
+                "• значение записано;\n"
+                "• значение прочитано обратно;\n"
+                f"• проверено формул: {result['formula_count']};\n"
+                "• тестовая запись удалена;\n"
+                "• формулы не изменились.\n\n"
+                "Рабочие данные и показатели дня не изменены."
+            )
+        except Exception as exc:
+            logger.exception("Plan-fact write test failed")
+            await update.effective_message.reply_text(
+                "Тест записи в план-факт не пройден ❌\n"
+                f"Ошибка: {type(exc).__name__}"
+            )
 
 
 async def deliver_test_notification(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,6 +642,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
+    telegram_app.add_handler(CommandHandler("writetest", writetest))
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
