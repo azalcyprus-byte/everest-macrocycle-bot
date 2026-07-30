@@ -81,6 +81,67 @@ def get_spreadsheet():
     return client.open_by_key(GOOGLE_SHEET_ID)
 
 
+def read_current_working_data() -> dict:
+    """Read concrete current data from the working spreadsheet."""
+    spreadsheet = get_spreadsheet()
+
+    panel_sheet = spreadsheet.worksheet("00_Панель")
+    panel_rows = panel_sheet.get(
+        "A4:B16",
+        value_render_option="FORMATTED_VALUE",
+    )
+    panel = {
+        row[0]: row[1] if len(row) > 1 else ""
+        for row in panel_rows
+        if row and row[0]
+    }
+
+    day_sheet = spreadsheet.worksheet("02_День")
+    day_rows = day_sheet.get(
+        "A4:N88",
+        value_render_option="FORMATTED_VALUE",
+    )
+
+    today_text = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    today_row = next(
+        (row for row in day_rows if row and row[0] == today_text),
+        None,
+    )
+
+    if today_row is None:
+        raise LookupError(
+            f"Today row {today_text} was not found in 02_День."
+        )
+
+    padded = list(today_row) + [""] * (14 - len(today_row))
+
+    return {
+        "spreadsheet_title": spreadsheet.title,
+        "panel": panel,
+        "day": {
+            "date": padded[0],
+            "day_of_week": padded[1],
+            "cycle_day": padded[2],
+            "week": padded[3],
+            "mesocycle": padded[4],
+            "phase": padded[5],
+            "day_type_plan": padded[6],
+            "day_type_fact": padded[7],
+            "total_load": padded[8],
+            "key_task": padded[9],
+            "game_plan": padded[10],
+            "game_fact": padded[11],
+            "study_plan": padded[12],
+            "study_fact": padded[13],
+        },
+    }
+
+
+def display_value(value: str) -> str:
+    value = str(value).strip()
+    return value if value else "—"
+
+
 def test_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -156,6 +217,70 @@ async def sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Google Sheets connection failed")
         await update.effective_message.reply_text(
             "Не удалось подключиться к Google Sheets ❌\n"
+            f"Ошибка: {type(exc).__name__}"
+        )
+
+
+
+
+async def readtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /readtest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Читаю рабочие данные из таблицы…"
+    )
+
+    try:
+        data = await asyncio.to_thread(read_current_working_data)
+        panel = data["panel"]
+        day = data["day"]
+
+        text = (
+            "Чтение рабочих данных успешно ✅\n\n"
+            f"Таблица: {data['spreadsheet_title']}\n"
+            "Источники: 00_Панель и 02_День\n\n"
+            "📍 Текущий контекст\n"
+            f"Дата: {display_value(day['date'])}\n"
+            f"День недели: {display_value(day['day_of_week'])}\n"
+            f"День макроцикла: {display_value(day['cycle_day'])}\n"
+            f"Неделя: {display_value(day['week'])}\n"
+            f"Мезоцикл: {display_value(day['mesocycle'])}\n"
+            f"Фаза: {display_value(day['phase'])}\n\n"
+            "📋 План и факт дня\n"
+            f"Day Type Plan: {display_value(day['day_type_plan'])}\n"
+            f"Day Type Fact: {display_value(day['day_type_fact'])}\n"
+            f"Ключевая задача: {display_value(day['key_task'])}\n"
+            f"Игра: план {display_value(day['game_plan'])} ч | "
+            f"факт {display_value(day['game_fact'])} ч\n"
+            f"Study: план {display_value(day['study_plan'])} ч | "
+            f"факт {display_value(day['study_fact'])} ч\n"
+            f"Общая фактическая нагрузка: "
+            f"{display_value(day['total_load'])} ч\n\n"
+            "📊 Панель\n"
+            f"Факт покера за макроцикл: "
+            f"{display_value(panel.get('Факт покера, ч', ''))} ч\n"
+            f"Цель: {display_value(panel.get('Цель, ч', ''))} ч\n"
+            f"Среднее за календарный день: "
+            f"{display_value(panel.get('Среднее/календарный день', ''))} ч\n"
+            f"Средний сон за 7 дней: "
+            f"{display_value(panel.get('Средний сон 7 дней', ''))} ч\n"
+            f"Overheat за 7 дней: "
+            f"{display_value(panel.get('Overheat 7 дней', ''))}"
+        )
+
+        await update.effective_message.reply_text(text)
+    except Exception as exc:
+        logger.exception("Working data read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать рабочие данные ❌\n"
             f"Ошибка: {type(exc).__name__}"
         )
 
@@ -349,6 +474,7 @@ async def main() -> None:
 
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
+    telegram_app.add_handler(CommandHandler("readtest", readtest))
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
