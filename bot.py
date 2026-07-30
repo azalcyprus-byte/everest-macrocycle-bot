@@ -132,7 +132,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.0"
+COORDINATOR_VERSION = "v12.1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -1372,12 +1372,22 @@ async def classify_coordinator_request(request_text: str) -> dict:
     return routed or fallback
 
 
-def _coordinator_session_decision_lines(data: dict) -> list[str]:
+def _coordinator_session_decision_lines(
+    data: dict,
+    *,
+    now: datetime | None = None,
+    time_aware: bool = True,
+) -> list[str]:
     day = data["day"]
     assessment = data["assessment"]
     status = assessment["status"]
     game_hours = float(day.get("game_hours") or 0.0)
     sleep_quality = assessment.get("sleep_quality")
+
+    current = now or datetime.now(MOSCOW_TZ)
+    plan_date = data.get("date")
+    current_minutes = current.hour * 60 + current.minute
+    game_start_minutes = _clock_to_minutes(ONLINE_GAME_START)
 
     lines: list[str] = []
     if game_hours > 0:
@@ -1391,19 +1401,58 @@ def _coordinator_session_decision_lines(data: dict) -> list[str]:
             f"{_format_score_10(float(sleep_quality))}/10."
         )
 
-    if status == "GREEN":
-        finish = _add_hours_to_clock(ONLINE_GAME_START, game_hours)
-        lines.append(
-            "Игровая сессия разрешена. "
-            f"Сегодня играем {ONLINE_GAME_START}–{finish}. 🟢"
+    if status in {"GREEN", "YELLOW"}:
+        allowed = (
+            game_hours
+            if status == "GREEN"
+            else float(assessment.get("allowed_hours") or 0.0)
         )
-    elif status == "YELLOW":
-        allowed = float(assessment.get("allowed_hours") or 0.0)
         finish = _add_hours_to_clock(ONLINE_GAME_START, allowed)
-        lines.append(
-            "Игровая сессия разрешена в сокращённом формате: "
-            f"{ONLINE_GAME_START}–{finish}. 🟡"
-        )
+        game_end_minutes = _clock_to_minutes(finish)
+        same_day = isinstance(plan_date, date) and plan_date == current.date()
+
+        if time_aware and same_day and current_minutes >= game_end_minutes:
+            lines.append(
+                f"Игровое окно {ONLINE_GAME_START}–{finish} уже завершилось."
+            )
+            if status == "GREEN":
+                lines.append(
+                    "Утреннее решение: полная сессия, зелёный свет. 🟢"
+                )
+            else:
+                lines.append(
+                    "Утреннее решение: сокращённая сессия, "
+                    "жёлтый свет. 🟡"
+                )
+            lines.append(
+                "Факт сессии не подтверждён — выполненной её не отмечаю."
+            )
+        elif (
+            time_aware
+            and same_day
+            and game_start_minutes <= current_minutes < game_end_minutes
+        ):
+            if status == "GREEN":
+                decision_text = "полная сессия, зелёный свет 🟢"
+            else:
+                decision_text = "сокращённая сессия, жёлтый свет 🟡"
+            lines.append(
+                f"Игровое окно уже идёт и запланировано до {finish}."
+            )
+            lines.append(f"Утреннее решение: {decision_text}.")
+            lines.append(
+                "Текущий факт выполнения пока не подтверждён."
+            )
+        elif status == "GREEN":
+            lines.append(
+                "Игровая сессия разрешена. "
+                f"Сегодня играем {ONLINE_GAME_START}–{finish}. 🟢"
+            )
+        else:
+            lines.append(
+                "Игровая сессия разрешена в сокращённом формате: "
+                f"{ONLINE_GAME_START}–{finish}. 🟡"
+            )
     elif status == "RED":
         lines.append("Сегодня онлайн-сессию отменяем. 🔴")
     elif status == "NO_GAME":
@@ -1414,23 +1463,105 @@ def _coordinator_session_decision_lines(data: dict) -> list[str]:
     return lines
 
 
-def _coordinator_day_plan_message(data: dict) -> str:
+def _coordinator_full_plan_requested(request_text: str) -> bool:
+    normalized = _normalize_text(request_text)
+    return any(
+        phrase in normalized
+        for phrase in (
+            "весь план",
+            "полный план",
+            "план целиком",
+            "изначальный план",
+            "покажи прошедшие",
+        )
+    )
+
+
+def _coordinator_day_plan_message(
+    data: dict,
+    request_text: str = "",
+    *,
+    now: datetime | None = None,
+) -> str:
     assessment = data["assessment"]
     full_plan = data["full_plan"]
-    lines = ["Андрей Николаевич, утренние данные проверены.", ""]
-    lines.extend(_coordinator_session_decision_lines(data))
+    current = now or datetime.now(MOSCOW_TZ)
+    plan_date = data.get("date")
+    same_day = isinstance(plan_date, date) and plan_date == current.date()
+    current_minutes = current.hour * 60 + current.minute
+    show_full = _coordinator_full_plan_requested(request_text)
+
+    intro = (
+        "Андрей Николаевич, утренние данные проверены."
+        if same_day and current_minutes < _clock_to_minutes(ONLINE_GAME_START)
+        else "Андрей Николаевич, данные дня проверены."
+    )
+    lines = [intro, ""]
+    lines.extend(
+        _coordinator_session_decision_lines(
+            data,
+            now=current,
+            time_aware=True,
+        )
+    )
 
     if assessment["status"] == "INCOMPLETE":
         return "\n".join(lines)[:4000]
 
-    lines.extend(["", "План на день"])
-    for item in full_plan["timeline"]:
-        start = _minutes_to_clock(item["start"])
-        if item["end"] is None:
-            lines.append(f"{start} — {item['label']}.")
-        else:
-            end = _minutes_to_clock(item["end"])
-            lines.append(f"{start}–{end} — {item['label']}.")
+    timeline = full_plan["timeline"]
+    rendered: list[tuple[dict, str]] = []
+    past_count = 0
+
+    if show_full or not same_day:
+        for item in timeline:
+            rendered.append((item, _minutes_to_clock(item["start"])))
+    else:
+        for item in timeline:
+            start = int(item["start"])
+            end = item["end"]
+            if end is None:
+                if start < current_minutes:
+                    past_count += 1
+                    continue
+                rendered.append((item, _minutes_to_clock(start)))
+                continue
+
+            end_minutes = int(end)
+            if end_minutes <= current_minutes:
+                past_count += 1
+                continue
+            display_start = (
+                "сейчас"
+                if start <= current_minutes < end_minutes
+                else _minutes_to_clock(start)
+            )
+            rendered.append((item, display_start))
+
+    lines.extend(["", "Полный план на день" if show_full else "План на оставшуюся часть дня"])
+    if same_day and not show_full:
+        lines.append(f"Сейчас {current.strftime('%H:%M')}.")
+
+    if rendered:
+        for item, display_start in rendered:
+            if item["end"] is None:
+                lines.append(f"{display_start} — {item['label']}.")
+            else:
+                end = _minutes_to_clock(item["end"])
+                if display_start == "сейчас":
+                    lines.append(f"Сейчас–{end} — {item['label']}.")
+                else:
+                    lines.append(f"{display_start}–{end} — {item['label']}.")
+    else:
+        lines.append(
+            "На оставшуюся часть дня запланированных блоков нет."
+        )
+
+    if past_count:
+        lines.extend([
+            "",
+            "Прошедшие блоки не отмечаю выполненными: "
+            "их факт пока не подтверждён.",
+        ])
 
     if full_plan.get("unscheduled_tasks"):
         lines.extend([
@@ -1491,7 +1622,7 @@ def _coordinator_system_status_message() -> str:
     return (
         f"Координатор штаба {COORDINATOR_VERSION} работает.\n\n"
         f"Маршрутизация: {model_status}.\n"
-        "Сейчас доступны: оценка игровой сессии, сборка плана дня, "
+        "Сейчас доступны: оценка игровой сессии, сборка плана дня с учётом текущего времени, "
         "чтение времени приёмов пищи и допущенных задач.\n"
         "Не подключены полностью: агент фаз, меню питания, покерный агент "
         "широкого профиля и финальный планировщик-исполнитель."
@@ -1519,7 +1650,7 @@ def build_coordinator_result(route: dict, request_text: str) -> dict:
                 {"module": "projects_tasks_adapter", "status": "completed"},
                 {"module": "planner_executor_adapter", "status": "completed"},
             ]
-            message = _coordinator_day_plan_message(data)
+            message = _coordinator_day_plan_message(data, request_text)
         else:
             delegations = [
                 {
