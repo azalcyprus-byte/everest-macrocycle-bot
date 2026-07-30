@@ -52,6 +52,7 @@ event_test_lock = asyncio.Lock()
 journal_test_lock = asyncio.Lock()
 scheduler_lock = asyncio.Lock()
 day_plan_test_lock = asyncio.Lock()
+full_plan_test_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
 SCHEDULER_SHEET = "15_Планировщик"
@@ -116,6 +117,14 @@ DAY_PLAN_TEST_ITEM_TYPE = "DAY_PLAN_TEST"
 DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS = int(
     os.environ.get("DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS", "10")
 )
+FULL_PLAN_TEST_SOURCE = "/fullplantest"
+FULL_PLAN_TEST_OPERATION = "FULL_DAY_PLAN_TEST"
+FULL_PLAN_TEST_ITEM_TYPE = "FULL_DAY_PLAN_TEST"
+FULL_PLAN_DAY_END = os.environ.get("FULL_PLAN_DAY_END", "20:10")
+STUDY_AFTER_GAME_GAP_MINUTES = int(
+    os.environ.get("STUDY_AFTER_GAME_GAP_MINUTES", "90")
+)
+MEAL_BLOCK_MINUTES = int(os.environ.get("MEAL_BLOCK_MINUTES", "20"))
 ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 SLEEP_QUALITY_RED_MAX = float(
     os.environ.get("SLEEP_QUALITY_RED_MAX", "3.0")
@@ -626,6 +635,7 @@ def read_morning_day_plan_test_data() -> dict:
         "date": target_date,
         "date_text": target_text,
         "day": {
+            "phase": padded[5].strip(),
             "day_type": padded[6].strip(),
             "key_task": padded[9].strip(),
             "game_hours": planned_game_hours,
@@ -718,6 +728,500 @@ def format_day_plan_test_message(data: dict) -> str:
     return text[:4000]
 
 
+
+def _clock_to_minutes(clock_text: str) -> int:
+    if not TIME_PATTERN.fullmatch(str(clock_text).strip()):
+        raise ValueError(f"Invalid clock value: {clock_text}")
+    hour, minute = map(int, str(clock_text).strip().split(":"))
+    return hour * 60 + minute
+
+
+def _minutes_to_clock(total_minutes: int) -> str:
+    total_minutes %= 24 * 60
+    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+
+def _duration_hours(start_minutes: int, end_minutes: int) -> float:
+    return max(0, end_minutes - start_minutes) / 60
+
+
+def _split_tokens(value: object) -> set[str]:
+    return {
+        _normalize_text(token)
+        for token in re.split(r"[;,]", str(value or ""))
+        if _normalize_text(token)
+    }
+
+
+def _task_allowed_for_day(
+    task: dict[str, str],
+    *,
+    day_type: str,
+    phase: str,
+) -> bool:
+    status = _normalize_text(task.get("Статус", ""))
+    admission = _normalize_text(task.get("Статус допуска", ""))
+    blocker = _normalize_text(task.get("Блокер", ""))
+    if status not in {"активна", "активен"}:
+        return False
+    if admission != "готово":
+        return False
+    if blocker:
+        return False
+
+    allowed_days = _split_tokens(task.get("Допустимые дни", ""))
+    if allowed_days and "все" not in allowed_days:
+        if _normalize_text(day_type) not in allowed_days:
+            return False
+
+    allowed_phases = _split_tokens(task.get("Допустимые фазы", ""))
+    if allowed_phases and "все" not in allowed_phases:
+        normalized_phase = _normalize_text(phase)
+        if not any(token in normalized_phase for token in allowed_phases):
+            return False
+    return True
+
+
+def _task_sort_key(task: dict[str, str]) -> tuple:
+    priority = _number(task.get("Приоритет", ""))
+    queue = _number(task.get("Очередь", ""))
+    urgency = _normalize_text(task.get("Срочность", ""))
+    urgency_rank = {"высокая": 0, "средняя": 1, "низкая": 2}.get(
+        urgency,
+        3,
+    )
+    return (
+        priority if priority is not None else 999,
+        urgency_rank,
+        queue if queue is not None else 999,
+        task.get("Task ID", ""),
+    )
+
+
+def _extract_meal_times_from_rows(
+    rows: list[dict[str, str]],
+    *,
+    target_date: date,
+    day_type: str,
+) -> dict[int, str]:
+    candidates: dict[date, dict[int, str]] = {}
+    pattern = re.compile(
+        r"(?:при[её]м\s+пищи\s*)?№\s*(\d+)\s*[—-]\s*"
+        r"((?:[01]\d|2[0-3]):[0-5]\d)",
+        re.IGNORECASE,
+    )
+    for row in rows:
+        row_date = _parse_date_value(row.get("Дата", ""))
+        if row_date is None or row_date >= target_date:
+            continue
+        if _normalize_text(row.get("Day Type Plan", "")) != _normalize_text(day_type):
+            continue
+        source_text = " ".join(
+            str(row.get(key, ""))
+            for key in (
+                "Блок / задача",
+                "Комментарий",
+                "Решение / перенос",
+            )
+        )
+        for meal_number, clock_text in pattern.findall(source_text):
+            candidates.setdefault(row_date, {})[int(meal_number)] = clock_text
+
+    for candidate_date in sorted(candidates, reverse=True):
+        meal_times = candidates[candidate_date]
+        if len(meal_times) >= 4:
+            return meal_times
+    return {}
+
+
+def _meal_label(
+    number: int,
+    *,
+    meal_minutes: int,
+    game_start: int | None,
+    game_end: int | None,
+) -> str:
+    if number == 1:
+        return "завтрак"
+    if number == 2:
+        return "второй завтрак"
+    if number == 3:
+        if game_start is not None and game_end is not None:
+            if game_start <= meal_minutes < game_end:
+                return "перекус во время игры"
+        return "перекус"
+    if number == 4:
+        if game_start is not None and game_end is not None:
+            if game_start <= meal_minutes < game_end:
+                return "обед во время игры"
+        return "обед"
+    if number == 5:
+        return "приём пищи"
+    if number == 6:
+        return "ужин"
+    return f"приём пищи №{number}"
+
+
+def _read_full_plan_sources(spreadsheet, base_data: dict) -> dict:
+    target_date = base_data["date"]
+    target_text = base_data["date_text"]
+    day_type = base_data["day"]["day_type"]
+    phase = base_data["day"].get("phase", "")
+
+    plan_values = spreadsheet.worksheet("10_План_факт_дня").get(
+        "A4:Z1000",
+        value_render_option="FORMATTED_VALUE",
+    )
+    plan_rows = _records_from_values(plan_values)
+    existing_rows = [
+        row
+        for row in plan_rows
+        if _parse_date_value(row.get("Дата", "")) == target_date
+    ]
+
+    task_values = spreadsheet.worksheet("05_Проекты_и_задачи").get(
+        "A3:AG1000",
+        value_render_option="FORMATTED_VALUE",
+    )
+    task_rows = _records_from_values(task_values)
+    ready_tasks = sorted(
+        (
+            task
+            for task in task_rows
+            if _task_allowed_for_day(
+                task,
+                day_type=day_type,
+                phase=phase,
+            )
+        ),
+        key=_task_sort_key,
+    )
+
+    meal_times = _extract_meal_times_from_rows(
+        plan_rows,
+        target_date=target_date,
+        day_type=day_type,
+    )
+    if not meal_times:
+        meal_times = {
+            1: "06:15",
+            2: "08:30",
+            3: "11:30",
+            4: "13:30",
+            5: "16:30",
+            6: "19:00",
+        }
+
+    return {
+        "target_text": target_text,
+        "existing_rows": existing_rows,
+        "ready_tasks": ready_tasks,
+        "meal_times": meal_times,
+    }
+
+
+def _append_timeline_item(
+    timeline: list[dict],
+    *,
+    start: int,
+    label: str,
+    end: int | None = None,
+    kind: str,
+    source_id: str = "",
+) -> None:
+    timeline.append({
+        "start": start,
+        "end": end,
+        "label": label,
+        "kind": kind,
+        "source_id": source_id,
+    })
+
+
+def _build_study_blocks(
+    *,
+    study_start: int,
+    study_minutes: int,
+    meals: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if study_minutes <= 0:
+        return []
+    remaining = study_minutes
+    cursor = study_start
+    blocks: list[tuple[int, int]] = []
+
+    for _, meal_time in sorted(meals, key=lambda item: item[1]):
+        if meal_time < cursor:
+            continue
+        projected_end = cursor + remaining
+        if meal_time >= projected_end:
+            break
+        available = meal_time - cursor
+        if available >= 30:
+            blocks.append((cursor, meal_time))
+            remaining -= available
+        cursor = meal_time + MEAL_BLOCK_MINUTES
+
+    if remaining > 0:
+        blocks.append((cursor, cursor + remaining))
+    return blocks
+
+
+def _build_full_day_timeline(data: dict) -> dict:
+    day = data["day"]
+    assessment = data["assessment"]
+    sources = data["sources"]
+    status = assessment["status"]
+    if status == "INCOMPLETE":
+        return {"timeline": [], "unscheduled_tasks": [], "reason": "INCOMPLETE"}
+
+    game_start = _clock_to_minutes(ONLINE_GAME_START)
+    game_hours = 0.0
+    if status in {"GREEN", "YELLOW"}:
+        game_hours = float(assessment.get("allowed_hours") or 0.0)
+    game_end = game_start + round(game_hours * 60) if game_hours > 0 else None
+
+    timeline: list[dict] = []
+    if game_end is not None:
+        game_label = "онлайн-игра"
+        if status == "YELLOW":
+            game_label += " — сокращённая сессия"
+        _append_timeline_item(
+            timeline,
+            start=game_start,
+            end=game_end,
+            label=game_label,
+            kind="game",
+        )
+
+    meal_pairs: list[tuple[int, int]] = []
+    for number, clock_text in sorted(sources["meal_times"].items()):
+        try:
+            meal_minutes = _clock_to_minutes(clock_text)
+        except ValueError:
+            continue
+        meal_pairs.append((number, meal_minutes))
+        _append_timeline_item(
+            timeline,
+            start=meal_minutes,
+            label=_meal_label(
+                number,
+                meal_minutes=meal_minutes,
+                game_start=game_start if game_end is not None else None,
+                game_end=game_end,
+            ),
+            kind="meal",
+        )
+
+    if game_end is not None:
+        recovery_end = game_end + STUDY_AFTER_GAME_GAP_MINUTES
+        _append_timeline_item(
+            timeline,
+            start=game_end,
+            end=recovery_end,
+            label="выход из игры и восстановление",
+            kind="recovery",
+        )
+        study_start = recovery_end
+    else:
+        study_start = game_start
+
+    study_hours = float(day.get("study_hours") or 0.0)
+    if status == "RED":
+        study_hours = 0.0
+    study_minutes = round(study_hours * 60)
+    study_blocks = _build_study_blocks(
+        study_start=study_start,
+        study_minutes=study_minutes,
+        meals=meal_pairs,
+    )
+    for index, (start, end) in enumerate(study_blocks, start=1):
+        label = "работа над игрой"
+        if len(study_blocks) > 1:
+            label += f" — блок {index}"
+        _append_timeline_item(
+            timeline,
+            start=start,
+            end=end,
+            label=label,
+            kind="study",
+        )
+
+    reserved_task_ids: set[str] = set()
+    for row in sources["existing_rows"]:
+        contour = _normalize_text(row.get("Контур", ""))
+        if contour in {"покер — игра", "покер — study", "здоровье", "восстановление"}:
+            continue
+        start_raw = str(row.get("План старт", "")).strip()
+        end_raw = str(row.get("План финиш", "")).strip()
+        if not TIME_PATTERN.fullmatch(start_raw):
+            continue
+        start = _clock_to_minutes(start_raw)
+        end = _clock_to_minutes(end_raw) if TIME_PATTERN.fullmatch(end_raw) else None
+        task_id = str(row.get("TASK_ID", "")).strip()
+        if task_id:
+            reserved_task_ids.add(task_id)
+        _append_timeline_item(
+            timeline,
+            start=start,
+            end=end,
+            label=str(row.get("Блок / задача", "")).strip(),
+            kind="existing_task",
+            source_id=task_id,
+        )
+
+    cursor = max(
+        [
+            item["end"] if item["end"] is not None else item["start"] + MEAL_BLOCK_MINUTES
+            for item in timeline
+            if item["kind"] in {"study", "game", "recovery"}
+        ]
+        or [game_start]
+    )
+    day_end = _clock_to_minutes(FULL_PLAN_DAY_END)
+    unscheduled_tasks: list[str] = []
+    for task in sources["ready_tasks"]:
+        task_id = str(task.get("Task ID", "")).strip()
+        if task_id in reserved_task_ids:
+            continue
+        slot_hours = _number(task.get("Слот, ч", "")) or 0.0
+        slot_minutes = max(0, round(slot_hours * 60))
+        if slot_minutes <= 0:
+            continue
+        for _, meal_time in sorted(meal_pairs, key=lambda item: item[1]):
+            if cursor <= meal_time < cursor + slot_minutes:
+                cursor = meal_time + MEAL_BLOCK_MINUTES
+        if cursor + slot_minutes > day_end:
+            unscheduled_tasks.append(task_id or str(task.get("Задача", "")))
+            continue
+        _append_timeline_item(
+            timeline,
+            start=cursor,
+            end=cursor + slot_minutes,
+            label=str(task.get("Задача", "")).strip(),
+            kind="ready_task",
+            source_id=task_id,
+        )
+        cursor += slot_minutes
+
+    timeline.sort(
+        key=lambda item: (
+            item["start"],
+            0 if item["kind"] == "meal" else 1,
+            item["end"] or item["start"],
+        )
+    )
+    return {
+        "timeline": timeline,
+        "unscheduled_tasks": unscheduled_tasks,
+        "reason": "OK",
+        "game_hours": game_hours,
+        "study_hours": study_hours,
+    }
+
+
+def read_full_day_plan_test_data() -> dict:
+    base_data = read_morning_day_plan_test_data()
+    spreadsheet = get_spreadsheet()
+    base_data["sources"] = _read_full_plan_sources(spreadsheet, base_data)
+    base_data["full_plan"] = _build_full_day_timeline(base_data)
+    return base_data
+
+
+def format_full_day_plan_test_message(data: dict) -> str:
+    assessment = data["assessment"]
+    full_plan = data["full_plan"]
+    if assessment["status"] == "INCOMPLETE":
+        reason = assessment.get("reasons", ["не хватает данных"])[0]
+        return (
+            "🧪 Тест полного плана дня\n\n"
+            "Полный план пока не сформирован: " + reason + "."
+        )[:4000]
+
+    lines = [
+        "🧪 Тест полного плана дня",
+        "",
+        f"Андрей Николаевич, план на {data['date_text']}:",
+        "",
+    ]
+    for item in full_plan["timeline"]:
+        start = _minutes_to_clock(item["start"])
+        if item["end"] is None:
+            lines.append(f"{start} — {item['label']}.")
+        else:
+            end = _minutes_to_clock(item["end"])
+            lines.append(f"{start}–{end} — {item['label']}.")
+
+    if full_plan["unscheduled_tasks"]:
+        lines.extend([
+            "",
+            "Не вошли в день из-за отсутствия свободного окна: "
+            + ", ".join(full_plan["unscheduled_tasks"])
+            + ".",
+        ])
+    return "\n".join(lines)[:4000]
+
+
+def prepare_full_day_plan_test(
+    *,
+    chat_id: int,
+    repeat: bool,
+) -> dict:
+    data = read_full_day_plan_test_data()
+    text = format_full_day_plan_test_message(data)
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    run_suffix = now.strftime("%H%M%S") if repeat else "primary"
+    run_key = f"fullplan-test:{data['date'].isoformat()}:{run_suffix}"
+    object_id = f"FULLPLAN-TEST-{data['date'].strftime('%Y%m%d')}-{run_suffix}"
+
+    def create_scheduler_row() -> dict:
+        target = now + timedelta(seconds=DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS)
+        scheduler_result = create_persistent_scheduler_item(
+            item_type=FULL_PLAN_TEST_ITEM_TYPE,
+            chat_id=chat_id,
+            target=target,
+            text=text,
+            source=(
+                f"{FULL_PLAN_TEST_SOURCE} repeat"
+                if repeat
+                else FULL_PLAN_TEST_SOURCE
+            ),
+        )
+        return {
+            "scheduler_created": scheduler_result["created"],
+            "scheduler_item": scheduler_result["item"],
+            "decision": data["assessment"]["status"],
+            "date": data["date_text"],
+            "message": text,
+            "timeline_items": len(data["full_plan"]["timeline"]),
+        }
+
+    return execute_action_once(
+        idempotency_key=run_key,
+        operation=FULL_PLAN_TEST_OPERATION,
+        object_type="TELEGRAM_MESSAGE",
+        object_id=object_id,
+        source=(
+            f"{FULL_PLAN_TEST_SOURCE} repeat"
+            if repeat
+            else FULL_PLAN_TEST_SOURCE
+        ),
+        target=f"Telegram chat {chat_id}",
+        payload={
+            "date": data["date_text"],
+            "day_type": data["day"]["day_type"],
+            "phase": data["day"].get("phase", ""),
+            "decision": data["assessment"]["status"],
+            "game_hours": data["full_plan"].get("game_hours", 0),
+            "study_hours": data["full_plan"].get("study_hours", 0),
+            "timeline": data["full_plan"]["timeline"],
+            "repeat": repeat,
+            "message": text,
+        },
+        action_callable=create_scheduler_row,
+    )
+
+
 def prepare_day_plan_test(
     *,
     chat_id: int,
@@ -779,16 +1283,18 @@ def prepare_day_plan_test(
 
 
 def read_day_plan_test_records() -> dict:
+    test_sources = (DAY_PLAN_TEST_SOURCE, FULL_PLAN_TEST_SOURCE)
+    test_operations = {DAY_PLAN_TEST_OPERATION, FULL_PLAN_TEST_OPERATION}
     scheduler_items = [
         item
         for item in read_scheduler_items()
-        if item["source"].startswith(DAY_PLAN_TEST_SOURCE)
+        if item["source"].startswith(test_sources)
     ]
     journal_entries = [
         entry
         for entry in read_action_journal_entries()
-        if entry["operation"] == DAY_PLAN_TEST_OPERATION
-        or entry["source"].startswith(DAY_PLAN_TEST_SOURCE)
+        if entry["operation"] in test_operations
+        or entry["source"].startswith(test_sources)
     ]
     return {
         "scheduler_items": scheduler_items,
@@ -797,11 +1303,13 @@ def read_day_plan_test_records() -> dict:
 
 
 def cleanup_day_plan_test_records() -> dict:
+    test_sources = (DAY_PLAN_TEST_SOURCE, FULL_PLAN_TEST_SOURCE)
+    test_operations = {DAY_PLAN_TEST_OPERATION, FULL_PLAN_TEST_OPERATION}
     spreadsheet, scheduler_sheet = ensure_scheduler_sheet()
     scheduler_items = [
         item
         for item in read_scheduler_items()
-        if item["source"].startswith(DAY_PLAN_TEST_SOURCE)
+        if item["source"].startswith(test_sources)
     ]
     for item in sorted(
         scheduler_items,
@@ -815,8 +1323,8 @@ def cleanup_day_plan_test_records() -> dict:
         journal_entries = [
             entry
             for entry in read_action_journal_entries()
-            if entry["operation"] == DAY_PLAN_TEST_OPERATION
-            or entry["source"].startswith(DAY_PLAN_TEST_SOURCE)
+            if entry["operation"] in test_operations
+            or entry["source"].startswith(test_sources)
         ]
         for entry in sorted(
             journal_entries,
@@ -3159,6 +3667,88 @@ async def dayplantest(
     )
 
 
+async def fullplantest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /fullplantest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    repeat = False
+    if context.args:
+        if len(context.args) != 1 or context.args[0].lower() != "repeat":
+            await update.effective_message.reply_text(
+                "Формат команды:\n/fullplantest\n"
+                "Повторный прогон: /fullplantest repeat"
+            )
+            return
+        repeat = True
+
+    if full_plan_test_lock.locked():
+        await update.effective_message.reply_text(
+            "Тест полного плана дня уже запускается."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Собираю игру, работу над игрой, питание и допущенные задачи…"
+    )
+
+    async with full_plan_test_lock:
+        async with scheduler_lock:
+            try:
+                execution = await asyncio.to_thread(
+                    prepare_full_day_plan_test,
+                    chat_id=update.effective_chat.id,
+                    repeat=repeat,
+                )
+            except Exception as exc:
+                logger.exception("Full day-plan test setup failed")
+                await update.effective_message.reply_text(
+                    "Не удалось сформировать полный план дня ❌\n"
+                    f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+                )
+                return
+
+            if not execution["blocked"]:
+                prepared_result = execution["result"]
+                prepared_item = prepared_result["scheduler_item"]
+                prepared_scheduled_now = False
+                if prepared_item["status"] == SCHEDULER_STATUS_SCHEDULED:
+                    prepared_scheduled_now = schedule_persistent_item(
+                        context.application,
+                        prepared_item,
+                    )
+
+    if execution["blocked"]:
+        entry = execution["entry"]
+        await update.effective_message.reply_text(
+            "Основной тест полного плана за сегодня уже запускался — "
+            "дубль заблокирован ✅\n\n"
+            f"ACTION_ID: {entry['action_id']}\n"
+            "Для повторного прогона используй /fullplantest repeat."
+        )
+        return
+
+    result = prepared_result
+    item = prepared_item
+    await update.effective_message.reply_text(
+        "Полный план подготовлен ✅\n\n"
+        f"Дата данных: {result['date']}\n"
+        f"Решение по игре: {result['decision']}\n"
+        f"Строк расписания: {result['timeline_items']}\n"
+        f"SCHED_ID: {item['sched_id']}\n"
+        f"ACTION_ID: {execution['entry']['action_id']}\n"
+        f"Поставлено в очередь: "
+        f"{'да' if prepared_scheduled_now else 'уже было'}\n\n"
+        "Отдельное сообщение с расписанием придёт через несколько секунд."
+    )
+
+
 async def dayplancleanup(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3172,34 +3762,35 @@ async def dayplancleanup(
 
     if context.args != ["CONFIRM"]:
         await update.effective_message.reply_text(
-            "Команда удаляет только тестовые записи /dayplantest "
-            "из планировщика и журнала.\n\n"
+            "Команда удаляет тестовые записи /dayplantest и "
+            "/fullplantest из планировщика и журнала.\n\n"
             "Для подтверждения: /dayplancleanup CONFIRM"
         )
         return
 
     async with day_plan_test_lock:
-        async with scheduler_lock:
-            try:
-                records = await asyncio.to_thread(read_day_plan_test_records)
-                for item in records["scheduler_items"]:
-                    for job in context.application.job_queue.get_jobs_by_name(
-                        item["dedup_key"]
-                    ):
-                        job.schedule_removal()
-                    persistent_scheduled_keys.discard(item["dedup_key"])
+        async with full_plan_test_lock:
+            async with scheduler_lock:
+                try:
+                    records = await asyncio.to_thread(read_day_plan_test_records)
+                    for item in records["scheduler_items"]:
+                        for job in context.application.job_queue.get_jobs_by_name(
+                            item["dedup_key"]
+                        ):
+                            job.schedule_removal()
+                        persistent_scheduled_keys.discard(item["dedup_key"])
 
-                result = await asyncio.to_thread(cleanup_day_plan_test_records)
-            except Exception as exc:
-                logger.exception("Morning day-plan test cleanup failed")
-                await update.effective_message.reply_text(
-                    "Не удалось очистить тестовые записи ❌\n"
-                    f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
-                )
-                return
+                    result = await asyncio.to_thread(cleanup_day_plan_test_records)
+                except Exception as exc:
+                    logger.exception("Day-plan test cleanup failed")
+                    await update.effective_message.reply_text(
+                        "Не удалось очистить тестовые записи ❌\n"
+                        f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+                    )
+                    return
 
     await update.effective_message.reply_text(
-        "Тестовые записи утреннего планирования очищены ✅\n\n"
+        "Тестовые записи утреннего и полного планирования очищены ✅\n\n"
         f"Планировщик: удалено {result['scheduler_deleted']}\n"
         f"Журнал действий: удалено {result['journal_deleted']}\n"
         "Рабочие показатели и чек-листы не изменены."
@@ -3317,6 +3908,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("journaltest", journaltest))
     telegram_app.add_handler(CommandHandler("journalstatus", journalstatus))
     telegram_app.add_handler(CommandHandler("dayplantest", dayplantest))
+    telegram_app.add_handler(CommandHandler("fullplantest", fullplantest))
     telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
