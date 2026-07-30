@@ -117,6 +117,17 @@ DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS = int(
     os.environ.get("DAY_PLAN_TEST_DELIVERY_DELAY_SECONDS", "10")
 )
 ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
+SLEEP_QUALITY_RED_MAX = float(
+    os.environ.get("SLEEP_QUALITY_RED_MAX", "3.0")
+)
+SLEEP_QUALITY_YELLOW_MAX = float(
+    os.environ.get("SLEEP_QUALITY_YELLOW_MAX", "5.4")
+)
+if not (0 <= SLEEP_QUALITY_RED_MAX < SLEEP_QUALITY_YELLOW_MAX <= 10):
+    raise RuntimeError(
+        "Sleep-quality thresholds must satisfy "
+        "0 <= RED_MAX < YELLOW_MAX <= 10."
+    )
 
 JOURNAL_TEST_SHEET = "10_План_факт_дня"
 JOURNAL_TEST_CELL = "R503"
@@ -333,6 +344,10 @@ def _number(value: object) -> float | None:
     return float(match.group(0).replace(",", "."))
 
 
+def _format_score_10(value: float) -> str:
+    return f"{value:.1f}".replace(".", ",")
+
+
 def _format_hours(value: float) -> str:
     rounded = round(value * 2) / 2
     if rounded.is_integer():
@@ -422,6 +437,7 @@ def assess_online_session(
     checklist_60: dict[str, str],
     checklist_90: dict[str, str],
     planned_game_hours: float,
+    sleep_quality: float | None,
 ) -> dict:
     scores = _morning_scores(checklist_60, checklist_90)
     required = (
@@ -439,11 +455,21 @@ def assess_online_session(
         "energy",
     )
     missing = [name for name in required if scores[name] is None]
+    if sleep_quality is None:
+        missing.append("sleep_quality")
     if missing:
+        reasons = []
+        if "sleep_quality" in missing:
+            reasons.append(
+                "не удалось прочитать показатель качества сна из 02_День"
+            )
+        if any(name != "sleep_quality" for name in missing):
+            reasons.append("не удалось прочитать часть оценок чек-листов")
         return {
             "status": "INCOMPLETE",
             "scores": scores,
-            "reasons": ["не удалось прочитать часть оценок чек-листов"],
+            "sleep_quality": sleep_quality,
+            "reasons": reasons,
             "allowed_hours": None,
         }
 
@@ -470,10 +496,16 @@ def assess_online_session(
         red_reasons.append("выраженная ментальная перегрузка или раздражение")
     if scores["sleepiness"] >= 4:
         red_reasons.append("выраженная сонливость через 90 минут после подъёма")
+    if sleep_quality <= SLEEP_QUALITY_RED_MAX:
+        red_reasons.append(
+            "качество сна критически низкое: "
+            f"{_format_score_10(sleep_quality)}/10"
+        )
     if red_reasons:
         return {
             "status": "RED",
             "scores": scores,
+            "sleep_quality": sleep_quality,
             "reasons": red_reasons,
             "allowed_hours": 0.0,
         }
@@ -485,12 +517,18 @@ def assess_online_session(
         yellow_reasons.append("есть заметная остаточная перегрузка")
     if scores["sleepiness"] == 3:
         yellow_reasons.append("сонливость выше рабочего уровня")
+    if sleep_quality <= SLEEP_QUALITY_YELLOW_MAX:
+        yellow_reasons.append(
+            "качество сна ниже рабочего уровня: "
+            f"{_format_score_10(sleep_quality)}/10"
+        )
     if yellow_reasons:
         reduced = max(2.0, round(planned_game_hours * 2 / 3 * 2) / 2)
         reduced = min(planned_game_hours, reduced)
         return {
             "status": "YELLOW",
             "scores": scores,
+            "sleep_quality": sleep_quality,
             "reasons": yellow_reasons,
             "allowed_hours": reduced,
         }
@@ -498,6 +536,7 @@ def assess_online_session(
     return {
         "status": "GREEN",
         "scores": scores,
+        "sleep_quality": sleep_quality,
         "reasons": [],
         "allowed_hours": planned_game_hours,
     }
@@ -535,7 +574,7 @@ def read_morning_day_plan_test_data() -> dict:
     ]
 
     day_rows = spreadsheet.worksheet("02_День").get(
-        "A4:N1000",
+        "A4:Z1000",
         value_render_option="FORMATTED_VALUE",
     )
     day_row = next(
@@ -546,9 +585,11 @@ def read_morning_day_plan_test_data() -> dict:
         raise LookupError(
             f"Today row {target_text} was not found in 02_День."
         )
-    padded = list(day_row) + [""] * (14 - len(day_row))
+    padded = list(day_row) + [""] * (26 - len(day_row))
     planned_game_hours = _number(padded[10]) or 0.0
     planned_study_hours = _number(padded[12]) or 0.0
+    sleep_hours = _number(padded[24])
+    sleep_quality = _number(padded[25])
 
     if planned_game_hours <= 0:
         assessment = {
@@ -558,6 +599,7 @@ def read_morning_day_plan_test_data() -> dict:
                 if checklist_60 and checklist_90
                 else {}
             ),
+            "sleep_quality": sleep_quality,
             "reasons": [],
             "allowed_hours": 0.0,
         }
@@ -565,6 +607,7 @@ def read_morning_day_plan_test_data() -> dict:
         assessment = {
             "status": "INCOMPLETE",
             "scores": {},
+            "sleep_quality": sleep_quality,
             "reasons": [
                 "не заполнены чек-листы: " + ", ".join(missing_checklists)
             ],
@@ -575,6 +618,7 @@ def read_morning_day_plan_test_data() -> dict:
             checklist_60,
             checklist_90,
             planned_game_hours,
+            sleep_quality,
         )
 
     return {
@@ -586,6 +630,8 @@ def read_morning_day_plan_test_data() -> dict:
             "key_task": padded[9].strip(),
             "game_hours": planned_game_hours,
             "study_hours": planned_study_hours,
+            "sleep_hours": sleep_hours,
+            "sleep_quality": sleep_quality,
         },
         "morning": morning,
         "checklist_60": checklist_60,
@@ -622,6 +668,20 @@ def format_day_plan_test_message(data: dict) -> str:
         return "\n".join(lines)
 
     scores = assessment["scores"]
+    sleep_quality = assessment.get("sleep_quality")
+    if sleep_quality is not None:
+        if sleep_quality <= SLEEP_QUALITY_RED_MAX:
+            sleep_label = "критически низкое"
+        elif sleep_quality <= SLEEP_QUALITY_YELLOW_MAX:
+            sleep_label = "ниже рабочего уровня"
+        else:
+            sleep_label = "достаточное"
+        lines.append(
+            "Качество сна — "
+            f"{_format_score_10(float(sleep_quality))}/10, "
+            f"{sleep_label}."
+        )
+
     if (
         min(scores["thinking"], scores["information"], scores["attention"]) >= 2
         and scores["energy"] >= 2
@@ -647,9 +707,9 @@ def format_day_plan_test_message(data: dict) -> str:
         allowed = float(assessment["allowed_hours"])
         finish = _add_hours_to_clock(ONLINE_GAME_START, allowed)
         lines.append(
-            "Игровую сессию сократить до "
-            f"{_format_hours(allowed)}: {ONLINE_GAME_START}–{finish}. "
-            "Жёлтый свет. 🟡"
+            "Игровую сессию сократить. "
+            f"Продолжительность — {_format_hours(allowed)}: "
+            f"{ONLINE_GAME_START}–{finish}. Жёлтый свет. 🟡"
         )
     else:
         lines.append("Сегодня лучше не играть. Красный свет. 🔴")
@@ -707,6 +767,8 @@ def prepare_day_plan_test(
             "day_type": data["day"]["day_type"],
             "game_hours": data["day"]["game_hours"],
             "study_hours": data["day"]["study_hours"],
+            "sleep_hours": data["day"]["sleep_hours"],
+            "sleep_quality": data["day"]["sleep_quality"],
             "decision": data["assessment"]["status"],
             "repeat": repeat,
             "message": text,
