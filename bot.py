@@ -9,8 +9,15 @@ from zoneinfo import ZoneInfo
 import gspread
 from aiohttp import web
 from google.oauth2.service_account import Credentials
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -27,10 +34,16 @@ PORT = int(os.environ.get("PORT", "8000"))
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
-# Временная защита от дублей в рамках текущего запуска процесса.
-# Постоянный журнал будет добавлен на отдельном этапе дорожной карты.
 scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
+
+BUTTON_LABELS = {
+    "view": "Посмотреть",
+    "approve": "Утвердить",
+    "revise": "На доработку",
+    "done": "Выполнено",
+    "move": "Перенести",
+}
 
 if not BOT_TOKEN:
     raise RuntimeError("Environment variable BOT_TOKEN is missing.")
@@ -66,6 +79,39 @@ def get_spreadsheet():
     )
     client = gspread.authorize(credentials)
     return client.open_by_key(GOOGLE_SHEET_ID)
+
+
+def test_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Посмотреть",
+                    callback_data="button_test:view",
+                ),
+                InlineKeyboardButton(
+                    "Утвердить",
+                    callback_data="button_test:approve",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "На доработку",
+                    callback_data="button_test:revise",
+                ),
+                InlineKeyboardButton(
+                    "Выполнено",
+                    callback_data="button_test:done",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Перенести",
+                    callback_data="button_test:move",
+                ),
+            ],
+        ]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -148,7 +194,7 @@ async def notifytest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if len(context.args) != 1 or not TIME_PATTERN.fullmatch(context.args[0]):
         await update.effective_message.reply_text(
             "Укажи время по Москве в формате:\n"
-            "/notifytest 11:50"
+            "/notifytest 12:15"
         )
         return
 
@@ -170,13 +216,15 @@ async def notifytest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if key in scheduled_notification_keys:
         await update.effective_message.reply_text(
-            f"Уведомление на {requested_time} уже запланировано — дубль заблокирован ✅"
+            f"Уведомление на {requested_time} уже запланировано — "
+            "дубль заблокирован ✅"
         )
         return
 
     if key in sent_notification_keys:
         await update.effective_message.reply_text(
-            f"Уведомление на {requested_time} уже было отправлено — повтор заблокирован ✅"
+            f"Уведомление на {requested_time} уже было отправлено — "
+            "повтор заблокирован ✅"
         )
         return
 
@@ -194,8 +242,74 @@ async def notifytest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     scheduled_notification_keys.add(key)
 
     await update.effective_message.reply_text(
-        f"Тестовое уведомление запланировано на {requested_time} по Москве ✅\n"
+        f"Тестовое уведомление запланировано на {requested_time} "
+        "по Москве ✅\n"
         "Повторная постановка на то же время будет заблокирована."
+    )
+
+
+async def buttonstest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        logger.warning(
+            "Unauthorized /buttonstest attempt from user_id=%s",
+            getattr(update.effective_user, "id", None),
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "🧪 Тестовая карточка управления\n\n"
+        "Это только техническая проверка кнопок.\n"
+        "Нажми любую кнопку — бот должен зафиксировать выбор.",
+        reply_markup=test_keyboard(),
+    )
+
+
+async def handle_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    if query.from_user.id != ALLOWED_USER_ID:
+        logger.warning(
+            "Unauthorized button attempt from user_id=%s",
+            query.from_user.id,
+        )
+        await query.answer("Доступ запрещён.", show_alert=True)
+        return
+
+    await query.answer()
+
+    data = query.data or ""
+    prefix = "button_test:"
+    if not data.startswith(prefix):
+        return
+
+    action = data.removeprefix(prefix)
+    label = BUTTON_LABELS.get(action, "Неизвестное действие")
+
+    logger.info(
+        "Test button pressed: action=%s user_id=%s",
+        action,
+        query.from_user.id,
+    )
+
+    original_text = (
+        "🧪 Тестовая карточка управления\n\n"
+        "Это только техническая проверка кнопок.\n"
+        "Нажми любую кнопку — бот должен зафиксировать выбор."
+    )
+    await query.edit_message_text(
+        text=(
+            f"{original_text}\n\n"
+            f"Последнее нажатие: «{label}» ✅"
+        ),
+        reply_markup=test_keyboard(),
     )
 
 
@@ -236,6 +350,13 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("notifytest", notifytest))
+    telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
+    telegram_app.add_handler(
+        CallbackQueryHandler(
+            handle_button,
+            pattern=r"^button_test:",
+        )
+    )
     telegram_app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
