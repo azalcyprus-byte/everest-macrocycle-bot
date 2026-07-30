@@ -113,6 +113,60 @@ action_journal_thread_lock = threading.Lock()
 MORNING_SHEET = "Утро"
 MORNING_60_SHEET = "Утро 60 мин"
 MORNING_90_SHEET = "Утро 90 мин"
+
+# Restored morning checklist orchestrator. Form URLs are kept outside code
+# so bot updates cannot erase or expose them.
+MORNING_FORM_URL = os.environ.get("MORNING_FORM_URL", "").strip()
+MORNING_60_FORM_URL = os.environ.get("MORNING_60_FORM_URL", "").strip()
+MORNING_90_FORM_URL = os.environ.get("MORNING_90_FORM_URL", "").strip()
+MORNING_SECOND_DELAY_MINUTES = int(
+    os.environ.get("MORNING_SECOND_DELAY_MINUTES", "60")
+)
+MORNING_THIRD_DELAY_MINUTES = int(
+    os.environ.get("MORNING_THIRD_DELAY_MINUTES", "90")
+)
+MORNING_REMINDER_INTERVAL_MINUTES = int(
+    os.environ.get("MORNING_REMINDER_INTERVAL_MINUTES", "15")
+)
+MORNING_READY_DELAY_MINUTES = int(
+    os.environ.get("MORNING_READY_DELAY_MINUTES", "5")
+)
+MORNING_ORCHESTRATOR_TICK_SECONDS = int(
+    os.environ.get("MORNING_ORCHESTRATOR_TICK_SECONDS", "60")
+)
+MORNING_SESSION_OPERATION = "MORNING_SESSION"
+MORNING_SESSION_OBJECT_TYPE = "MORNING_SESSION"
+MORNING_SESSION_SOURCE = "telegram:доброе утро"
+MORNING_TRIGGER_PATTERN = re.compile(r"\bдоброе\s+утро\b", re.IGNORECASE)
+MORNING_DEFER_PATTERN = re.compile(
+    r"буду\s+готов(?:а)?\s+через\s+"
+    r"(?P<amount>\d+(?:[.,]\d+)?)\s*"
+    r"(?P<unit>мин(?:ут(?:у|ы)?)?|час(?:а|ов)?)",
+    re.IGNORECASE,
+)
+MORNING_WISHES = (
+    "Пусть сегодняшний день укрепит спокойную уверенность и качество решений.",
+    "Пусть сегодня дисциплина работает тише эмоций, но сильнее результата.",
+    "Пусть каждый блок дня приближает к Тайваню без перегрева и суеты.",
+    "Пусть сегодня внимание остаётся точным, а нагрузка — управляемой.",
+    "Пусть этот день добавит форме устойчивости, а игре — ясности.",
+    "Пусть сегодня важное будет сделано без лишнего напряжения.",
+    "Пусть день пройдёт в режиме чемпиона: спокойно, точно и последовательно.",
+)
+
+if min(
+    MORNING_SECOND_DELAY_MINUTES,
+    MORNING_THIRD_DELAY_MINUTES,
+    MORNING_REMINDER_INTERVAL_MINUTES,
+    MORNING_READY_DELAY_MINUTES,
+    MORNING_ORCHESTRATOR_TICK_SECONDS,
+) <= 0:
+    raise RuntimeError("Morning orchestrator timing values must be positive.")
+if MORNING_THIRD_DELAY_MINUTES < MORNING_SECOND_DELAY_MINUTES:
+    raise RuntimeError(
+        "MORNING_THIRD_DELAY_MINUTES must not be earlier than the second checklist."
+    )
+
 DAY_PLAN_TEST_SOURCE = "/dayplantest"
 DAY_PLAN_TEST_OPERATION = "DAY_PLAN_TEST"
 DAY_PLAN_TEST_ITEM_TYPE = "DAY_PLAN_TEST"
@@ -132,7 +186,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.1"
+COORDINATOR_VERSION = "v12.2"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -354,6 +408,333 @@ def _latest_record_for_date(
             record.get("Отметка времени", "")
         ),
     )
+
+
+
+def _parse_json_object(raw: object) -> dict:
+    if not str(raw or "").strip():
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _morning_form_url(checklist_number: int) -> str:
+    return {
+        1: MORNING_FORM_URL,
+        2: MORNING_60_FORM_URL,
+        3: MORNING_90_FORM_URL,
+    }.get(checklist_number, "")
+
+
+def _morning_form_urls_configured() -> int:
+    return sum(
+        bool(url)
+        for url in (
+            MORNING_FORM_URL,
+            MORNING_60_FORM_URL,
+            MORNING_90_FORM_URL,
+        )
+    )
+
+
+def _morning_checklist_title(checklist_number: int) -> str:
+    return {
+        1: "первый утренний чек-лист",
+        2: "второй утренний чек-лист (+60 минут)",
+        3: "третий утренний чек-лист (+90 минут)",
+    }.get(checklist_number, "утренний чек-лист")
+
+
+def _morning_button_label(checklist_number: int) -> str:
+    return {
+        1: "📋 Заполнить первый чек-лист",
+        2: "📋 Заполнить второй чек-лист",
+        3: "📋 Заполнить третий чек-лист",
+    }.get(checklist_number, "📋 Заполнить чек-лист")
+
+
+def _morning_checklist_keyboard(
+    checklist_number: int,
+) -> InlineKeyboardMarkup | None:
+    url = _morning_form_url(checklist_number)
+    if not url:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(_morning_button_label(checklist_number), url=url)]]
+    )
+
+
+def _morning_record_timestamp(record: dict[str, str] | None) -> datetime | None:
+    if not record:
+        return None
+    parsed = _parse_timestamp_value(record.get("Отметка времени", ""))
+    if parsed.year <= 1:
+        return None
+    return parsed
+
+
+def read_morning_checklist_state(
+    target_date: date | None = None,
+) -> dict:
+    target = target_date or datetime.now(MOSCOW_TZ).date()
+    spreadsheet = get_spreadsheet()
+    records = {
+        1: _latest_record_for_date(
+            spreadsheet.worksheet(MORNING_SHEET),
+            "A1:O1000",
+            target,
+        ),
+        2: _latest_record_for_date(
+            spreadsheet.worksheet(MORNING_60_SHEET),
+            "A1:Q1000",
+            target,
+        ),
+        3: _latest_record_for_date(
+            spreadsheet.worksheet(MORNING_90_SHEET),
+            "A1:L1000",
+            target,
+        ),
+    }
+    timestamps = {
+        number: _morning_record_timestamp(record)
+        for number, record in records.items()
+    }
+    return {
+        "date": target,
+        "records": records,
+        "timestamps": timestamps,
+        "filled": {
+            number: record is not None
+            for number, record in records.items()
+        },
+        "all_filled": all(record is not None for record in records.values()),
+    }
+
+
+def _morning_session_key(target_date: date) -> str:
+    return f"morning-session:{target_date.isoformat()}"
+
+
+def _morning_session_object_id(target_date: date) -> str:
+    return f"MORNING-{target_date.strftime('%Y%m%d')}"
+
+
+def find_morning_session_entry(
+    target_date: date | None = None,
+) -> dict | None:
+    target = target_date or datetime.now(MOSCOW_TZ).date()
+    key = _morning_session_key(target)
+    return next(
+        (
+            entry
+            for entry in read_action_journal_entries()
+            if entry["idempotency_key"] == key
+            and entry["operation"] == MORNING_SESSION_OPERATION
+        ),
+        None,
+    )
+
+
+def _morning_session_started_at(entry: dict) -> datetime:
+    result = _parse_json_object(entry.get("result_json", ""))
+    raw = result.get("started_at") or entry.get("created_at")
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=MOSCOW_TZ)
+    return parsed.astimezone(MOSCOW_TZ)
+
+
+def _morning_session_chat_id(entry: dict) -> int:
+    result = _parse_json_object(entry.get("result_json", ""))
+    payload = _parse_json_object(entry.get("payload_json", ""))
+    raw = result.get("chat_id") or payload.get("chat_id") or ALLOWED_USER_ID
+    return int(raw)
+
+
+def create_morning_session_once(
+    *,
+    chat_id: int,
+    trigger_text: str,
+    now: datetime | None = None,
+) -> dict:
+    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ).replace(
+        microsecond=0
+    )
+    target_date = current.date()
+    existing = find_morning_session_entry(target_date)
+    if existing is not None:
+        return {
+            "created": False,
+            "entry": existing,
+        }
+
+    result = execute_action_once(
+        idempotency_key=_morning_session_key(target_date),
+        operation=MORNING_SESSION_OPERATION,
+        object_type=MORNING_SESSION_OBJECT_TYPE,
+        object_id=_morning_session_object_id(target_date),
+        source=MORNING_SESSION_SOURCE,
+        target="morning checklist flow",
+        payload={
+            "chat_id": chat_id,
+            "trigger": trigger_text.strip(),
+            "date": target_date.isoformat(),
+        },
+        action_callable=lambda: {
+            "chat_id": chat_id,
+            "started_at": current.isoformat(),
+            "date": target_date.isoformat(),
+            "second_due_at": (
+                current + timedelta(minutes=MORNING_SECOND_DELAY_MINUTES)
+            ).isoformat(),
+            "third_due_at": (
+                current + timedelta(minutes=MORNING_THIRD_DELAY_MINUTES)
+            ).isoformat(),
+        },
+    )
+    return {
+        "created": bool(result.get("executed")),
+        "entry": result["entry"],
+    }
+
+
+def _morning_ready_action_key(target_date: date) -> str:
+    return f"morning-ready:{target_date.isoformat()}"
+
+
+def _morning_action_succeeded(idempotency_key: str) -> bool:
+    return any(
+        entry["idempotency_key"] == idempotency_key
+        and entry["status"] == ACTION_STATUS_SUCCEEDED
+        for entry in read_action_journal_entries()
+    )
+
+
+def build_morning_session_snapshot(
+    target_date: date | None = None,
+) -> dict | None:
+    target = target_date or datetime.now(MOSCOW_TZ).date()
+    entry = find_morning_session_entry(target)
+    if entry is None:
+        return None
+    state = read_morning_checklist_state(target)
+    started_at = _morning_session_started_at(entry)
+    completed_times = [
+        timestamp
+        for timestamp in state["timestamps"].values()
+        if timestamp is not None
+    ]
+    last_completed_at = max(completed_times) if completed_times else None
+    ready_at = (
+        last_completed_at + timedelta(minutes=MORNING_READY_DELAY_MINUTES)
+        if state["all_filled"] and last_completed_at
+        else None
+    )
+    return {
+        "date": target,
+        "entry": entry,
+        "chat_id": _morning_session_chat_id(entry),
+        "started_at": started_at,
+        "second_due_at": started_at + timedelta(
+            minutes=MORNING_SECOND_DELAY_MINUTES
+        ),
+        "third_due_at": started_at + timedelta(
+            minutes=MORNING_THIRD_DELAY_MINUTES
+        ),
+        "state": state,
+        "last_completed_at": last_completed_at,
+        "ready_at": ready_at,
+        "ready_sent": _morning_action_succeeded(
+            _morning_ready_action_key(target)
+        ),
+    }
+
+
+def _morning_next_due_checklist(snapshot: dict, now: datetime) -> int | None:
+    filled = snapshot["state"]["filled"]
+    if not filled[1]:
+        return 1
+    if not filled[2] and now >= snapshot["second_due_at"]:
+        return 2
+    if not filled[3] and now >= snapshot["third_due_at"]:
+        return 3
+    return None
+
+
+def format_morning_session_status(
+    snapshot: dict,
+    *,
+    now: datetime | None = None,
+) -> str:
+    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+    filled = snapshot["state"]["filled"]
+    marks = " / ".join(
+        f"{number} {'✅' if filled[number] else '⏳'}"
+        for number in (1, 2, 3)
+    )
+    lines = [
+        f"Утренняя сессия на {snapshot['date'].strftime('%d.%m.%Y')} уже запущена.",
+        f"Чек-листы: {marks}.",
+    ]
+
+    if snapshot["state"]["all_filled"]:
+        if snapshot["ready_sent"]:
+            lines.append("Все три чек-листа заполнены. Штаб готов обсуждать план дня.")
+        elif snapshot["ready_at"] and current < snapshot["ready_at"]:
+            lines.append(
+                "Все три чек-листа заполнены. Сообщение о готовности придёт в "
+                f"{snapshot['ready_at'].strftime('%H:%M')}."
+            )
+        else:
+            lines.append("Все три чек-листа заполнены. Проверяю готовность плана.")
+        return "\n".join(lines)
+
+    if not filled[1]:
+        lines.append("Сейчас нужен первый утренний чек-лист.")
+    elif not filled[2] and current < snapshot["second_due_at"]:
+        lines.append(
+            "Второй чек-лист будет запрошен в "
+            f"{snapshot['second_due_at'].strftime('%H:%M')}."
+        )
+    elif not filled[2]:
+        lines.append("Сейчас нужен второй утренний чек-лист.")
+    elif not filled[3] and current < snapshot["third_due_at"]:
+        lines.append(
+            "Третий чек-лист будет запрошен в "
+            f"{snapshot['third_due_at'].strftime('%H:%M')}."
+        )
+    else:
+        lines.append("Сейчас нужен третий утренний чек-лист.")
+    return "\n".join(lines)
+
+
+def _morning_reminder_bucket(
+    *,
+    now: datetime,
+    first_due: datetime,
+) -> int | None:
+    if now < first_due:
+        return None
+    elapsed_minutes = int((now - first_due).total_seconds() // 60)
+    return elapsed_minutes // MORNING_REMINDER_INTERVAL_MINUTES
+
+
+def _morning_reminder_key(
+    target_date: date,
+    checklist_number: int,
+    bucket: int,
+) -> str:
+    return (
+        f"morning-checklist:{target_date.isoformat()}:"
+        f"{checklist_number}:{bucket}"
+    )
+
+
+def _morning_wish(target_date: date) -> str:
+    return MORNING_WISHES[target_date.toordinal() % len(MORNING_WISHES)]
 
 
 def _record_value(record: dict[str, str], fragment: str) -> str:
@@ -1619,11 +2000,20 @@ def _coordinator_system_status_message() -> str:
         if OPENAI_API_KEY and OPENAI_MODEL
         else "используется безопасная маршрутизация по правилам"
     )
+    configured_forms = _morning_form_urls_configured()
+    morning_status = (
+        "утренний оркестратор активен; формы настроены 3/3"
+        if configured_forms == 3
+        else f"утренний оркестратор активен; формы настроены {configured_forms}/3"
+    )
     return (
         f"Координатор штаба {COORDINATOR_VERSION} работает.\n\n"
         f"Маршрутизация: {model_status}.\n"
-        "Сейчас доступны: оценка игровой сессии, сборка плана дня с учётом текущего времени, "
-        "чтение времени приёмов пищи и допущенных задач.\n"
+        f"Утро: {morning_status}.\n"
+        "Сейчас доступны: запуск дня фразой «Доброе утро», контроль трёх "
+        "чек-листов и напоминаний, оценка игровой сессии, сборка плана дня "
+        "с учётом текущего времени, чтение времени приёмов пищи и "
+        "допущенных задач.\n"
         "Не подключены полностью: агент фаз, меню питания, покерный агент "
         "широкого профиля и финальный планировщик-исполнитель."
     )
@@ -3421,7 +3811,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.effective_message.reply_text(
         "Everest Macrocycle Bot запущен ✅\n"
-        "Авторизация подтверждена."
+        "Авторизация подтверждена.\n\n"
+        "Для запуска утренней сессии напишите: Доброе утро"
     )
 
 
@@ -4211,6 +4602,394 @@ async def dayplantest(
 
 
 
+
+async def _finish_journaled_message(
+    *,
+    action_id: str,
+    result: dict,
+) -> None:
+    await asyncio.to_thread(
+        finish_action,
+        action_id,
+        status=ACTION_STATUS_SUCCEEDED,
+        result=result,
+        error="",
+        system_check="TELEGRAM_SENT_ONCE",
+    )
+
+
+async def _send_morning_message_once(
+    *,
+    bot,
+    chat_id: int,
+    idempotency_key: str,
+    operation: str,
+    object_id: str,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    payload: dict | None = None,
+) -> bool:
+    claim = await asyncio.to_thread(
+        begin_action_once,
+        idempotency_key=idempotency_key,
+        operation=operation,
+        object_type="TELEGRAM_MESSAGE",
+        object_id=object_id,
+        source="morning_orchestrator",
+        target=str(chat_id),
+        payload=payload or {"text": text},
+    )
+    if claim["blocked"]:
+        return False
+
+    action_id = claim["entry"]["action_id"]
+    try:
+        message = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+    except Exception as exc:
+        await asyncio.to_thread(
+            finish_action,
+            action_id,
+            status=ACTION_STATUS_FAILED,
+            result=None,
+            error=f"{type(exc).__name__}: {str(exc)[:500]}",
+            system_check="TELEGRAM_SEND_FAILED",
+        )
+        raise
+
+    await _finish_journaled_message(
+        action_id=action_id,
+        result={
+            "chat_id": chat_id,
+            "message_id": getattr(message, "message_id", None),
+            "sent_at": datetime.now(MOSCOW_TZ).replace(
+                microsecond=0
+            ).isoformat(),
+        },
+    )
+    return True
+
+
+async def _send_morning_checklist_prompt(
+    *,
+    bot,
+    snapshot: dict,
+    checklist_number: int,
+    bucket: int,
+) -> bool:
+    target_date = snapshot["date"]
+    title = _morning_checklist_title(checklist_number)
+    url = _morning_form_url(checklist_number)
+    if not url:
+        await _send_morning_message_once(
+            bot=bot,
+            chat_id=snapshot["chat_id"],
+            idempotency_key=(
+                f"morning-form-missing:{target_date.isoformat()}:"
+                f"{checklist_number}"
+            ),
+            operation="MORNING_FORM_CONFIGURATION_ERROR",
+            object_id=_morning_session_object_id(target_date),
+            text=(
+                f"Не могу открыть {title}: ссылка на Google Form не настроена. "
+                "Нужно добавить соответствующую переменную Railway."
+            ),
+            payload={
+                "checklist_number": checklist_number,
+                "missing_env": {
+                    1: "MORNING_FORM_URL",
+                    2: "MORNING_60_FORM_URL",
+                    3: "MORNING_90_FORM_URL",
+                }[checklist_number],
+            },
+        )
+        return False
+
+    if checklist_number == 1:
+        text = (
+            "Напоминание: первый утренний чек-лист ещё не заполнен. "
+            "Заполните его, чтобы штаб мог продолжить утреннюю оценку."
+        )
+    elif bucket == 0:
+        delay = (
+            MORNING_SECOND_DELAY_MINUTES
+            if checklist_number == 2
+            else MORNING_THIRD_DELAY_MINUTES
+        )
+        text = (
+            f"⏱ Прошло {delay} минут с начала утренней сессии. "
+            f"Пора заполнить {title}."
+        )
+    else:
+        text = (
+            f"Напоминание: {title} ещё не заполнен. "
+            "После заполнения штаб автоматически увидит запись."
+        )
+
+    return await _send_morning_message_once(
+        bot=bot,
+        chat_id=snapshot["chat_id"],
+        idempotency_key=_morning_reminder_key(
+            target_date,
+            checklist_number,
+            bucket,
+        ),
+        operation="MORNING_CHECKLIST_REMINDER",
+        object_id=_morning_session_object_id(target_date),
+        text=text,
+        reply_markup=_morning_checklist_keyboard(checklist_number),
+        payload={
+            "checklist_number": checklist_number,
+            "bucket": bucket,
+            "date": target_date.isoformat(),
+        },
+    )
+
+
+async def morning_orchestrator_tick(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    try:
+        snapshot = await asyncio.to_thread(
+            build_morning_session_snapshot,
+            now.date(),
+        )
+    except Exception:
+        logger.exception("Morning orchestrator state read failed")
+        return
+    if snapshot is None:
+        return
+
+    state = snapshot["state"]
+    if state["all_filled"]:
+        if snapshot["ready_sent"]:
+            return
+        ready_at = snapshot["ready_at"]
+        if ready_at is None or now < ready_at:
+            return
+        try:
+            await _send_morning_message_once(
+                bot=context.bot,
+                chat_id=snapshot["chat_id"],
+                idempotency_key=_morning_ready_action_key(snapshot["date"]),
+                operation="MORNING_READY_FOR_PLAN",
+                object_id=_morning_session_object_id(snapshot["date"]),
+                text=(
+                    "Андрей Николаевич, все три утренних чек-листа заполнены.\n\n"
+                    "Мы готовы обсудить план на день."
+                ),
+                payload={
+                    "date": snapshot["date"].isoformat(),
+                    "last_checklist_at": (
+                        snapshot["last_completed_at"].isoformat()
+                        if snapshot["last_completed_at"]
+                        else None
+                    ),
+                },
+            )
+        except Exception:
+            logger.exception("Morning ready message failed")
+        return
+
+    checks = (
+        (
+            1,
+            snapshot["started_at"]
+            + timedelta(minutes=MORNING_REMINDER_INTERVAL_MINUTES),
+        ),
+        (2, snapshot["second_due_at"]),
+        (3, snapshot["third_due_at"]),
+    )
+    for checklist_number, first_due in checks:
+        if state["filled"][checklist_number]:
+            continue
+        bucket = _morning_reminder_bucket(now=now, first_due=first_due)
+        if bucket is None:
+            continue
+        try:
+            await _send_morning_checklist_prompt(
+                bot=context.bot,
+                snapshot=snapshot,
+                checklist_number=checklist_number,
+                bucket=bucket,
+            )
+        except Exception:
+            logger.exception(
+                "Morning checklist prompt failed: checklist=%s bucket=%s",
+                checklist_number,
+                bucket,
+            )
+
+
+async def start_or_continue_morning_session(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    current = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    try:
+        result = await asyncio.to_thread(
+            create_morning_session_once,
+            chat_id=update.effective_chat.id,
+            trigger_text=(update.effective_message.text or ""),
+            now=current,
+        )
+        snapshot = await asyncio.to_thread(
+            build_morning_session_snapshot,
+            current.date(),
+        )
+    except Exception as exc:
+        logger.exception("Morning session start failed")
+        await update.effective_message.reply_text(
+            "Не удалось запустить утреннюю сессию ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+        return
+
+    if snapshot is None:
+        await update.effective_message.reply_text(
+            "Утренняя сессия не была сохранена ❌"
+        )
+        return
+
+    if not result["created"]:
+        checklist_number = _morning_next_due_checklist(snapshot, current)
+        await update.effective_message.reply_text(
+            format_morning_session_status(snapshot, now=current),
+            reply_markup=(
+                _morning_checklist_keyboard(checklist_number)
+                if checklist_number
+                else None
+            ),
+        )
+        return
+
+    first_filled = snapshot["state"]["filled"][1]
+    greeting = (
+        "Доброе утро, Андрей Николаевич!\n\n"
+        f"{_morning_wish(current.date())}"
+    )
+    if first_filled:
+        await update.effective_message.reply_text(greeting)
+        await update.effective_message.reply_text(
+            format_morning_session_status(snapshot, now=current)
+        )
+    else:
+        if not MORNING_FORM_URL:
+            greeting += (
+                "\n\nСсылка на первый чек-лист пока не настроена в Railway "
+                "(`MORNING_FORM_URL`)."
+            )
+        else:
+            greeting += "\n\nНачинаем с первого утреннего чек-листа."
+        await update.effective_message.reply_text(
+            greeting,
+            reply_markup=_morning_checklist_keyboard(1),
+        )
+
+    # Run one immediate control pass. It will not duplicate the greeting and
+    # will schedule no extra messages before their due times.
+    await morning_orchestrator_tick(context)
+
+
+async def morningstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    try:
+        snapshot = await asyncio.to_thread(
+            build_morning_session_snapshot,
+            datetime.now(MOSCOW_TZ).date(),
+        )
+    except Exception as exc:
+        logger.exception("Morning status read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать утреннюю сессию ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+        return
+    if snapshot is None:
+        await update.effective_message.reply_text(
+            "Сегодня утренняя сессия ещё не запускалась.\n"
+            "Для запуска напишите: Доброе утро"
+        )
+        return
+    checklist_number = _morning_next_due_checklist(
+        snapshot,
+        datetime.now(MOSCOW_TZ),
+    )
+    await update.effective_message.reply_text(
+        format_morning_session_status(snapshot),
+        reply_markup=(
+            _morning_checklist_keyboard(checklist_number)
+            if checklist_number
+            else None
+        ),
+    )
+
+
+async def morningcheck(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    await morning_orchestrator_tick(context)
+    await morningstatus(update, context)
+
+
+async def handle_morning_defer(
+    update: Update,
+    match: re.Match,
+) -> None:
+    amount = float(match.group("amount").replace(",", "."))
+    unit = match.group("unit").lower()
+    delta = (
+        timedelta(minutes=amount)
+        if unit.startswith("мин")
+        else timedelta(hours=amount)
+    )
+    ready_time = datetime.now(MOSCOW_TZ) + delta
+    message_id = getattr(update.effective_message, "message_id", 0)
+    try:
+        await asyncio.to_thread(
+            execute_action_once,
+            idempotency_key=(
+                f"morning-plan-defer:{update.effective_chat.id}:{message_id}"
+            ),
+            operation="MORNING_PLAN_DISCUSSION_DEFERRED",
+            object_type="MORNING_SESSION",
+            object_id=_morning_session_object_id(ready_time.date()),
+            source="telegram",
+            target="plan discussion",
+            payload={
+                "amount": amount,
+                "unit": unit,
+                "ready_not_before": ready_time.replace(
+                    microsecond=0
+                ).isoformat(),
+            },
+            action_callable=lambda: {
+                "accepted": True,
+                "ready_not_before": ready_time.replace(
+                    microsecond=0
+                ).isoformat(),
+                "extra_reminders_created": False,
+            },
+        )
+    except Exception:
+        logger.exception("Morning plan defer journal write failed")
+    await update.effective_message.reply_text(
+        "Принято. Вернёмся к обсуждению плана не раньше "
+        f"{ready_time.strftime('%H:%M')}. Дополнительные напоминания не запускаю."
+    )
+
+
 async def _process_coordinator_message(
     update: Update,
     request_text: str,
@@ -4309,6 +5088,9 @@ async def hq(
         await update.effective_message.reply_text(
             "Формат: /hq составь план на день"
         )
+        return
+    if MORNING_TRIGGER_PATTERN.search(request_text):
+        await start_or_continue_morning_session(update, context)
         return
     await _process_coordinator_message(update, request_text)
 
@@ -4518,6 +5300,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (update.effective_message.text or "").strip()
     if not text:
         return
+
+    if MORNING_TRIGGER_PATTERN.search(text):
+        await start_or_continue_morning_session(update, context)
+        return
+
+    defer_match = MORNING_DEFER_PATTERN.search(text)
+    if defer_match:
+        try:
+            snapshot = await asyncio.to_thread(
+                build_morning_session_snapshot,
+                datetime.now(MOSCOW_TZ).date(),
+            )
+        except Exception:
+            logger.exception("Morning defer context read failed")
+            snapshot = None
+        if snapshot is not None and snapshot["state"]["all_filled"]:
+            await handle_morning_defer(update, defer_match)
+            return
+
     await _process_coordinator_message(update, text)
 
 
@@ -4557,6 +5358,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("hq", hq))
     telegram_app.add_handler(CommandHandler("hqtest", hqtest))
     telegram_app.add_handler(CommandHandler("hqstatus", hqstatus))
+    telegram_app.add_handler(CommandHandler("morningstatus", morningstatus))
+    telegram_app.add_handler(CommandHandler("morningcheck", morningcheck))
     telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
@@ -4575,6 +5378,12 @@ async def main() -> None:
         await telegram_app.initialize()
         await telegram_app.start()
         await restore_persistent_scheduler(telegram_app)
+        telegram_app.job_queue.run_repeating(
+            morning_orchestrator_tick,
+            interval=MORNING_ORCHESTRATOR_TICK_SECONDS,
+            first=5,
+            name="morning-orchestrator",
+        )
         await telegram_app.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
