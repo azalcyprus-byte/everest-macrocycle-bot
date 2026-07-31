@@ -56,6 +56,7 @@ day_plan_test_lock = asyncio.Lock()
 full_plan_test_lock = asyncio.Lock()
 morning_test_lock = asyncio.Lock()
 coordinator_lock = asyncio.Lock()
+morning_planning_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
 SCHEDULER_SHEET = "15_Планировщик"
@@ -114,6 +115,26 @@ action_journal_thread_lock = threading.Lock()
 MORNING_SHEET = "Утро"
 MORNING_60_SHEET = "Утро 60 мин"
 MORNING_90_SHEET = "Утро 90 мин"
+INBOX_TASKS_SHEET = "17_Входящие_задачи"
+MORNING_PLANNING_OPERATION = "MORNING_PLANNING_DIALOGUE"
+MORNING_PLANNING_OBJECT_TYPE = "MORNING_PLANNING"
+MORNING_PLANNING_SOURCE = "telegram:morning-planning"
+MORNING_PLANNING_STAGES = {
+    "ASK_MEAL",
+    "ASK_TASKS",
+    "ASK_ESTIMATES",
+    "PHASE_APPROVAL",
+    "DRAFT_REVIEW",
+    "COMPLETED",
+}
+DAY_TYPE_LOAD_CAP_HOURS = {
+    "O": float(os.environ.get("DAY_CAP_O_HOURS", "1")),
+    "RP": float(os.environ.get("DAY_CAP_RP_HOURS", "3")),
+    "L": float(os.environ.get("DAY_CAP_L_HOURS", "6")),
+    "L+": float(os.environ.get("DAY_CAP_L_PLUS_HOURS", "8")),
+    "M": float(os.environ.get("DAY_CAP_M_HOURS", "10")),
+    "T": float(os.environ.get("DAY_CAP_T_HOURS", "10")),
+}
 
 
 def _normalize_google_form_url(raw_url: str) -> str:
@@ -212,7 +233,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.3"
+COORDINATOR_VERSION = "v12.4"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -659,6 +680,12 @@ def build_morning_session_snapshot(
         if state["all_filled"] and last_completed_at
         else None
     )
+    planning_entry = find_morning_planning_entry(target)
+    planning_state = (
+        _parse_json_object(planning_entry.get("result_json", ""))
+        if planning_entry is not None
+        else {}
+    )
     return {
         "date": target,
         "entry": entry,
@@ -673,9 +700,12 @@ def build_morning_session_snapshot(
         "state": state,
         "last_completed_at": last_completed_at,
         "ready_at": ready_at,
-        "ready_sent": _morning_action_succeeded(
-            _morning_ready_action_key(target)
+        "ready_sent": (
+            _morning_action_succeeded(_morning_ready_action_key(target))
+            or planning_entry is not None
         ),
+        "planning_started": planning_entry is not None,
+        "planning_stage": planning_state.get("stage", ""),
     }
 
 
@@ -707,7 +737,13 @@ def format_morning_session_status(
     ]
 
     if snapshot["state"]["all_filled"]:
-        if snapshot["ready_sent"]:
+        if snapshot.get("planning_started"):
+            stage = snapshot.get("planning_stage") or "активна"
+            lines.append(
+                "Все три чек-листа заполнены. Обсуждение плана уже начато "
+                f"(этап: {stage})."
+            )
+        elif snapshot["ready_sent"]:
             lines.append("Все три чек-листа заполнены. Штаб готов обсуждать план дня.")
         elif snapshot["ready_at"] and current < snapshot["ready_at"]:
             lines.append(
@@ -863,6 +899,59 @@ def _number(value: object) -> float | None:
     return float(match.group(0).replace(",", "."))
 
 
+def _parse_duration_hours_text(value: object) -> float | None:
+    raw = _normalize_text(value)
+    if not raw:
+        return None
+
+    hour_match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(?:час(?:а|ов)?|ч\b)",
+        raw,
+    )
+    minute_match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(?:мин(?:ут(?:а|ы)?)?|м\b)",
+        raw,
+    )
+    if hour_match or minute_match:
+        hours = (
+            float(hour_match.group(1).replace(",", "."))
+            if hour_match
+            else 0.0
+        )
+        minutes = (
+            float(minute_match.group(1).replace(",", "."))
+            if minute_match
+            else 0.0
+        )
+        total = hours + minutes / 60
+        return total if total > 0 else None
+
+    number = _number(raw)
+    if number is not None and 0 < number <= 12:
+        return number
+    return None
+
+
+def _preliminary_user_task_hours(
+    tasks_text: str,
+    estimates_text: str,
+) -> tuple[float, str]:
+    if not tasks_text or _normalize_text(tasks_text) in {
+        "нет", "ничего", "нет задач", "новых задач нет"
+    }:
+        return 0.0, "none"
+    parsed = _parse_duration_hours_text(estimates_text)
+    if parsed is not None:
+        return max(0.5, round(parsed * 2) / 2), "user"
+    pieces = [
+        item.strip()
+        for item in re.split(r"[;\n]+", tasks_text)
+        if item.strip()
+    ]
+    estimated = min(2.0, max(0.5, 0.5 * max(1, len(pieces))))
+    return estimated, "system_preliminary"
+
+
 def _format_score_10(value: float) -> str:
     return f"{value:.1f}".replace(".", ",")
 
@@ -952,12 +1041,28 @@ def _morning_scores(
     }
 
 
+def _reduced_half_hour(value: float, factor: float) -> float:
+    if value <= 0:
+        return 0.0
+    reduced = round(value * factor * 2) / 2
+    if reduced >= value and value >= 0.5:
+        reduced = max(0.0, value - 0.5)
+    return max(0.0, reduced)
+
+
 def assess_online_session(
     checklist_60: dict[str, str],
     checklist_90: dict[str, str],
     planned_game_hours: float,
     sleep_quality: float | None,
+    planned_study_hours: float = 0.0,
+    day_context: dict | None = None,
 ) -> dict:
+    """Assess the phase load without changing the approved poker PLAN.
+
+    YELLOW and RED are recommendations only. The original game/study hours
+    remain effective until Andrey explicitly approves a reduction.
+    """
     scores = _morning_scores(checklist_60, checklist_90)
     required = (
         "thinking",
@@ -976,6 +1081,21 @@ def assess_online_session(
     missing = [name for name in required if scores[name] is None]
     if sleep_quality is None:
         missing.append("sleep_quality")
+
+    context = dict(day_context or {})
+    base = {
+        "scores": scores,
+        "sleep_quality": sleep_quality,
+        "day_context": context,
+        "planned_game_hours": float(planned_game_hours),
+        "planned_study_hours": float(planned_study_hours),
+        "proposed_game_hours": float(planned_game_hours),
+        "proposed_study_hours": float(planned_study_hours),
+        "allowed_hours": float(planned_game_hours),
+        "requires_approval": False,
+        "recommendation": "KEEP_PLAN",
+    }
+
     if missing:
         reasons = []
         if "sleep_quality" in missing:
@@ -985,11 +1105,10 @@ def assess_online_session(
         if any(name != "sleep_quality" for name in missing):
             reasons.append("не удалось прочитать часть оценок чек-листов")
         return {
+            **base,
             "status": "INCOMPLETE",
-            "scores": scores,
-            "sleep_quality": sleep_quality,
             "reasons": reasons,
-            "allowed_hours": None,
+            "recommendation": "WAIT_FOR_DATA",
         }
 
     positive = (
@@ -1020,13 +1139,32 @@ def assess_online_session(
             "качество сна критически низкое: "
             f"{_format_score_10(sleep_quality)}/10"
         )
+    energy_morning = _number(context.get("energy_morning"))
+    clarity_morning = _number(context.get("clarity_morning"))
+    residual_overheat = _number(context.get("residual_overheat"))
+    residual_irritation = _number(context.get("residual_irritation"))
+    tail_morning = _number(context.get("tail_morning"))
+    if energy_morning is not None and energy_morning <= 3:
+        red_reasons.append("утренняя энергия критически низкая")
+    if clarity_morning is not None and clarity_morning <= 3:
+        red_reasons.append("утренняя ясность критически низкая")
+    if residual_overheat is not None and residual_overheat >= 7:
+        red_reasons.append("высокий остаточный Overheat")
+    if residual_irritation is not None and residual_irritation >= 7:
+        red_reasons.append("высокое остаточное раздражение")
+    if tail_morning is not None and tail_morning >= 7:
+        red_reasons.append("высокий утренний хвост нагрузки")
     if red_reasons:
         return {
+            **base,
             "status": "RED",
-            "scores": scores,
-            "sleep_quality": sleep_quality,
             "reasons": red_reasons,
-            "allowed_hours": 0.0,
+            "proposed_game_hours": 0.0,
+            "proposed_study_hours": 0.0,
+            "requires_approval": bool(
+                planned_game_hours > 0 or planned_study_hours > 0
+            ),
+            "recommendation": "PROPOSE_REDUCTION",
         }
 
     yellow_reasons: list[str] = []
@@ -1041,24 +1179,93 @@ def assess_online_session(
             "качество сна ниже рабочего уровня: "
             f"{_format_score_10(sleep_quality)}/10"
         )
+    if energy_morning is not None and energy_morning <= 5:
+        yellow_reasons.append("утренняя энергия ниже устойчивого уровня")
+    if clarity_morning is not None and clarity_morning <= 5:
+        yellow_reasons.append("утренняя ясность ниже устойчивого уровня")
+    if residual_overheat is not None and residual_overheat >= 4:
+        yellow_reasons.append("сохраняется остаточный Overheat")
+    if residual_irritation is not None and residual_irritation >= 4:
+        yellow_reasons.append("сохраняется остаточное раздражение")
+    if tail_morning is not None and tail_morning >= 4:
+        yellow_reasons.append("сохраняется заметный хвост нагрузки")
+    body_signal = _normalize_text(context.get("body_signal", ""))
+    if body_signal and body_signal not in {"нет", "—", "-"}:
+        yellow_reasons.append("зафиксирован телесный сигнал")
+    previous_day_cost = _number(context.get("previous_day_cost"))
+    previous_tail_end = _number(context.get("previous_tail_end"))
+    if (
+        previous_day_cost is not None
+        and previous_day_cost >= 8
+        and previous_tail_end is not None
+        and previous_tail_end >= 3
+    ):
+        yellow_reasons.append("высокая цена предыдущего дня не снята полностью")
+    yellow_reasons = list(dict.fromkeys(yellow_reasons))
     if yellow_reasons:
-        reduced = max(2.0, round(planned_game_hours * 2 / 3 * 2) / 2)
-        reduced = min(planned_game_hours, reduced)
+        proposed_game = _reduced_half_hour(planned_game_hours, 2 / 3)
+        proposed_study = _reduced_half_hour(planned_study_hours, 2 / 3)
         return {
+            **base,
             "status": "YELLOW",
-            "scores": scores,
-            "sleep_quality": sleep_quality,
             "reasons": yellow_reasons,
-            "allowed_hours": reduced,
+            "proposed_game_hours": proposed_game,
+            "proposed_study_hours": proposed_study,
+            "requires_approval": bool(
+                proposed_game < planned_game_hours
+                or proposed_study < planned_study_hours
+            ),
+            "recommendation": "PROPOSE_REDUCTION",
         }
 
     return {
+        **base,
         "status": "GREEN",
-        "scores": scores,
-        "sleep_quality": sleep_quality,
         "reasons": [],
-        "allowed_hours": planned_game_hours,
     }
+
+
+def _extract_clock_from_text(value: object) -> str:
+    match = re.search(r"(?:[01]\d|2[0-3]):[0-5]\d", str(value or ""))
+    return match.group(0) if match else ""
+
+
+def _extract_wake_time(
+    morning: dict[str, str] | None,
+    *,
+    fallback: datetime | None = None,
+) -> dict:
+    record = morning or {}
+    fragments = (
+        "во сколько вы проснулись",
+        "во сколько проснулись",
+        "во сколько проснулся",
+        "время пробуждения",
+        "время подъёма",
+        "время подъема",
+        "подъём",
+        "подъем",
+    )
+    for fragment in fragments:
+        raw = _record_value(record, fragment)
+        clock = _extract_clock_from_text(raw)
+        if clock:
+            return {"time": clock, "source": "morning_checklist", "exact": True}
+
+    timestamp = _morning_record_timestamp(record)
+    if timestamp is not None:
+        return {
+            "time": timestamp.strftime("%H:%M"),
+            "source": "checklist_submission_time",
+            "exact": False,
+        }
+    if fallback is not None:
+        return {
+            "time": fallback.astimezone(MOSCOW_TZ).strftime("%H:%M"),
+            "source": "morning_session_start",
+            "exact": False,
+        }
+    return {"time": "", "source": "unavailable", "exact": False}
 
 
 def read_morning_day_plan_test_data() -> dict:
@@ -1093,7 +1300,7 @@ def read_morning_day_plan_test_data() -> dict:
     ]
 
     day_rows = spreadsheet.worksheet("02_День").get(
-        "A4:Z1000",
+        "A4:AR1000",
         value_render_option="FORMATTED_VALUE",
     )
     day_row = next(
@@ -1104,13 +1311,36 @@ def read_morning_day_plan_test_data() -> dict:
         raise LookupError(
             f"Today row {target_text} was not found in 02_День."
         )
-    padded = list(day_row) + [""] * (26 - len(day_row))
+    padded = list(day_row) + [""] * (44 - len(day_row))
     planned_game_hours = _number(padded[10]) or 0.0
     planned_study_hours = _number(padded[12]) or 0.0
     sleep_hours = _number(padded[24])
     sleep_quality = _number(padded[25])
+    previous_candidates = []
+    for row in day_rows:
+        row_date = _parse_date_value(row[0] if row else "")
+        if row_date is not None and row_date < target_date:
+            previous_candidates.append((row_date, row))
+    previous_row = (
+        max(previous_candidates, key=lambda item: item[0])[1]
+        if previous_candidates
+        else []
+    )
+    previous_padded = list(previous_row) + [""] * (44 - len(previous_row))
+    day_context = {
+        "energy_morning": padded[26],
+        "clarity_morning": padded[27],
+        "residual_overheat": padded[28],
+        "residual_irritation": padded[29],
+        "body_signal": padded[34],
+        "tail_morning": padded[40],
+        "day_cost": padded[42],
+        "previous_day_cost": previous_padded[42],
+        "previous_tail_end": previous_padded[39],
+        "previous_overheat_after": previous_padded[30],
+    }
 
-    if planned_game_hours <= 0:
+    if planned_game_hours <= 0 and planned_study_hours <= 0:
         assessment = {
             "status": "NO_GAME",
             "scores": (
@@ -1121,6 +1351,13 @@ def read_morning_day_plan_test_data() -> dict:
             "sleep_quality": sleep_quality,
             "reasons": [],
             "allowed_hours": 0.0,
+            "planned_game_hours": 0.0,
+            "planned_study_hours": 0.0,
+            "proposed_game_hours": 0.0,
+            "proposed_study_hours": 0.0,
+            "requires_approval": False,
+            "recommendation": "KEEP_PLAN",
+            "day_context": day_context,
         }
     elif missing_checklists:
         assessment = {
@@ -1130,7 +1367,14 @@ def read_morning_day_plan_test_data() -> dict:
             "reasons": [
                 "не заполнены чек-листы: " + ", ".join(missing_checklists)
             ],
-            "allowed_hours": None,
+            "allowed_hours": planned_game_hours,
+            "planned_game_hours": planned_game_hours,
+            "planned_study_hours": planned_study_hours,
+            "proposed_game_hours": planned_game_hours,
+            "proposed_study_hours": planned_study_hours,
+            "requires_approval": False,
+            "recommendation": "WAIT_FOR_DATA",
+            "day_context": day_context,
         }
     else:
         assessment = assess_online_session(
@@ -1138,6 +1382,8 @@ def read_morning_day_plan_test_data() -> dict:
             checklist_90,
             planned_game_hours,
             sleep_quality,
+            planned_study_hours,
+            day_context,
         )
 
     return {
@@ -1152,8 +1398,10 @@ def read_morning_day_plan_test_data() -> dict:
             "study_hours": planned_study_hours,
             "sleep_hours": sleep_hours,
             "sleep_quality": sleep_quality,
+            **day_context,
         },
         "morning": morning,
+        "wake": _extract_wake_time(morning),
         "checklist_60": checklist_60,
         "checklist_90": checklist_90,
         "assessment": assessment,
@@ -1220,19 +1468,25 @@ def format_day_plan_test_message(data: dict) -> str:
 
     lines.append("")
     if status == "GREEN":
-        lines.append("Игровая сессия разрешена. Зелёный свет. 🟢")
-        lines.append("")
-        lines.append("Штаб готов сформировать план дня.")
-    elif status == "YELLOW":
-        allowed = float(assessment["allowed_hours"])
-        finish = _add_hours_to_clock(ONLINE_GAME_START, allowed)
         lines.append(
-            "Игровую сессию сократить. "
-            f"Продолжительность — {_format_hours(allowed)}: "
-            f"{ONLINE_GAME_START}–{finish}. Жёлтый свет. 🟡"
+            "Фазовый агент рекомендует сохранить утверждённый покерный "
+            "PLAN без изменений. Зелёный свет. 🟢"
         )
-    else:
-        lines.append("Сегодня лучше не играть. Красный свет. 🔴")
+        lines.append("")
+        lines.append("Штаб готов начать обсуждение плана дня.")
+    elif status in {"YELLOW", "RED"}:
+        light = "Жёлтый" if status == "YELLOW" else "Красный"
+        lines.append(
+            "Фазовый агент предварительно предлагает сократить покерный "
+            "объём: "
+            f"игра — {_format_hours(float(assessment.get('proposed_game_hours') or 0.0))}, "
+            f"study — {_format_hours(float(assessment.get('proposed_study_hours') or 0.0))}. "
+            f"{light} сигнал. {'🟡' if status == 'YELLOW' else '🔴'}"
+        )
+        lines.append(
+            "Сокращение не применяется автоматически: нужен явный APPROVAL "
+            "Андрея. До него исходный PLAN сохраняется."
+        )
 
     text = "\n".join(lines)
     return text[:4000]
@@ -1372,6 +1626,96 @@ def _meal_label(
     return f"приём пищи №{number}"
 
 
+def _records_from_detected_header(
+    values: list[list[str]],
+    required_header: str,
+) -> list[dict[str, str]]:
+    wanted = _normalize_text(required_header)
+    for index, row in enumerate(values):
+        normalized = {_normalize_text(value) for value in row}
+        if wanted in normalized:
+            return _records_from_values(values[index:])
+    return []
+
+
+def _inbox_task_sort_key(task: dict[str, str]) -> tuple:
+    urgency = _normalize_text(task.get("Срочность", ""))
+    urgency_rank = {"высокая": 0, "средняя": 1, "низкая": 2}.get(urgency, 3)
+    deadline = _parse_date_value(task.get("Дедлайн", "")) or date.max
+    created = _parse_timestamp_value(task.get("Дата и время появления", ""))
+    return (urgency_rank, deadline, created, task.get("INBOX_ID", ""))
+
+
+def _read_inbox_tasks(spreadsheet, target_date: date) -> dict:
+    try:
+        worksheet = spreadsheet.worksheet(INBOX_TASKS_SHEET)
+    except gspread.WorksheetNotFound:
+        return {
+            "available": False,
+            "records": [],
+            "active": [],
+            "message": f"Вкладка {INBOX_TASKS_SHEET} ещё не создана.",
+        }
+
+    values = worksheet.get(
+        "A1:Y2000",
+        value_render_option="FORMATTED_VALUE",
+    )
+    records = _records_from_detected_header(values, "INBOX_ID")
+    active_statuses = {
+        "новое",
+        "нужно уточнение",
+        "готово к переносу",
+        "отложено",
+    }
+    active = []
+    for record in records:
+        status = _normalize_text(record.get("Статус разбора", ""))
+        if status not in active_statuses:
+            continue
+        linked_task = str(
+            record.get("Связанный Task ID из 05_Проекты_и_задачи", "")
+        ).strip()
+        if linked_task and status == "передано в 05":
+            continue
+        deadline = _parse_date_value(record.get("Дедлайн", ""))
+        record = dict(record)
+        record["_deadline_today"] = "Да" if deadline == target_date else ""
+        active.append(record)
+
+    active.sort(key=_inbox_task_sort_key)
+    return {
+        "available": True,
+        "records": records,
+        "active": active,
+        "message": "",
+    }
+
+
+def _inbox_task_label(task: dict[str, str]) -> str:
+    return (
+        str(task.get("Нормализованная задача", "")).strip()
+        or str(task.get("Исходная формулировка Андрея", "")).strip()
+        or str(task.get("INBOX_ID", "")).strip()
+        or "входящая задача"
+    )
+
+
+def _inbox_task_needs(task: dict[str, str]) -> list[str]:
+    needs: list[str] = []
+    if not str(task.get("Дедлайн", "")).strip() and not str(
+        task.get("Жёсткое временное окно", "")
+    ).strip():
+        needs.append("срок")
+    if not str(task.get("Оценка времени Андрея, ч", "")).strip() and not str(
+        task.get("Оценка времени системы, ч", "")
+    ).strip():
+        needs.append("оценка времени")
+    if not str(task.get("Нормализованная задача", "")).strip():
+        needs.append("формулировка действия")
+    return needs
+
+
 def _read_full_plan_sources(spreadsheet, base_data: dict) -> dict:
     target_date = base_data["date"]
     target_text = base_data["date_text"]
@@ -1407,6 +1751,8 @@ def _read_full_plan_sources(spreadsheet, base_data: dict) -> dict:
         key=_task_sort_key,
     )
 
+    inbox = _read_inbox_tasks(spreadsheet, target_date)
+
     meal_times = _extract_meal_times_from_rows(
         plan_rows,
         target_date=target_date,
@@ -1426,6 +1772,9 @@ def _read_full_plan_sources(spreadsheet, base_data: dict) -> dict:
         "target_text": target_text,
         "existing_rows": existing_rows,
         "ready_tasks": ready_tasks,
+        "inbox_available": inbox["available"],
+        "inbox_tasks": inbox["active"],
+        "inbox_message": inbox["message"],
         "meal_times": meal_times,
     }
 
@@ -1477,7 +1826,78 @@ def _build_study_blocks(
     return blocks
 
 
-def _build_full_day_timeline(data: dict) -> dict:
+def _effective_poker_hours(
+    data: dict,
+    planning_state: dict | None = None,
+) -> tuple[float, float, bool]:
+    assessment = data["assessment"]
+    day = data["day"]
+    planned_game = float(day.get("game_hours") or 0.0)
+    planned_study = float(day.get("study_hours") or 0.0)
+    approved = bool(
+        planning_state
+        and planning_state.get("phase_reduction_approved") is True
+    )
+    if approved and assessment.get("requires_approval"):
+        return (
+            float(assessment.get("proposed_game_hours") or 0.0),
+            float(assessment.get("proposed_study_hours") or 0.0),
+            True,
+        )
+    return planned_game, planned_study, False
+
+
+def _planning_meal_pairs(
+    data: dict,
+    planning_state: dict | None,
+    *,
+    current_minutes: int,
+    day_end: int,
+) -> list[tuple[int, int]]:
+    source_pairs: list[tuple[int, int]] = []
+    for number, clock_text in sorted(data["sources"]["meal_times"].items()):
+        try:
+            source_pairs.append((number, _clock_to_minutes(clock_text)))
+        except ValueError:
+            continue
+
+    if not planning_state:
+        return source_pairs
+
+    meal_eaten = planning_state.get("meal_eaten")
+    meal_time_text = str(planning_state.get("meal_time") or "").strip()
+    interval = 180
+    pairs: list[tuple[int, int]] = []
+
+    if meal_eaten is False:
+        first = current_minutes + 5
+        number = 1
+        while first <= day_end and number <= 6:
+            pairs.append((number, first))
+            first += interval
+            number += 1
+        return pairs
+
+    if meal_eaten is True and TIME_PATTERN.fullmatch(meal_time_text):
+        next_meal = _clock_to_minutes(meal_time_text) + interval
+        while next_meal <= current_minutes:
+            next_meal += interval
+        number = 2
+        while next_meal <= day_end and number <= 6:
+            pairs.append((number, next_meal))
+            next_meal += interval
+            number += 1
+        return pairs
+
+    return [pair for pair in source_pairs if pair[1] >= current_minutes]
+
+
+def _build_full_day_timeline(
+    data: dict,
+    planning_state: dict | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict:
     day = data["day"]
     assessment = data["assessment"]
     sources = data["sources"]
@@ -1485,17 +1905,38 @@ def _build_full_day_timeline(data: dict) -> dict:
     if status == "INCOMPLETE":
         return {"timeline": [], "unscheduled_tasks": [], "reason": "INCOMPLETE"}
 
-    game_start = _clock_to_minutes(ONLINE_GAME_START)
-    game_hours = 0.0
-    if status in {"GREEN", "YELLOW"}:
-        game_hours = float(assessment.get("allowed_hours") or 0.0)
+    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+    current_minutes = current.hour * 60 + current.minute
+    original_start = _clock_to_minutes(ONLINE_GAME_START)
+    day_end = _clock_to_minutes(FULL_PLAN_DAY_END)
+    if planning_state is not None:
+        hard_end = str(planning_state.get("hard_end_time") or "").strip()
+        if TIME_PATTERN.fullmatch(hard_end):
+            day_end = _clock_to_minutes(hard_end)
+
+    game_hours, study_hours, reduction_approved = _effective_poker_hours(
+        data, planning_state
+    )
+
+    work_start = original_start
+    if planning_state is not None:
+        work_start = max(original_start, current_minutes + 10)
+        preferred_start = str(
+            planning_state.get("preferred_work_start") or ""
+        ).strip()
+        if TIME_PATTERN.fullmatch(preferred_start):
+            work_start = max(current_minutes + 5, _clock_to_minutes(preferred_start))
+        if planning_state.get("meal_eaten") is False:
+            work_start = max(work_start, current_minutes + 5 + MEAL_BLOCK_MINUTES + 10)
+
+    game_start = work_start
     game_end = game_start + round(game_hours * 60) if game_hours > 0 else None
 
     timeline: list[dict] = []
     if game_end is not None:
         game_label = "онлайн-игра"
-        if status == "YELLOW":
-            game_label += " — сокращённая сессия"
+        if reduction_approved:
+            game_label += " — сокращение подтверждено"
         _append_timeline_item(
             timeline,
             start=game_start,
@@ -1504,22 +1945,29 @@ def _build_full_day_timeline(data: dict) -> dict:
             kind="game",
         )
 
-    meal_pairs: list[tuple[int, int]] = []
-    for number, clock_text in sorted(sources["meal_times"].items()):
-        try:
-            meal_minutes = _clock_to_minutes(clock_text)
-        except ValueError:
-            continue
-        meal_pairs.append((number, meal_minutes))
-        _append_timeline_item(
-            timeline,
-            start=meal_minutes,
-            label=_meal_label(
+    meal_pairs = _planning_meal_pairs(
+        data,
+        planning_state,
+        current_minutes=current_minutes,
+        day_end=day_end,
+    )
+    for number, meal_minutes in meal_pairs:
+        if planning_state is not None:
+            if planning_state.get("meal_eaten") is False and number == 1:
+                meal_label = "первый приём пищи"
+            else:
+                meal_label = "следующий приём пищи"
+        else:
+            meal_label = _meal_label(
                 number,
                 meal_minutes=meal_minutes,
                 game_start=game_start if game_end is not None else None,
                 game_end=game_end,
-            ),
+            )
+        _append_timeline_item(
+            timeline,
+            start=meal_minutes,
+            label=meal_label,
             kind="meal",
         )
 
@@ -1534,11 +1982,8 @@ def _build_full_day_timeline(data: dict) -> dict:
         )
         study_start = recovery_end
     else:
-        study_start = game_start
+        study_start = work_start
 
-    study_hours = float(day.get("study_hours") or 0.0)
-    if status == "RED":
-        study_hours = 0.0
     study_minutes = round(study_hours * 60)
     study_blocks = _build_study_blocks(
         study_start=study_start,
@@ -1547,6 +1992,8 @@ def _build_full_day_timeline(data: dict) -> dict:
     )
     for index, (start, end) in enumerate(study_blocks, start=1):
         label = "работа над игрой"
+        if reduction_approved:
+            label += " — сокращение подтверждено"
         if len(study_blocks) > 1:
             label += f" — блок {index}"
         _append_timeline_item(
@@ -1580,16 +2027,26 @@ def _build_full_day_timeline(data: dict) -> dict:
             source_id=task_id,
         )
 
-    cursor = max(
-        [
-            item["end"] if item["end"] is not None else item["start"] + MEAL_BLOCK_MINUTES
-            for item in timeline
-            if item["kind"] in {"study", "game", "recovery"}
-        ]
-        or [game_start]
-    )
-    day_end = _clock_to_minutes(FULL_PLAN_DAY_END)
+    core_ends = [
+        item["end"] if item["end"] is not None else item["start"] + MEAL_BLOCK_MINUTES
+        for item in timeline
+        if item["kind"] in {"study", "game", "recovery"}
+    ]
+    cursor = max(core_ends or [work_start])
     unscheduled_tasks: list[str] = []
+
+    task_budget_minutes: int | None = None
+    if planning_state is not None:
+        cap = DAY_TYPE_LOAD_CAP_HOURS.get(str(day.get("day_type") or "").strip())
+        if cap is not None:
+            reserve = max(0.0, cap - game_hours - study_hours)
+            if assessment.get("requires_approval") and planning_state.get(
+                "phase_reduction_approved"
+            ) is False:
+                reserve = 0.0
+            task_budget_minutes = round(reserve * 60)
+
+    task_used_minutes = 0
     for task in sources["ready_tasks"]:
         task_id = str(task.get("Task ID", "")).strip()
         if task_id in reserved_task_ids:
@@ -1597,6 +2054,12 @@ def _build_full_day_timeline(data: dict) -> dict:
         slot_hours = _number(task.get("Слот, ч", "")) or 0.0
         slot_minutes = max(0, round(slot_hours * 60))
         if slot_minutes <= 0:
+            continue
+        if (
+            task_budget_minutes is not None
+            and task_used_minutes + slot_minutes > task_budget_minutes
+        ):
+            unscheduled_tasks.append(task_id or str(task.get("Задача", "")))
             continue
         for _, meal_time in sorted(meal_pairs, key=lambda item: item[1]):
             if cursor <= meal_time < cursor + slot_minutes:
@@ -1613,6 +2076,43 @@ def _build_full_day_timeline(data: dict) -> dict:
             source_id=task_id,
         )
         cursor += slot_minutes
+        task_used_minutes += slot_minutes
+
+    if planning_state is not None:
+        user_tasks_text = str(planning_state.get("user_tasks_text") or "").strip()
+        user_hours, estimate_source = _preliminary_user_task_hours(
+            user_tasks_text,
+            str(planning_state.get("task_estimates_text") or ""),
+        )
+        user_minutes = round(user_hours * 60)
+        if user_minutes > 0:
+            user_label = "Новые задачи: " + re.sub(
+                r"\s+", " ", user_tasks_text
+            )[:180]
+            if estimate_source == "system_preliminary":
+                user_label += " — предварительная оценка системы"
+            if (
+                task_budget_minutes is not None
+                and task_used_minutes + user_minutes > task_budget_minutes
+            ):
+                unscheduled_tasks.append("новые задачи из обсуждения")
+            else:
+                for _, meal_time in sorted(meal_pairs, key=lambda item: item[1]):
+                    if cursor <= meal_time < cursor + user_minutes:
+                        cursor = meal_time + MEAL_BLOCK_MINUTES
+                if cursor + user_minutes > day_end:
+                    unscheduled_tasks.append("новые задачи из обсуждения")
+                else:
+                    _append_timeline_item(
+                        timeline,
+                        start=cursor,
+                        end=cursor + user_minutes,
+                        label=user_label,
+                        kind="discussion_task",
+                        source_id="MORNING_DIALOGUE",
+                    )
+                    cursor += user_minutes
+                    task_used_minutes += user_minutes
 
     timeline.sort(
         key=lambda item: (
@@ -1621,20 +2121,35 @@ def _build_full_day_timeline(data: dict) -> dict:
             item["end"] or item["start"],
         )
     )
+    core_finish = max(core_ends or [work_start])
     return {
         "timeline": timeline,
         "unscheduled_tasks": unscheduled_tasks,
         "reason": "OK",
         "game_hours": game_hours,
         "study_hours": study_hours,
+        "reduction_approved": reduction_approved,
+        "task_budget_hours": (
+            None if task_budget_minutes is None else task_budget_minutes / 60
+        ),
+        "core_overflow_minutes": max(0, core_finish - day_end),
+        "work_start": work_start,
     }
 
 
-def read_full_day_plan_test_data() -> dict:
+def read_full_day_plan_test_data(
+    planning_state: dict | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict:
     base_data = read_morning_day_plan_test_data()
     spreadsheet = get_spreadsheet()
     base_data["sources"] = _read_full_plan_sources(spreadsheet, base_data)
-    base_data["full_plan"] = _build_full_day_timeline(base_data)
+    base_data["full_plan"] = _build_full_day_timeline(
+        base_data,
+        planning_state,
+        now=now,
+    )
     return base_data
 
 
@@ -1864,89 +2379,107 @@ def _coordinator_session_decision_lines(
     *,
     now: datetime | None = None,
     time_aware: bool = True,
+    planning_state: dict | None = None,
 ) -> list[str]:
     day = data["day"]
     assessment = data["assessment"]
     status = assessment["status"]
-    game_hours = float(day.get("game_hours") or 0.0)
+    planned_game = float(day.get("game_hours") or 0.0)
+    planned_study = float(day.get("study_hours") or 0.0)
+    proposed_game = float(assessment.get("proposed_game_hours") or 0.0)
+    proposed_study = float(assessment.get("proposed_study_hours") or 0.0)
     sleep_quality = assessment.get("sleep_quality")
+    approval = (
+        planning_state.get("phase_reduction_approved")
+        if planning_state
+        else None
+    )
 
     current = now or datetime.now(MOSCOW_TZ)
     plan_date = data.get("date")
     current_minutes = current.hour * 60 + current.minute
-    game_start_minutes = _clock_to_minutes(ONLINE_GAME_START)
-
     lines: list[str] = []
-    if game_hours > 0:
-        lines.append("По плану сегодня онлайн-игра.")
-    else:
-        lines.append("По плану сегодня онлайн-игры нет.")
 
+    lines.append(
+        "Утверждённый покерный PLAN: "
+        f"игра — {_format_hours(planned_game)}, "
+        f"study — {_format_hours(planned_study)}."
+    )
     if sleep_quality is not None:
         lines.append(
             "Качество сна — "
             f"{_format_score_10(float(sleep_quality))}/10."
         )
 
-    if status in {"GREEN", "YELLOW"}:
-        allowed = (
-            game_hours
-            if status == "GREEN"
-            else float(assessment.get("allowed_hours") or 0.0)
-        )
-        finish = _add_hours_to_clock(ONLINE_GAME_START, allowed)
-        game_end_minutes = _clock_to_minutes(finish)
-        same_day = isinstance(plan_date, date) and plan_date == current.date()
+    if status == "INCOMPLETE":
+        reason = assessment.get("reasons", ["не хватает данных"])[0]
+        lines.append(f"Фазовая оценка не завершена: {reason}.")
+        return lines
 
-        if time_aware and same_day and current_minutes >= game_end_minutes:
+    if status == "NO_GAME":
+        lines.append("Покерной нагрузки сегодня по PLAN нет.")
+        return lines
+
+    if status == "GREEN":
+        lines.append(
+            "Фазовый агент рекомендует сохранить покерный PLAN без изменений. 🟢"
+        )
+    elif status in {"YELLOW", "RED"}:
+        reasons = "; ".join(assessment.get("reasons", [])[:3])
+        proposal = (
+            f"игра — {_format_hours(proposed_game)}, "
+            f"study — {_format_hours(proposed_study)}"
+        )
+        if approval is True:
             lines.append(
-                f"Игровое окно {ONLINE_GAME_START}–{finish} уже завершилось."
+                "Предложение фазового агента подтверждено: "
+                f"{proposal}. {'🟡' if status == 'YELLOW' else '🔴'}"
             )
-            if status == "GREEN":
-                lines.append(
-                    "Утреннее решение: полная сессия, зелёный свет. 🟢"
-                )
-            else:
-                lines.append(
-                    "Утреннее решение: сокращённая сессия, "
-                    "жёлтый свет. 🟡"
-                )
+        elif approval is False:
             lines.append(
-                "Факт сессии не подтверждён — выполненной её не отмечаю."
-            )
-        elif (
-            time_aware
-            and same_day
-            and game_start_minutes <= current_minutes < game_end_minutes
-        ):
-            if status == "GREEN":
-                decision_text = "полная сессия, зелёный свет 🟢"
-            else:
-                decision_text = "сокращённая сессия, жёлтый свет 🟡"
-            lines.append(
-                f"Игровое окно уже идёт и запланировано до {finish}."
-            )
-            lines.append(f"Утреннее решение: {decision_text}.")
-            lines.append(
-                "Текущий факт выполнения пока не подтверждён."
-            )
-        elif status == "GREEN":
-            lines.append(
-                "Игровая сессия разрешена. "
-                f"Сегодня играем {ONLINE_GAME_START}–{finish}. 🟢"
+                "Предложение о сокращении отклонено: исходный PLAN сохранён. "
+                "Дополнительную нагрузку агент не рекомендует."
             )
         else:
             lines.append(
-                "Игровая сессия разрешена в сокращённом формате: "
-                f"{ONLINE_GAME_START}–{finish}. 🟡"
+                "Фазовый агент предварительно предлагает сокращение: "
+                f"{proposal}."
             )
-    elif status == "RED":
-        lines.append("Сегодня онлайн-сессию отменяем. 🔴")
-    elif status == "NO_GAME":
-        lines.append("Дополнительное решение по игровой сессии не требуется.")
+            if reasons:
+                lines.append("Основание: " + reasons + ".")
+            lines.append(
+                "Это только предложение: до подтверждения исходный PLAN "
+                "не меняется и в таблицу ничего не записывается."
+            )
+
+    effective_game, _, reduction_approved = _effective_poker_hours(
+        data, planning_state
+    )
+    if effective_game <= 0:
+        if planned_game > 0 and reduction_approved:
+            lines.append("После подтверждённого сокращения онлайн-игры сегодня нет.")
+        elif planned_game <= 0:
+            lines.append("Онлайн-игры сегодня по PLAN нет.")
+        return lines
+
+    same_day = isinstance(plan_date, date) and plan_date == current.date()
+    start_minutes = _clock_to_minutes(ONLINE_GAME_START)
+    finish = _add_hours_to_clock(ONLINE_GAME_START, effective_game)
+    end_minutes = _clock_to_minutes(finish)
+    if not time_aware or not same_day:
+        lines.append(f"Плановое игровое окно: {ONLINE_GAME_START}–{finish}.")
+    elif current_minutes >= end_minutes:
+        lines.append(
+            f"Плановое игровое окно {ONLINE_GAME_START}–{finish} уже прошло; "
+            "факт выполнения не подтверждён."
+        )
+    elif start_minutes <= current_minutes < end_minutes:
+        lines.append(
+            f"Плановое игровое окно уже идёт и рассчитано до {finish}; "
+            "факт выполнения пока не подтверждён."
+        )
     else:
-        reason = assessment.get("reasons", ["не хватает данных"])[0]
-        lines.append(f"Решение по сессии не принято: {reason}.")
+        lines.append(f"Плановое игровое окно: {ONLINE_GAME_START}–{finish}.")
     return lines
 
 
@@ -2118,11 +2651,14 @@ def _coordinator_system_status_message() -> str:
         f"Утро: {morning_status}.\n"
         "Сейчас доступны: запуск дня фразой «Доброе утро», контроль трёх "
         "чек-листов и напоминаний, ускоренный тест /morningtest, "
-        "оценка игровой сессии, сборка плана дня "
-        "с учётом текущего времени, чтение времени приёмов пищи и "
-        "допущенных задач.\n"
-        "Не подключены полностью: агент фаз, меню питания, покерный агент "
-        "широкого профиля и финальный планировщик-исполнитель."
+        "пошаговое утреннее обсуждение плана, чтение фактического времени "
+        "подъёма из чек-листа, входящих задач из вкладки 17 и допущенных "
+        "задач из вкладки 05.\n"
+        "Фазовый агент оценивает сон, энергию, ясность и признаки перегруза. "
+        "Он не повышает покерный объём и не сокращает его автоматически: "
+        "снижение применяется только после явного APPROVAL Андрея.\n"
+        "Не подключены полностью: меню питания, покерный агент широкого "
+        "профиля и запись финального расписания планировщиком-исполнителем."
     )
 
 
@@ -2811,6 +3347,147 @@ def finish_action(
             entry,
         )
         return entry
+
+
+def update_started_action_state(
+    action_id: str,
+    state: dict,
+    *,
+    system_check: str = "STATE_UPDATED",
+) -> dict:
+    with action_journal_thread_lock:
+        _, worksheet = ensure_action_journal_sheet()
+        entry = next(
+            (
+                candidate
+                for candidate in read_action_journal_entries()
+                if candidate["action_id"] == action_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise LookupError(f"Action journal entry {action_id} was not found.")
+        if entry["status"] != ACTION_STATUS_STARTED:
+            raise RuntimeError(
+                f"Action {action_id} is not open: {entry['status']}."
+            )
+        entry["result_json"] = _stable_json(state)
+        entry["system_check"] = system_check
+        _write_action_journal_entry(worksheet, entry)
+        return entry
+
+
+def _morning_planning_key(target_date: date) -> str:
+    return f"morning-planning:{target_date.isoformat()}"
+
+
+def _morning_planning_object_id(target_date: date) -> str:
+    return f"MORNING-PLAN-{target_date.strftime('%Y%m%d')}"
+
+
+def find_morning_planning_entry(
+    target_date: date | None = None,
+) -> dict | None:
+    target = target_date or datetime.now(MOSCOW_TZ).date()
+    key = _morning_planning_key(target)
+    return next(
+        (
+            entry
+            for entry in read_action_journal_entries()
+            if entry["idempotency_key"] == key
+            and entry["operation"] == MORNING_PLANNING_OPERATION
+        ),
+        None,
+    )
+
+
+def read_morning_planning_state(
+    target_date: date | None = None,
+) -> tuple[dict | None, dict | None]:
+    entry = find_morning_planning_entry(target_date)
+    if entry is None:
+        return None, None
+    state = _parse_json_object(entry.get("result_json", ""))
+    return entry, state
+
+
+def create_morning_planning_state_once(
+    *,
+    chat_id: int,
+    target_date: date,
+    initial_state: dict,
+) -> tuple[dict, dict, bool]:
+    existing, state = read_morning_planning_state(target_date)
+    if existing is not None:
+        if state:
+            return existing, state, False
+        if existing.get("status") == ACTION_STATUS_STARTED:
+            existing = update_started_action_state(
+                existing["action_id"],
+                initial_state,
+                system_check="MORNING_PLANNING_STATE_RECOVERED",
+            )
+            return existing, initial_state, False
+        return existing, initial_state, False
+
+    claim = begin_action_once(
+        idempotency_key=_morning_planning_key(target_date),
+        operation=MORNING_PLANNING_OPERATION,
+        object_type=MORNING_PLANNING_OBJECT_TYPE,
+        object_id=_morning_planning_object_id(target_date),
+        source=MORNING_PLANNING_SOURCE,
+        target=f"Telegram chat {chat_id}",
+        payload={
+            "date": target_date.isoformat(),
+            "chat_id": chat_id,
+            "coordinator_version": COORDINATOR_VERSION,
+        },
+    )
+    entry = claim["entry"]
+    if claim["blocked"]:
+        restored = _parse_json_object(entry.get("result_json", ""))
+        return entry, restored or initial_state, False
+    entry = update_started_action_state(
+        entry["action_id"],
+        initial_state,
+        system_check="MORNING_PLANNING_STARTED",
+    )
+    return entry, initial_state, True
+
+
+def save_morning_planning_state(
+    entry: dict,
+    state: dict,
+    *,
+    system_check: str,
+) -> dict:
+    if state.get("stage") not in MORNING_PLANNING_STAGES:
+        raise ValueError(f"Unsupported morning planning stage: {state.get('stage')}")
+    state["updated_at"] = datetime.now(MOSCOW_TZ).replace(
+        microsecond=0
+    ).isoformat()
+    return update_started_action_state(
+        entry["action_id"],
+        state,
+        system_check=system_check,
+    )
+
+
+def complete_morning_planning_state(
+    entry: dict,
+    state: dict,
+) -> dict:
+    state["stage"] = "COMPLETED"
+    state["completed_at"] = datetime.now(MOSCOW_TZ).replace(
+        microsecond=0
+    ).isoformat()
+    return finish_action(
+        entry["action_id"],
+        status=ACTION_STATUS_SUCCEEDED,
+        result=state,
+        error="",
+        system_check="MORNING_PLAN_CONFIRMED",
+    )
 
 
 def execute_action_once(
@@ -4856,6 +5533,840 @@ async def _send_morning_checklist_prompt(
     )
 
 
+def _planning_phase_snapshot(data: dict) -> dict:
+    assessment = data["assessment"]
+    return {
+        "status": assessment.get("status", "INCOMPLETE"),
+        "reasons": list(assessment.get("reasons", [])),
+        "planned_game_hours": float(data["day"].get("game_hours") or 0.0),
+        "planned_study_hours": float(data["day"].get("study_hours") or 0.0),
+        "proposed_game_hours": float(
+            assessment.get("proposed_game_hours")
+            if assessment.get("proposed_game_hours") is not None
+            else data["day"].get("game_hours") or 0.0
+        ),
+        "proposed_study_hours": float(
+            assessment.get("proposed_study_hours")
+            if assessment.get("proposed_study_hours") is not None
+            else data["day"].get("study_hours") or 0.0
+        ),
+        "requires_approval": bool(assessment.get("requires_approval")),
+        "recommendation": assessment.get("recommendation", "WAIT_FOR_DATA"),
+        "sleep_quality": assessment.get("sleep_quality"),
+    }
+
+
+def _planning_inbox_snapshot(data: dict) -> list[dict]:
+    result: list[dict] = []
+    for task in data.get("sources", {}).get("inbox_tasks", [])[:10]:
+        result.append({
+            "inbox_id": str(task.get("INBOX_ID", "")).strip(),
+            "label": _inbox_task_label(task),
+            "status": str(task.get("Статус разбора", "")).strip(),
+            "deadline": str(task.get("Дедлайн", "")).strip(),
+            "window": str(task.get("Жёсткое временное окно", "")).strip(),
+            "estimate_user": str(
+                task.get("Оценка времени Андрея, ч", "")
+            ).strip(),
+            "estimate_system": str(
+                task.get("Оценка времени системы, ч", "")
+            ).strip(),
+            "needs": _inbox_task_needs(task),
+        })
+    return result
+
+
+def _planning_ready_tasks_snapshot(data: dict) -> list[dict]:
+    result: list[dict] = []
+    for task in data.get("sources", {}).get("ready_tasks", [])[:10]:
+        result.append({
+            "task_id": str(task.get("Task ID", "")).strip(),
+            "label": str(task.get("Задача", "")).strip(),
+            "slot_hours": _number(task.get("Слот, ч", "")) or 0.0,
+            "urgency": str(task.get("Срочность", "")).strip(),
+        })
+    return result
+
+
+def _build_initial_morning_planning_state(
+    *,
+    chat_id: int,
+    data: dict,
+) -> dict:
+    wake = dict(data.get("wake") or {})
+    if not wake.get("time"):
+        morning_entry = find_morning_session_entry(data["date"])
+        fallback = (
+            _morning_session_started_at(morning_entry)
+            if morning_entry is not None
+            else datetime.now(MOSCOW_TZ)
+        )
+        wake = _extract_wake_time(data.get("morning"), fallback=fallback)
+    return {
+        "date": data["date"].isoformat(),
+        "chat_id": chat_id,
+        "stage": "ASK_MEAL",
+        "wake_time": wake.get("time", ""),
+        "wake_source": wake.get("source", "unavailable"),
+        "wake_exact": bool(wake.get("exact")),
+        "meal_eaten": None,
+        "meal_time": "",
+        "user_tasks_text": "",
+        "task_estimates_text": "",
+        "hard_end_time": "",
+        "preferred_work_start": "",
+        "phase": _planning_phase_snapshot(data),
+        "phase_reduction_approved": None,
+        "inbox_available": bool(
+            data.get("sources", {}).get("inbox_available")
+        ),
+        "inbox_message": str(
+            data.get("sources", {}).get("inbox_message", "")
+        ),
+        "inbox_tasks": _planning_inbox_snapshot(data),
+        "ready_tasks": _planning_ready_tasks_snapshot(data),
+        "revision_notes": [],
+        "history": [],
+        "draft": "",
+        "created_at": datetime.now(MOSCOW_TZ).replace(
+            microsecond=0
+        ).isoformat(),
+    }
+
+
+def _planning_initial_question(state: dict) -> str:
+    wake = state.get("wake_time") or "не распознано"
+    wake_note = (
+        "из утреннего чек-листа"
+        if state.get("wake_exact")
+        else "ориентировочно по записи утренней сессии"
+    )
+    phase = state["phase"]
+    lines = [
+        "Андрей Николаевич, все три утренних чек-листа заполнены.",
+        "",
+        "Начинаем именно обсуждение плана, а не мгновенную выдачу расписания.",
+        f"Время подъёма: {wake} ({wake_note}). Повторно его не спрашиваю.",
+        (
+            "Утверждённый покерный PLAN: "
+            f"игра — {_format_hours(phase['planned_game_hours'])}, "
+            f"study — {_format_hours(phase['planned_study_hours'])}."
+        ),
+        "",
+        "Первый вопрос: уже был какой-нибудь приём пищи? "
+        "Если да — напишите примерно во сколько. Если нет — так и напишите.",
+    ]
+    return "\n".join(lines)[:4000]
+
+
+def _parse_meal_response(text: str) -> tuple[bool | None, str]:
+    normalized = _normalize_text(text)
+    clock = _extract_clock_from_text(text)
+    negative_phrases = (
+        "не ел",
+        "не ела",
+        "не завтракал",
+        "не завтракала",
+        "приема пищи не было",
+        "приёма пищи не было",
+        "еще не ел",
+        "ещё не ел",
+        "нет, не",
+    )
+    if normalized in {"нет", "ещё нет", "еще нет"} or any(
+        phrase in normalized for phrase in negative_phrases
+    ):
+        return False, ""
+    positive_phrases = (
+        "поел",
+        "поела",
+        "завтракал",
+        "завтракала",
+        "прием пищи был",
+        "приём пищи был",
+        "уже ел",
+        "уже поел",
+    )
+    if (
+        clock
+        or re.search(r"\bда\b", normalized)
+        or any(phrase in normalized for phrase in positive_phrases)
+    ):
+        return True, clock
+    return None, ""
+
+
+def _planning_inbox_question(state: dict) -> str:
+    lines = [
+        "Принято. Теперь соберём задачи и ограничения дня.",
+        "",
+    ]
+    ready = state.get("ready_tasks", [])
+    if ready:
+        lines.append("Штаб уже знает допущенные задачи из вкладки 05:")
+        for task in ready[:5]:
+            task_id = task.get("task_id") or "без ID"
+            lines.append(
+                f"• {task_id}: {task.get('label') or 'задача'} "
+                f"({_format_hours(float(task.get('slot_hours') or 0.0))})."
+            )
+        lines.append("")
+
+    inbox = state.get("inbox_tasks", [])
+    if inbox:
+        lines.append("Во входящих задачах уже записано:")
+        for task in inbox[:6]:
+            suffix = ""
+            if task.get("needs"):
+                suffix = " — нужно уточнить: " + ", ".join(task["needs"])
+            lines.append(
+                f"• {task.get('inbox_id') or 'INBOX'}: "
+                f"{task.get('label')}{suffix}."
+            )
+        lines.append("")
+    elif not state.get("inbox_available"):
+        lines.append(
+            "Вкладка 17_Входящие_задачи пока недоступна; "
+            "бот продолжит без неё и не завершится с ошибкой."
+        )
+        lines.append("")
+
+    lines.extend([
+        "Какие обязательные события, поездки, звонки или новые задачи "
+        "появились на сегодня?",
+        "Укажите также жёсткое время, если оно есть. Можно написать всё "
+        "одним сообщением. Если ничего нового — ответьте «нет».",
+    ])
+    return "\n".join(lines)[:4000]
+
+
+def _planning_has_no_user_tasks(text: str) -> bool:
+    return _normalize_text(text) in {
+        "нет",
+        "ничего",
+        "нет задач",
+        "новых задач нет",
+        "ничего нового",
+    }
+
+
+def _extract_hard_end_time(text: str) -> str:
+    normalized = _normalize_text(text)
+    patterns = (
+        r"(?:закончить|завершить|работать)\s+(?:нужно\s+)?до\s+((?:[01]\d|2[0-3]):[0-5]\d)",
+        r"ж[её]стк\w*\s+(?:конец|финиш).*?((?:[01]\d|2[0-3]):[0-5]\d)",
+        r"до\s+((?:[01]\d|2[0-3]):[0-5]\d)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _extract_preferred_start(text: str) -> str:
+    normalized = _normalize_text(text)
+    match = re.search(
+        r"(?:начать|старт|начало|работу с|работать с)\D*"
+        r"((?:[01]\d|2[0-3]):[0-5]\d)",
+        normalized,
+    )
+    return match.group(1) if match else ""
+
+
+def _planning_needs_estimates(state: dict) -> bool:
+    if state.get("user_tasks_text") and not _planning_has_no_user_tasks(
+        state["user_tasks_text"]
+    ):
+        return True
+    return any(task.get("needs") for task in state.get("inbox_tasks", []))
+
+
+def _planning_estimates_question(state: dict) -> str:
+    lines = [
+        "Теперь нужна оценка объёма, чтобы фазовый агент не перегрузил день.",
+        "",
+    ]
+    if state.get("user_tasks_text") and not _planning_has_no_user_tasks(
+        state["user_tasks_text"]
+    ):
+        lines.append(
+            "Сколько примерно займут новые задачи? Можно дать общую оценку "
+            "или по каждой задаче. Если не знаете — напишите «не знаю», "
+            "и штаб даст предварительную оценку."
+        )
+    missing = [task for task in state.get("inbox_tasks", []) if task.get("needs")]
+    if missing:
+        lines.append("")
+        lines.append("По входящим ещё не хватает:")
+        for task in missing[:6]:
+            lines.append(
+                f"• {task.get('label')}: {', '.join(task.get('needs', []))}."
+            )
+        lines.append(
+            "Можно уточнить эти данные сейчас либо прямо указать, что задача "
+            "сегодня не рассматривается."
+        )
+    return "\n".join(lines)[:4000]
+
+
+def _planning_phase_proposal_message(state: dict) -> str:
+    phase = state["phase"]
+    reasons = "; ".join(phase.get("reasons", [])[:4]) or "состояние ниже рабочего"
+    light = "🟡" if phase.get("status") == "YELLOW" else "🔴"
+    return (
+        f"Фазовый агент завершил предварительную оценку {light}\n\n"
+        "Исходный утверждённый PLAN:\n"
+        f"• игра — {_format_hours(phase['planned_game_hours'])};\n"
+        f"• study — {_format_hours(phase['planned_study_hours'])}.\n\n"
+        "Предложение по сокращению:\n"
+        f"• игра — {_format_hours(phase['proposed_game_hours'])};\n"
+        f"• study — {_format_hours(phase['proposed_study_hours'])}.\n\n"
+        f"Основание: {reasons}.\n\n"
+        "Это только предложение. До вашего подтверждения исходный PLAN "
+        "не меняется и запись в рабочие таблицы не производится.\n\n"
+        "Ответьте: «сокращаем» или «оставляем исходный план»."
+    )[:4000]
+
+
+def _phase_approval_from_text(text: str) -> bool | None:
+    normalized = _normalize_text(text)
+    reject_phrases = (
+        "не сокращ",
+        "оставляем",
+        "оставь",
+        "исходный план",
+        "без сокращ",
+        "нет",
+    )
+    if any(phrase in normalized for phrase in reject_phrases):
+        return False
+    approve_phrases = (
+        "сокращаем",
+        "сократить",
+        "согласен",
+        "согласна",
+        "подтверждаю сокращение",
+    )
+    if re.search(r"\bда\b", normalized) or any(
+        phrase in normalized for phrase in approve_phrases
+    ):
+        return True
+    return None
+
+
+def _planning_refresh_live_state(state: dict, data: dict) -> None:
+    state["phase"] = _planning_phase_snapshot(data)
+    state["inbox_available"] = bool(
+        data.get("sources", {}).get("inbox_available")
+    )
+    state["inbox_message"] = str(
+        data.get("sources", {}).get("inbox_message", "")
+    )
+    state["inbox_tasks"] = _planning_inbox_snapshot(data)
+    state["ready_tasks"] = _planning_ready_tasks_snapshot(data)
+
+
+def _planning_draft_message(state: dict) -> str:
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    data = read_full_day_plan_test_data(state, now=now)
+    _planning_refresh_live_state(state, data)
+    full_plan = data["full_plan"]
+    phase = state["phase"]
+    meal_text = (
+        "приёма пищи ещё не было"
+        if state.get("meal_eaten") is False
+        else (
+            "приём пищи был"
+            + (f" около {state.get('meal_time')}" if state.get("meal_time") else "")
+        )
+    )
+    lines = [
+        "Черновик плана для обсуждения",
+        "",
+        f"Фактический подъём: {state.get('wake_time') or '—'}.",
+        f"Питание: {meal_text}.",
+        (
+            "Покерный объём в черновике: "
+            f"игра — {_format_hours(float(full_plan.get('game_hours') or 0.0))}, "
+            f"study — {_format_hours(float(full_plan.get('study_hours') or 0.0))}."
+        ),
+    ]
+    if phase.get("requires_approval"):
+        lines.append(
+            "Решение по предложенному сокращению: "
+            + (
+                "подтверждено"
+                if state.get("phase_reduction_approved") is True
+                else "отклонено, исходный PLAN сохранён"
+            )
+            + "."
+        )
+    budget = full_plan.get("task_budget_hours")
+    if budget is not None:
+        lines.append(
+            "Предварительный резерв на дополнительные задачи: "
+            f"до {_format_hours(float(budget))}."
+        )
+    lines.extend(["", "Предлагаемая последовательность:"])
+    current_minutes = now.hour * 60 + now.minute
+    rendered = 0
+    for item in full_plan.get("timeline", []):
+        end = item.get("end")
+        if end is not None and int(end) <= current_minutes:
+            continue
+        start_text = (
+            "сейчас"
+            if int(item["start"]) <= current_minutes < int(end or item["start"] + 1)
+            else _minutes_to_clock(int(item["start"]))
+        )
+        if end is None:
+            lines.append(f"• {start_text} — {item['label']}.")
+        else:
+            lines.append(
+                f"• {start_text}–{_minutes_to_clock(int(end))} — {item['label']}."
+            )
+        rendered += 1
+    if rendered == 0:
+        lines.append("• На оставшуюся часть дня блоки пока не размещены.")
+
+    inbox = state.get("inbox_tasks", [])
+    if inbox:
+        lines.extend(["", "Входящие, которые не включены автоматически:"])
+        for task in inbox[:6]:
+            suffix = (
+                " — нужно уточнить " + ", ".join(task.get("needs", []))
+                if task.get("needs")
+                else " — ожидает переноса в реестр задач"
+            )
+            lines.append(f"• {task.get('label')}{suffix}.")
+
+    if full_plan.get("unscheduled_tasks"):
+        lines.extend([
+            "",
+            "Не помещается в безопасный объём или временное окно: "
+            + ", ".join(full_plan["unscheduled_tasks"])
+            + ".",
+        ])
+    if full_plan.get("core_overflow_minutes", 0) > 0:
+        lines.extend([
+            "",
+            "Конфликт: основной покерный объём выходит за установленное "
+            f"время завершения примерно на {full_plan['core_overflow_minutes']} мин. "
+            "Я не сокращаю его автоматически — это нужно отдельно согласовать.",
+        ])
+    if state.get("revision_notes"):
+        lines.extend(["", "Последние корректировки:"])
+        for note in state["revision_notes"][-3:]:
+            lines.append(f"• {note}")
+
+    lines.extend([
+        "",
+        "Это черновик, а не утверждённый план. Ответьте «утверждаю» "
+        "или напишите, что изменить.",
+    ])
+    draft = "\n".join(lines)[:4000]
+    state["draft"] = draft
+    return draft
+
+
+def _planning_approval_from_text(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return any(
+        phrase in normalized
+        for phrase in (
+            "утверждаю",
+            "подтверждаю план",
+            "план принимаю",
+            "план утвержден",
+            "план утверждён",
+        )
+    )
+
+
+def _planning_current_prompt(state: dict) -> str:
+    stage = state.get("stage")
+    if stage == "ASK_MEAL":
+        return _planning_initial_question(state)
+    if stage == "ASK_TASKS":
+        return _planning_inbox_question(state)
+    if stage == "ASK_ESTIMATES":
+        return _planning_estimates_question(state)
+    if stage == "PHASE_APPROVAL":
+        return _planning_phase_proposal_message(state)
+    if stage == "DRAFT_REVIEW":
+        return state.get("draft") or _planning_draft_message(state)
+    if stage == "COMPLETED":
+        return "План обсуждён и подтверждён."
+    return ""
+
+
+def _planning_status_message(entry: dict, state: dict) -> str:
+    stage_labels = {
+        "ASK_MEAL": "ожидается информация о приёме пищи",
+        "ASK_TASKS": "ожидаются новые задачи и ограничения",
+        "ASK_ESTIMATES": "ожидается оценка длительности задач",
+        "PHASE_APPROVAL": "ожидается решение по сокращению покерного объёма",
+        "DRAFT_REVIEW": "черновик сформирован и ждёт утверждения",
+        "COMPLETED": "план обсуждён и подтверждён",
+    }
+    lines = [
+        f"Утренняя планировочная сессия: {stage_labels.get(state.get('stage'), state.get('stage'))}.",
+        f"Подъём: {state.get('wake_time') or '—'}.",
+        f"ACTION_ID: {entry.get('action_id', '—')}.",
+    ]
+    prompt = _planning_current_prompt(state)
+    if prompt:
+        lines.extend(["", "Текущий вопрос / черновик:", prompt])
+    return "\n".join(lines)[:4000]
+
+
+def _create_or_restore_planning_session(
+    *,
+    chat_id: int,
+    target_date: date,
+) -> tuple[dict, dict, bool]:
+    existing, existing_state = read_morning_planning_state(target_date)
+    if existing is not None and existing_state:
+        return existing, existing_state, False
+    data = read_full_day_plan_test_data()
+    initial = _build_initial_morning_planning_state(chat_id=chat_id, data=data)
+    return create_morning_planning_state_once(
+        chat_id=chat_id,
+        target_date=target_date,
+        initial_state=initial,
+    )
+
+
+async def _planning_advance_to_phase_or_draft(
+    *,
+    entry: dict,
+    state: dict,
+) -> str:
+    data = await asyncio.to_thread(read_full_day_plan_test_data)
+    _planning_refresh_live_state(state, data)
+    phase = state["phase"]
+    if phase.get("requires_approval"):
+        state["stage"] = "PHASE_APPROVAL"
+        await asyncio.to_thread(
+            save_morning_planning_state,
+            entry,
+            state,
+            system_check="WAITING_PHASE_APPROVAL",
+        )
+        return _planning_phase_proposal_message(state)
+
+    state["phase_reduction_approved"] = None
+    state["stage"] = "DRAFT_REVIEW"
+    draft = await asyncio.to_thread(_planning_draft_message, state)
+    await asyncio.to_thread(
+        save_morning_planning_state,
+        entry,
+        state,
+        system_check="DRAFT_READY",
+    )
+    return draft
+
+
+async def start_or_continue_morning_planning(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    target_date = datetime.now(MOSCOW_TZ).date()
+    try:
+        snapshot = await asyncio.to_thread(
+            build_morning_session_snapshot,
+            target_date,
+        )
+    except Exception as exc:
+        logger.exception("Morning planning checklist read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать утренние чек-листы ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+        return
+    if snapshot is None or not snapshot["state"]["all_filled"]:
+        await update.effective_message.reply_text(
+            "Сначала нужно завершить три утренних чек-листа."
+        )
+        return
+    try:
+        entry, state, created = await asyncio.to_thread(
+            _create_or_restore_planning_session,
+            chat_id=update.effective_chat.id,
+            target_date=target_date,
+        )
+    except Exception as exc:
+        logger.exception("Morning planning session start failed")
+        await update.effective_message.reply_text(
+            "Не удалось начать обсуждение плана ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+        return
+    if created:
+        await update.effective_message.reply_text(
+            _planning_initial_question(state)
+        )
+    else:
+        await update.effective_message.reply_text(
+            _planning_status_message(entry, state)
+        )
+
+
+async def handle_morning_planning_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    target_date = datetime.now(MOSCOW_TZ).date()
+    try:
+        entry, state = await asyncio.to_thread(
+            read_morning_planning_state,
+            target_date,
+        )
+    except Exception:
+        logger.exception("Morning planning state read failed")
+        return False
+    if entry is None or not state or state.get("stage") == "COMPLETED":
+        return False
+    if entry.get("status") != ACTION_STATUS_STARTED:
+        return False
+
+    async with morning_planning_lock:
+        stage = state.get("stage")
+        state.setdefault("history", []).append({
+            "stage": stage,
+            "user_text": text,
+            "at": datetime.now(MOSCOW_TZ).replace(microsecond=0).isoformat(),
+        })
+
+        if stage == "ASK_MEAL":
+            eaten, meal_time = _parse_meal_response(text)
+            if eaten is None:
+                await update.effective_message.reply_text(
+                    "Не смог однозначно понять ответ. Напишите, пожалуйста: "
+                    "«не ел» либо «ел примерно в HH:MM»."
+                )
+                return True
+            state["meal_eaten"] = eaten
+            state["meal_time"] = meal_time
+            state["stage"] = "ASK_TASKS"
+            await asyncio.to_thread(
+                save_morning_planning_state,
+                entry,
+                state,
+                system_check="MEAL_CONTEXT_CAPTURED",
+            )
+            await update.effective_message.reply_text(
+                _planning_inbox_question(state)
+            )
+            return True
+
+        if stage == "ASK_TASKS":
+            state["user_tasks_text"] = text
+            hard_end = _extract_hard_end_time(text)
+            if hard_end:
+                state["hard_end_time"] = hard_end
+            if _planning_needs_estimates(state):
+                state["stage"] = "ASK_ESTIMATES"
+                await asyncio.to_thread(
+                    save_morning_planning_state,
+                    entry,
+                    state,
+                    system_check="TASK_CONTEXT_CAPTURED",
+                )
+                await update.effective_message.reply_text(
+                    _planning_estimates_question(state)
+                )
+                return True
+            response = await _planning_advance_to_phase_or_draft(
+                entry=entry,
+                state=state,
+            )
+            await update.effective_message.reply_text(response)
+            return True
+
+        if stage == "ASK_ESTIMATES":
+            state["task_estimates_text"] = text
+            hard_end = _extract_hard_end_time(text)
+            if hard_end:
+                state["hard_end_time"] = hard_end
+            response = await _planning_advance_to_phase_or_draft(
+                entry=entry,
+                state=state,
+            )
+            await update.effective_message.reply_text(response)
+            return True
+
+        if stage == "PHASE_APPROVAL":
+            approval = _phase_approval_from_text(text)
+            if approval is None:
+                await update.effective_message.reply_text(
+                    "Нужно явное решение: «сокращаем» или "
+                    "«оставляем исходный план»."
+                )
+                return True
+            state["phase_reduction_approved"] = approval
+            state["stage"] = "DRAFT_REVIEW"
+            draft = await asyncio.to_thread(_planning_draft_message, state)
+            await asyncio.to_thread(
+                save_morning_planning_state,
+                entry,
+                state,
+                system_check=(
+                    "PHASE_REDUCTION_APPROVED"
+                    if approval
+                    else "PHASE_REDUCTION_REJECTED"
+                ),
+            )
+            await update.effective_message.reply_text(draft)
+            return True
+
+        if stage == "DRAFT_REVIEW":
+            if _planning_approval_from_text(text):
+                final_entry = await asyncio.to_thread(
+                    complete_morning_planning_state,
+                    entry,
+                    state,
+                )
+                await update.effective_message.reply_text(
+                    "План обсуждён и подтверждён ✅\n\n"
+                    "Зафиксировал согласование в журнале штаба. "
+                    "Покерный PLAN меняется только в пределах явно "
+                    "подтверждённого сокращения.\n"
+                    f"ACTION_ID: {final_entry['action_id']}"
+                )
+                return True
+
+            preferred = _extract_preferred_start(text)
+            hard_end = _extract_hard_end_time(text)
+            parsed_change = False
+            if preferred:
+                state["preferred_work_start"] = preferred
+                parsed_change = True
+            if hard_end:
+                state["hard_end_time"] = hard_end
+                parsed_change = True
+            meal_eaten, meal_time = _parse_meal_response(text)
+            if meal_eaten is not None and any(
+                word in _normalize_text(text)
+                for word in ("ел", "поел", "завтрак", "прием пищи", "приём пищи")
+            ):
+                state["meal_eaten"] = meal_eaten
+                if meal_time:
+                    state["meal_time"] = meal_time
+                parsed_change = True
+            state.setdefault("revision_notes", []).append(text)
+            draft = await asyncio.to_thread(_planning_draft_message, state)
+            await asyncio.to_thread(
+                save_morning_planning_state,
+                entry,
+                state,
+                system_check=(
+                    "DRAFT_REBUILT_FROM_CONSTRAINTS"
+                    if parsed_change
+                    else "DRAFT_REVISION_NOTED"
+                ),
+            )
+            prefix = (
+                "Ограничения распознаны и черновик пересобран.\n\n"
+                if parsed_change
+                else "Правку зафиксировал как комментарий. "
+                "Для автоматической пересборки укажите конкретное время "
+                "начала/окончания или изменение объёма.\n\n"
+            )
+            await update.effective_message.reply_text(prefix + draft)
+            return True
+
+    return False
+
+
+async def planningstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    try:
+        entry, state = await asyncio.to_thread(
+            read_morning_planning_state,
+            datetime.now(MOSCOW_TZ).date(),
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(
+            "Не удалось прочитать планировочную сессию ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+        return
+    if entry is None or not state:
+        await update.effective_message.reply_text(
+            "Сегодня обсуждение плана ещё не запускалось."
+        )
+        return
+    await update.effective_message.reply_text(
+        _planning_status_message(entry, state)
+    )
+
+
+async def planningtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    try:
+        data = await asyncio.to_thread(read_full_day_plan_test_data)
+        state = _build_initial_morning_planning_state(
+            chat_id=update.effective_chat.id,
+            data=data,
+        )
+        state["meal_eaten"] = False
+        state["user_tasks_text"] = "Тестовая бытовая задача"
+        state["task_estimates_text"] = "1 час"
+        planned_before = _effective_poker_hours(data, state)
+        state["phase_reduction_approved"] = True
+        planned_after = _effective_poker_hours(data, state)
+        draft = await asyncio.to_thread(_planning_draft_message, state)
+        phase = state["phase"]
+        checks = {
+            "wake_from_checklist_or_fallback": bool(state.get("wake_time")),
+            "no_wake_question": "во сколько вы проснулись" not in _normalize_text(
+                _planning_initial_question(state)
+            ),
+            "plan_unchanged_before_approval": (
+                planned_before[0] == phase["planned_game_hours"]
+                and planned_before[1] == phase["planned_study_hours"]
+            ),
+            "reduction_only_after_approval": (
+                not phase.get("requires_approval")
+                or (
+                    planned_after[0] == phase["proposed_game_hours"]
+                    and planned_after[1] == phase["proposed_study_hours"]
+                )
+            ),
+            "inbox_read_is_graceful": "inbox_available" in state,
+            "draft_built": "Черновик плана" in draft,
+        }
+        failed = [name for name, ok in checks.items() if not ok]
+    except Exception as exc:
+        logger.exception("Planning self-test failed")
+        await update.effective_message.reply_text(
+            "Тест утреннего обсуждения завершился ошибкой ❌\n"
+            f"{type(exc).__name__}: {str(exc)[:500]}"
+        )
+        return
+    lines = [
+        "🧪 Тест утреннего обсуждения плана",
+        "",
+        *(f"{'✅' if ok else '❌'} {name}" for name, ok in checks.items()),
+        "",
+        f"Вкладка 17 доступна: {'да' if state.get('inbox_available') else 'нет — обработано без падения'}.",
+        f"Итог: {'PASS' if not failed else 'FAIL: ' + ', '.join(failed)}.",
+        "Рабочая планировочная сессия и таблицы не изменялись.",
+    ]
+    await update.effective_message.reply_text("\n".join(lines)[:4000])
+
+
 async def morning_orchestrator_tick(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -4873,24 +6384,33 @@ async def morning_orchestrator_tick(
 
     state = snapshot["state"]
     if state["all_filled"]:
-        if snapshot["ready_sent"]:
-            return
         ready_at = snapshot["ready_at"]
         if ready_at is None or now < ready_at:
             return
         try:
+            planning_entry, planning_state = await asyncio.to_thread(
+                read_morning_planning_state,
+                snapshot["date"],
+            )
+            if planning_entry is not None and planning_state:
+                return
+            planning_entry, planning_state, _ = await asyncio.to_thread(
+                _create_or_restore_planning_session,
+                chat_id=snapshot["chat_id"],
+                target_date=snapshot["date"],
+            )
             await _send_morning_message_once(
                 bot=context.bot,
                 chat_id=snapshot["chat_id"],
-                idempotency_key=_morning_ready_action_key(snapshot["date"]),
-                operation="MORNING_READY_FOR_PLAN",
-                object_id=_morning_session_object_id(snapshot["date"]),
-                text=(
-                    "Андрей Николаевич, все три утренних чек-листа заполнены.\n\n"
-                    "Мы готовы обсудить план на день."
+                idempotency_key=(
+                    f"morning-planning-start:{snapshot['date'].isoformat()}"
                 ),
+                operation="MORNING_PLANNING_STARTED_MESSAGE",
+                object_id=_morning_planning_object_id(snapshot["date"]),
+                text=_planning_initial_question(planning_state),
                 payload={
                     "date": snapshot["date"].isoformat(),
+                    "planning_action_id": planning_entry["action_id"],
                     "last_checklist_at": (
                         snapshot["last_completed_at"].isoformat()
                         if snapshot["last_completed_at"]
@@ -4899,7 +6419,7 @@ async def morning_orchestrator_tick(
                 },
             )
         except Exception:
-            logger.exception("Morning ready message failed")
+            logger.exception("Morning planning start message failed")
         return
 
     checks = (
@@ -5389,11 +6909,7 @@ async def hqtest(
             getattr(update.effective_user, "id", None),
         )
         return
-    await _process_coordinator_message(
-        update,
-        "Составь план на день на основании текущих данных.",
-        forced_intent="BUILD_DAY_PLAN",
-    )
+    await start_or_continue_morning_planning(update, context)
 
 
 async def hqstatus(
@@ -5421,6 +6937,11 @@ async def hq(
         return
     if MORNING_TRIGGER_PATTERN.search(request_text):
         await start_or_continue_morning_session(update, context)
+        return
+    if _coordinator_heuristic_route(request_text)["intent"] == "BUILD_DAY_PLAN":
+        await start_or_continue_morning_planning(update, context)
+        return
+    if await handle_morning_planning_message(update, context, request_text):
         return
     await _process_coordinator_message(update, request_text)
 
@@ -5649,6 +7170,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await handle_morning_defer(update, defer_match)
             return
 
+    if _coordinator_heuristic_route(text)["intent"] == "BUILD_DAY_PLAN":
+        await start_or_continue_morning_planning(update, context)
+        return
+
+    if await handle_morning_planning_message(update, context, text):
+        return
+
     await _process_coordinator_message(update, text)
 
 
@@ -5691,6 +7219,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("morningstatus", morningstatus))
     telegram_app.add_handler(CommandHandler("morningcheck", morningcheck))
     telegram_app.add_handler(CommandHandler("morningtest", morningtest))
+    telegram_app.add_handler(CommandHandler("planningstatus", planningstatus))
+    telegram_app.add_handler(CommandHandler("planningtest", planningtest))
     telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
     telegram_app.add_handler(CommandHandler("buttonstest", buttonstest))
     telegram_app.add_handler(
