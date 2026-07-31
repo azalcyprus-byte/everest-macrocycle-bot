@@ -1,0 +1,8 @@
+# Все параметры необязательны: в bot.py есть рабочие значения по умолчанию.
+EVENING_FORM_URL=https://docs.google.com/forms/d/e/1FAIpQLSdZ4s4fsLyqxAgdLrxVKV72UQEQOcIrq1gjD1uj59L0wnxFzw/viewform
+EVENING_SHEET=Вечер
+EVENING_DELAY_HOURS=15
+EVENING_REMINDER_INTERVAL_MINUTES=15
+EVENING_RESPONSE_RANGE=A1:AZ1000
+EVENING_SNOOZE_MIN_MINUTES=5
+EVENING_SNOOZE_MAX_HOURS=24

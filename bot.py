@@ -116,6 +116,7 @@ action_journal_thread_lock = threading.Lock()
 spreadsheet_connection_lock = threading.Lock()
 _cached_spreadsheet = None
 _cached_action_journal_worksheet = None
+_cached_evening_worksheet = None
 _action_journal_headers_validated = False
 SHEETS_QUOTA_RETRY_DELAYS = (2, 4, 8, 16, 32)
 
@@ -166,6 +167,39 @@ MORNING_60_FORM_URL = _normalize_google_form_url(
 MORNING_90_FORM_URL = _normalize_google_form_url(
     os.environ.get("MORNING_90_FORM_URL", "")
 )
+
+# Evening closure flow. The URL supplied by Andrey is the safe default;
+# Railway can override it without changing code.
+EVENING_FORM_URL = _normalize_google_form_url(
+    os.environ.get(
+        "EVENING_FORM_URL",
+        "https://docs.google.com/forms/d/e/1FAIpQLSdZ4s4fsLyqxAgdLrxVKV72UQEQOcIrq1gjD1uj59L0wnxFzw/viewform",
+    )
+)
+EVENING_SHEET = os.environ.get("EVENING_SHEET", "Вечер").strip() or "Вечер"
+EVENING_DELAY_HOURS = float(os.environ.get("EVENING_DELAY_HOURS", "15"))
+EVENING_REMINDER_INTERVAL_MINUTES = int(
+    os.environ.get("EVENING_REMINDER_INTERVAL_MINUTES", "15")
+)
+EVENING_RESPONSE_RANGE = os.environ.get(
+    "EVENING_RESPONSE_RANGE",
+    "A1:AZ1000",
+).strip() or "A1:AZ1000"
+EVENING_OPERATION = "EVENING_CHECKLIST_FLOW"
+EVENING_SOURCE = "telegram:evening-closure"
+EVENING_SNOOZE_OPERATION = "EVENING_CHECKLIST_SNOOZE"
+EVENING_SNOOZE_SOURCE = "telegram:evening-snooze"
+EVENING_SNOOZE_MIN_MINUTES = int(
+    os.environ.get("EVENING_SNOOZE_MIN_MINUTES", "5")
+)
+EVENING_SNOOZE_MAX_HOURS = float(
+    os.environ.get("EVENING_SNOOZE_MAX_HOURS", "24")
+)
+
+if EVENING_DELAY_HOURS <= 0 or EVENING_REMINDER_INTERVAL_MINUTES <= 0:
+    raise RuntimeError("Evening timing values must be positive.")
+if EVENING_SNOOZE_MIN_MINUTES <= 0 or EVENING_SNOOZE_MAX_HOURS <= 0:
+    raise RuntimeError("Evening snooze limits must be positive.")
 MORNING_SECOND_DELAY_MINUTES = int(
     os.environ.get("MORNING_SECOND_DELAY_MINUTES", "60")
 )
@@ -240,7 +274,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.4.1"
+COORDINATOR_VERSION = "v12.5.1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -761,6 +795,201 @@ def _morning_action_succeeded(
     )
 
 
+
+
+def _parse_iso_datetime(raw: object) -> datetime | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=MOSCOW_TZ)
+    return parsed.astimezone(MOSCOW_TZ)
+
+
+def _latest_evening_snooze(
+    target_date: date,
+    *,
+    entries: list[dict] | None = None,
+) -> dict | None:
+    journal_entries = entries if entries is not None else read_action_journal_entries()
+    object_id = _morning_session_object_id(target_date)
+    candidates: list[tuple[datetime, dict, datetime]] = []
+    for entry in journal_entries:
+        if (
+            entry.get("operation") != EVENING_SNOOZE_OPERATION
+            or entry.get("status") != ACTION_STATUS_SUCCEEDED
+            or entry.get("object_id") != object_id
+        ):
+            continue
+        state = _parse_json_object(entry.get("result_json"))
+        if not state:
+            state = _parse_json_object(entry.get("payload_json"))
+        snooze_until = _parse_iso_datetime(state.get("snooze_until"))
+        if snooze_until is None:
+            continue
+        created_at = _parse_iso_datetime(entry.get("created_at"))
+        if created_at is None:
+            created_at = datetime.min.replace(tzinfo=MOSCOW_TZ)
+        candidates.append((created_at, entry, snooze_until))
+    if not candidates:
+        return None
+    created_at, entry, snooze_until = max(candidates, key=lambda item: item[0])
+    return {
+        "until": snooze_until,
+        "created_at": created_at,
+        "entry": entry,
+    }
+
+
+def _evening_initial_prompt_sent(
+    target_date: date,
+    *,
+    entries: list[dict] | None = None,
+) -> bool:
+    journal_entries = entries if entries is not None else read_action_journal_entries()
+    object_id = _morning_session_object_id(target_date)
+    return any(
+        entry.get("operation") == "EVENING_CHECKLIST_INITIAL_PROMPT"
+        and entry.get("status") == ACTION_STATUS_SUCCEEDED
+        and entry.get("object_id") == object_id
+        for entry in journal_entries
+    )
+
+
+def save_evening_snooze(
+    *,
+    snapshot: dict,
+    snooze_until: datetime,
+    requested_text: str,
+) -> dict:
+    until = snooze_until.astimezone(MOSCOW_TZ).replace(microsecond=0)
+    payload = {
+        "date": snapshot["date"].isoformat(),
+        "chat_id": snapshot["chat_id"],
+        "requested_text": requested_text,
+        "snooze_until": until.isoformat(),
+    }
+    claim = begin_action_once(
+        idempotency_key=(
+            f"evening-snooze:{snapshot['date'].isoformat()}:"
+            f"{until.strftime('%Y%m%dT%H%M%S')}"
+        ),
+        operation=EVENING_SNOOZE_OPERATION,
+        object_type="EVENING_SNOOZE",
+        object_id=_morning_session_object_id(snapshot["date"]),
+        source=EVENING_SNOOZE_SOURCE,
+        target=str(snapshot["chat_id"]),
+        payload=payload,
+    )
+    if claim["blocked"]:
+        return claim
+    finished = finish_action(
+        claim["entry"]["action_id"],
+        status=ACTION_STATUS_SUCCEEDED,
+        result=payload,
+        error="",
+        system_check="EVENING_SNOOZE_SAVED",
+    )
+    return {"created": True, "blocked": False, "entry": finished}
+
+
+_RUSSIAN_DURATION_NUMBERS = {
+    "ноль": 0.0,
+    "один": 1.0,
+    "одна": 1.0,
+    "одну": 1.0,
+    "два": 2.0,
+    "две": 2.0,
+    "три": 3.0,
+    "четыре": 4.0,
+    "пять": 5.0,
+    "шесть": 6.0,
+    "семь": 7.0,
+    "восемь": 8.0,
+    "девять": 9.0,
+    "десять": 10.0,
+    "полтора": 1.5,
+    "полторы": 1.5,
+}
+
+
+def _duration_number(raw: str | None, *, default: float = 1.0) -> float:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return default
+    if value in _RUSSIAN_DURATION_NUMBERS:
+        return _RUSSIAN_DURATION_NUMBERS[value]
+    try:
+        return float(value.replace(",", "."))
+    except ValueError:
+        return default
+
+
+def _parse_evening_snooze_request(
+    text: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+    normalized = _normalize_text(text).replace("ё", "е")
+    if not normalized:
+        return None
+
+    if "через" in normalized:
+        tail = normalized.split("через", 1)[1].strip()
+        if tail.startswith("полчаса") or tail.startswith("пол часа"):
+            minutes = 30.0
+        else:
+            token = (
+                r"(?:\d+(?:[.,]\d+)?|ноль|один|одна|одну|два|две|три|"
+                r"четыре|пять|шесть|семь|восемь|девять|десять|полтора|полторы)"
+            )
+            unit_pattern = re.compile(
+                rf"(?:(?P<number>{token})\s*)?"
+                r"(?P<unit>час(?:а|ов)?|ч\b|минут(?:а|ы)?|мин\b)"
+            )
+            minutes = 0.0
+            for match in unit_pattern.finditer(tail):
+                amount = _duration_number(match.group("number"), default=1.0)
+                unit = match.group("unit")
+                minutes += amount * (60.0 if unit.startswith("час") or unit == "ч" else 1.0)
+        if minutes > 0:
+            min_minutes = float(EVENING_SNOOZE_MIN_MINUTES)
+            max_minutes = float(EVENING_SNOOZE_MAX_HOURS) * 60.0
+            if minutes < min_minutes or minutes > max_minutes:
+                return None
+            return (current + timedelta(minutes=minutes)).replace(microsecond=0)
+
+    exact = re.search(
+        r"(?:напомни|напомнить|заполню|заполнить|отложи|отложить|перенеси|перенести)?"
+        r"[^\d]{0,24}(?:в|на)\s*(?P<hour>[01]?\d|2[0-3])[:.](?P<minute>[0-5]\d)\b",
+        normalized,
+    )
+    if exact:
+        target = current.replace(
+            hour=int(exact.group("hour")),
+            minute=int(exact.group("minute")),
+            second=0,
+            microsecond=0,
+        )
+        if target <= current:
+            target += timedelta(days=1)
+        delay_minutes = (target - current).total_seconds() / 60.0
+        if (
+            delay_minutes >= EVENING_SNOOZE_MIN_MINUTES
+            and delay_minutes <= EVENING_SNOOZE_MAX_HOURS * 60.0
+        ):
+            return target
+    return None
+
+
+def _evening_prompt_cycle_id(due_at: datetime) -> str:
+    return due_at.astimezone(MOSCOW_TZ).strftime("%Y%m%dT%H%M%S")
+
 def build_morning_session_snapshot(
     target_date: date | None = None,
 ) -> dict | None:
@@ -791,6 +1020,10 @@ def build_morning_session_snapshot(
         if planning_entry is not None
         else {}
     )
+    evening_snooze = _latest_evening_snooze(
+        target,
+        entries=journal_entries,
+    )
     return {
         "date": target,
         "entry": entry,
@@ -811,6 +1044,24 @@ def build_morning_session_snapshot(
                 entries=journal_entries,
             )
             or planning_entry is not None
+        ),
+        "load_report_sent": _morning_action_succeeded(
+            f"morning-load-report:{target.isoformat()}",
+            entries=journal_entries,
+        ),
+        "evening_closure_sent": _morning_action_succeeded(
+            f"evening-closure:{target.isoformat()}",
+            entries=journal_entries,
+        ),
+        "evening_initial_prompt_sent": _evening_initial_prompt_sent(
+            target,
+            entries=journal_entries,
+        ),
+        "evening_snooze_until": (
+            evening_snooze["until"] if evening_snooze is not None else None
+        ),
+        "evening_snooze_entry": (
+            evening_snooze["entry"] if evening_snooze is not None else None
         ),
         "planning_started": planning_entry is not None,
         "planning_stage": planning_state.get("stage", ""),
@@ -847,21 +1098,27 @@ def format_morning_session_status(
     ]
 
     if snapshot["state"]["all_filled"]:
-        if snapshot.get("planning_started"):
-            stage = snapshot.get("planning_stage") or "активна"
+        if snapshot.get("load_report_sent"):
             lines.append(
-                "Все три чек-листа заполнены. Обсуждение плана уже начато "
-                f"(этап: {stage})."
-            )
-        elif snapshot["ready_sent"]:
-            lines.append("Все три чек-листа заполнены. Штаб готов обсуждать план дня.")
-        elif snapshot["ready_at"] and current < snapshot["ready_at"]:
-            lines.append(
-                "Все три чек-листа заполнены. Сообщение о готовности придёт в "
-                f"{snapshot['ready_at'].strftime('%H:%M')}."
+                "Все три чек-листа заполнены. Утренний отчёт по нагрузке уже отправлен ✅"
             )
         else:
-            lines.append("Все три чек-листа заполнены. Проверяю готовность плана.")
+            lines.append(
+                "Все три чек-листа заполнены. Формирую короткий отчёт по покерной нагрузке."
+            )
+        evening_base_due = _evening_base_due_at(snapshot)
+        evening_due = _evening_due_at(snapshot)
+        lines.append(
+            "Первая проверка вечернего чек-листа: "
+            f"{evening_base_due.strftime('%H:%M')}."
+        )
+        if evening_due > evening_base_due:
+            lines.append(
+                "Заполнение отложено до "
+                f"{evening_due.strftime('%d.%m в %H:%M')}."
+            )
+        if snapshot.get("evening_closure_sent"):
+            lines.append("День уже закрыт вечерним отчётом ✅")
         return "\n".join(lines)
 
     if not filled[1]:
@@ -926,7 +1183,8 @@ def run_morning_orchestrator_self_check() -> dict:
         "second_after_start": MORNING_SECOND_DELAY_MINUTES == 60,
         "third_after_start": MORNING_THIRD_DELAY_MINUTES == 90,
         "reminder_interval": MORNING_REMINDER_INTERVAL_MINUTES == 15,
-        "ready_delay": MORNING_READY_DELAY_MINUTES == 5,
+        "load_report_mode": COORDINATOR_VERSION == "v12.5.1",
+        "evening_delay": EVENING_DELAY_HOURS == 15,
     }
 
     base = datetime(2026, 7, 31, 4, 0, tzinfo=MOSCOW_TZ)
@@ -1378,9 +1636,9 @@ def _extract_wake_time(
     return {"time": "", "source": "unavailable", "exact": False}
 
 
-def read_morning_day_plan_test_data() -> dict:
+def read_morning_day_plan_test_data(target_date: date | None = None) -> dict:
     spreadsheet = get_spreadsheet()
-    target_date = datetime.now(MOSCOW_TZ).date()
+    target_date = target_date or datetime.now(MOSCOW_TZ).date()
     target_text = target_date.strftime("%d.%m.%Y")
 
     morning_values, checklist_60_values, checklist_90_values, day_rows = (
@@ -2764,31 +3022,19 @@ def _coordinator_meal_message(data: dict, request_text: str) -> str:
 
 
 def _coordinator_system_status_message() -> str:
-    model_status = (
-        f"подключена модель {OPENAI_MODEL}"
-        if OPENAI_API_KEY and OPENAI_MODEL
-        else "используется безопасная маршрутизация по правилам"
-    )
     configured_forms = _morning_form_urls_configured()
-    morning_status = (
-        "утренний оркестратор активен; формы настроены 3/3"
-        if configured_forms == 3
-        else f"утренний оркестратор активен; формы настроены {configured_forms}/3"
-    )
+    evening_status = "настроен" if EVENING_FORM_URL else "не настроен"
     return (
-        f"Координатор штаба {COORDINATOR_VERSION} работает.\n\n"
-        f"Маршрутизация: {model_status}.\n"
-        f"Утро: {morning_status}.\n"
-        "Сейчас доступны: запуск дня фразой «Доброе утро», контроль трёх "
-        "чек-листов и напоминаний, ускоренный тест /morningtest, "
-        "пошаговое утреннее обсуждение плана, чтение фактического времени "
-        "подъёма из чек-листа, входящих задач из вкладки 17 и допущенных "
-        "задач из вкладки 05.\n"
-        "Фазовый агент оценивает сон, энергию, ясность и признаки перегруза. "
-        "Он не повышает покерный объём и не сокращает его автоматически: "
-        "снижение применяется только после явного APPROVAL Андрея.\n"
-        "Не подключены полностью: меню питания, покерный агент широкого "
-        "профиля и запись финального расписания планировщиком-исполнителем."
+        f"Цифровой штаб {COORDINATOR_VERSION} работает.\n\n"
+        f"Утро: формы настроены {configured_forms}/3; проверка заполнения и "
+        "напоминания активны.\n"
+        "После третьего чек-листа штаб выдаёт короткое решение фазового "
+        "агента по покерной нагрузке без составления плана дня.\n"
+        f"Вечер: чек-лист {evening_status}; первая проверка через "
+        f"{EVENING_DELAY_HOURS:g} часов от первого «Доброе утро», затем "
+        f"напоминания каждые {EVENING_REMINDER_INTERVAL_MINUTES} минут до "
+        "появления записи. После заполнения формируется отчёт закрытия дня.\n"
+        "AI-координатор и платные вызовы OpenAI API в этом режиме не используются."
     )
 
 
@@ -4733,9 +4979,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.effective_message.reply_text(
-        "Everest Macrocycle Bot запущен ✅\n"
+        "Everest Macrocycle Bot v12.5 запущен ✅\n"
         "Авторизация подтверждена.\n\n"
-        "Для запуска утренней сессии напишите: Доброе утро"
+        "Для запуска дневного контура напишите: Доброе утро\n"
+        "Статус утра: /morningstatus\n"
+        "Статус вечернего закрытия: /eveningstatus"
     )
 
 
@@ -6426,24 +6674,9 @@ async def planningstatus(
 ) -> None:
     if not is_authorized(update):
         return
-    try:
-        entry, state = await asyncio.to_thread(
-            read_morning_planning_state,
-            datetime.now(MOSCOW_TZ).date(),
-        )
-    except Exception as exc:
-        await update.effective_message.reply_text(
-            "Не удалось прочитать планировочную сессию ❌\n"
-            f"Ошибка: {type(exc).__name__}: {str(exc)[:300]}"
-        )
-        return
-    if entry is None or not state:
-        await update.effective_message.reply_text(
-            "Сегодня обсуждение плана ещё не запускалось."
-        )
-        return
     await update.effective_message.reply_text(
-        _planning_status_message(entry, state)
+        "Планирование дня в боте отключено. Активен только контур "
+        "«утро → решение по нагрузке → вечернее закрытие»."
     )
 
 
@@ -6453,141 +6686,567 @@ async def planningtest(
 ) -> None:
     if not is_authorized(update):
         return
+    await update.effective_message.reply_text(
+        "Тест планирования отключён. Используйте /morningtest и /eveningtest."
+    )
+
+
+def _morning_load_report_key(target_date: date) -> str:
+    return f"morning-load-report:{target_date.isoformat()}"
+
+
+def _evening_closure_key(target_date: date) -> str:
+    return f"evening-closure:{target_date.isoformat()}"
+
+
+def _evening_base_due_at(snapshot: dict) -> datetime:
+    return snapshot["started_at"] + timedelta(hours=EVENING_DELAY_HOURS)
+
+
+def _evening_due_at(snapshot: dict) -> datetime:
+    base_due = _evening_base_due_at(snapshot)
+    snooze_until = snapshot.get("evening_snooze_until")
+    if isinstance(snooze_until, datetime) and snooze_until > base_due:
+        return snooze_until.astimezone(MOSCOW_TZ)
+    return base_due
+
+
+def _evening_reminder_bucket(now: datetime, due_at: datetime) -> int | None:
+    if now < due_at:
+        return None
+    elapsed = int((now - due_at).total_seconds() // 60)
+    return elapsed // EVENING_REMINDER_INTERVAL_MINUTES
+
+
+def _evening_keyboard() -> InlineKeyboardMarkup | None:
+    if not EVENING_FORM_URL:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🌙 Заполнить вечерний чек-лист", url=EVENING_FORM_URL)]]
+    )
+
+
+def _get_evening_worksheet():
+    global _cached_evening_worksheet
+    if _cached_evening_worksheet is not None:
+        return _cached_evening_worksheet
+
+    spreadsheet = get_spreadsheet()
     try:
-        data = await asyncio.to_thread(read_full_day_plan_test_data)
-        state = _build_initial_morning_planning_state(
-            chat_id=update.effective_chat.id,
-            data=data,
+        worksheet = _sheets_api_call(
+            lambda: spreadsheet.worksheet(EVENING_SHEET),
+            operation=f"open evening worksheet {EVENING_SHEET}",
         )
-        state["meal_eaten"] = False
-        state["user_tasks_text"] = "Тестовая бытовая задача"
-        state["task_estimates_text"] = "1 час"
-        planned_before = _effective_poker_hours(data, state)
-        state["phase_reduction_approved"] = True
-        planned_after = _effective_poker_hours(data, state)
-        draft = await asyncio.to_thread(_planning_draft_message, state)
-        phase = state["phase"]
-        checks = {
-            "wake_from_checklist_or_fallback": bool(state.get("wake_time")),
-            "no_wake_question": "во сколько вы проснулись" not in _normalize_text(
-                _planning_initial_question(state)
+    except Exception as exact_error:
+        # Safe fallback for harmless title variations such as
+        # "Вечерний чек-лист". We never select an unrelated form sheet.
+        worksheets = _sheets_api_call(
+            spreadsheet.worksheets,
+            operation="list worksheets for evening discovery",
+        )
+        candidates = [
+            ws for ws in worksheets
+            if "вечер" in _normalize_text(getattr(ws, "title", ""))
+        ]
+        if not candidates:
+            raise LookupError(
+                f"Evening response sheet '{EVENING_SHEET}' was not found. "
+                "Set Railway variable EVENING_SHEET to the exact tab name."
+            ) from exact_error
+        worksheet = candidates[0]
+        logger.warning(
+            "Evening sheet fallback selected: configured=%s actual=%s",
+            EVENING_SHEET,
+            worksheet.title,
+        )
+
+    _cached_evening_worksheet = worksheet
+    return worksheet
+
+
+def read_evening_checklist_state(target_date: date) -> dict:
+    worksheet = _get_evening_worksheet()
+    values = _worksheet_get(worksheet, EVENING_RESPONSE_RANGE)
+    records = _records_from_values(values)
+    matches: list[dict[str, str]] = []
+    for record in records:
+        record_date = _parse_date_value(record.get("Дата", ""))
+        if record_date is None:
+            record_date = _parse_date_value(record.get("Отметка времени", ""))
+        if record_date == target_date:
+            matches.append(record)
+    latest = (
+        max(
+            matches,
+            key=lambda record: _parse_timestamp_value(
+                record.get("Отметка времени", "")
             ),
-            "plan_unchanged_before_approval": (
-                planned_before[0] == phase["planned_game_hours"]
-                and planned_before[1] == phase["planned_study_hours"]
-            ),
-            "reduction_only_after_approval": (
-                not phase.get("requires_approval")
-                or (
-                    planned_after[0] == phase["proposed_game_hours"]
-                    and planned_after[1] == phase["proposed_study_hours"]
-                )
-            ),
-            "inbox_read_is_graceful": "inbox_available" in state,
-            "draft_built": "Черновик плана" in draft,
-        }
-        failed = [name for name, ok in checks.items() if not ok]
+        )
+        if matches
+        else None
+    )
+    return {
+        "date": target_date,
+        "worksheet_title": worksheet.title,
+        "record": latest,
+        "filled": latest is not None,
+        "timestamp": _morning_record_timestamp(latest),
+    }
+
+
+def _compact_form_label(value: object) -> str:
+    label = re.sub(r"\s+", " ", str(value or "")).strip(" .:-")
+    label = re.sub(r"^\d+[.)]?\s*", "", label)
+    return label if len(label) <= 72 else label[:69].rstrip() + "…"
+
+
+def _compact_form_value(value: object) -> str:
+    rendered = re.sub(r"\s+", " ", str(value or "")).strip()
+    return rendered if len(rendered) <= 140 else rendered[:137].rstrip() + "…"
+
+
+def _evening_report_items(record: dict[str, str]) -> list[tuple[str, str]]:
+    ignored = {
+        "дата",
+        "отметка времени",
+        "адрес электронной почты",
+        "электронная почта",
+        "email address",
+        "email",
+    }
+    items: list[tuple[str, str]] = []
+    for key, value in record.items():
+        normalized_key = _normalize_text(key)
+        if normalized_key in ignored or not str(value or "").strip():
+            continue
+        items.append((_compact_form_label(key), _compact_form_value(value)))
+        if len(items) >= 8:
+            break
+    return items
+
+
+def format_morning_load_report(data: dict) -> str:
+    day = data["day"]
+    assessment = data["assessment"]
+    status = assessment.get("status", "INCOMPLETE")
+    lines = [
+        f"📅 {data['date'].strftime('%d.%m.%Y')}",
+        f"Фаза: {day.get('phase') or '—'}",
+        f"Тип дня: {day.get('day_type') or '—'}",
+        "",
+    ]
+
+    if status == "NO_GAME":
+        lines.append("Решение по покерной нагрузке: по плану покерного объёма сегодня нет.")
+    elif status == "GREEN":
+        lines.append("Решение по покерной нагрузке: сохранить исходный PLAN без изменений ✅")
+        lines.append(
+            "План: игра — "
+            f"{_format_hours(float(day.get('game_hours') or 0.0))}; "
+            "study — "
+            f"{_format_hours(float(day.get('study_hours') or 0.0))}."
+        )
+    elif status in {"YELLOW", "RED"}:
+        marker = "🟡" if status == "YELLOW" else "🔴"
+        lines.append(f"Рекомендация фазового агента: снизить покерный объём {marker}")
+        lines.append(
+            "Исходный PLAN: игра — "
+            f"{_format_hours(float(assessment.get('planned_game_hours') or 0.0))}; "
+            "study — "
+            f"{_format_hours(float(assessment.get('planned_study_hours') or 0.0))}."
+        )
+        lines.append(
+            "Рекомендуемый объём: игра — "
+            f"{_format_hours(float(assessment.get('proposed_game_hours') or 0.0))}; "
+            "study — "
+            f"{_format_hours(float(assessment.get('proposed_study_hours') or 0.0))}."
+        )
+        reasons = assessment.get("reasons") or []
+        if reasons:
+            lines.append("Причина: " + "; ".join(str(item) for item in reasons[:4]) + ".")
+        lines.append("Это рекомендация: утверждённый PLAN автоматически не изменён.")
+    else:
+        reasons = assessment.get("reasons") or []
+        lines.append("Решение по покерной нагрузке пока не сформировано ⚠️")
+        if reasons:
+            lines.append("Причина: " + "; ".join(str(item) for item in reasons[:4]) + ".")
+
+    lines.extend(["", "Утренний контур завершён. Следующая автоматическая точка — вечерний чек-лист через 15 часов от первого «Доброе утро»."])
+    return "\n".join(lines)[:4000]
+
+
+def format_evening_closure_report(
+    *,
+    snapshot: dict,
+    evening_state: dict,
+    day_data: dict | None,
+) -> str:
+    record = evening_state.get("record") or {}
+    timestamp = evening_state.get("timestamp")
+    lines = ["✅ День закрыт", "", f"Дата: {snapshot['date'].strftime('%d.%m.%Y')}"]
+    if day_data:
+        day = day_data.get("day", {})
+        lines.append(f"Фаза: {day.get('phase') or '—'}")
+        lines.append(f"Тип дня: {day.get('day_type') or '—'}")
+    if timestamp:
+        lines.append(f"Вечерний чек-лист заполнен в {timestamp.strftime('%H:%M')}.")
+    else:
+        lines.append("Вечерний чек-лист заполнен, данные сохранены.")
+
+    items = _evening_report_items(record)
+    if items:
+        lines.extend(["", "Отчёт закрытия:"])
+        lines.extend(f"• {label}: {value}" for label, value in items)
+    else:
+        lines.extend(["", "Данные вечернего чек-листа сохранены в таблице."])
+    lines.extend(["", "Напоминания на сегодня остановлены."])
+    return "\n".join(lines)[:4000]
+
+
+def run_evening_orchestrator_self_check() -> dict:
+    base = datetime(2026, 7, 31, 4, 0, tzinfo=MOSCOW_TZ)
+    due = base + timedelta(hours=EVENING_DELAY_HOURS)
+    snooze_two_hours = _parse_evening_snooze_request(
+        "Заполню через два часа",
+        now=due,
+    )
+    snooze_45_minutes = _parse_evening_snooze_request(
+        "Напомни через 45 минут",
+        now=due,
+    )
+    snooze_exact = _parse_evening_snooze_request(
+        "Напомни в 21:30",
+        now=due,
+    )
+    fake_snapshot = {
+        "started_at": base,
+        "evening_snooze_until": due + timedelta(hours=2),
+    }
+    checks = {
+        "form_configured": bool(EVENING_FORM_URL),
+        "responder_url": EVENING_FORM_URL.startswith("https://docs.google.com/forms/") and EVENING_FORM_URL.endswith("/viewform"),
+        "delay_15_hours": EVENING_DELAY_HOURS == 15,
+        "reminder_15_minutes": EVENING_REMINDER_INTERVAL_MINUTES == 15,
+        "not_early": _evening_reminder_bucket(due - timedelta(seconds=1), due) is None,
+        "first_bucket": _evening_reminder_bucket(due, due) == 0,
+        "next_bucket": _evening_reminder_bucket(due + timedelta(minutes=15), due) == 1,
+        "snooze_two_hours": snooze_two_hours == due + timedelta(hours=2),
+        "snooze_45_minutes": snooze_45_minutes == due + timedelta(minutes=45),
+        "snooze_exact_time": snooze_exact == due.replace(hour=21, minute=30),
+        "snooze_changes_due": _evening_due_at(fake_snapshot) == due + timedelta(hours=2),
+        "snooze_cycle_changes_key": (
+            _evening_prompt_cycle_id(due)
+            != _evening_prompt_cycle_id(due + timedelta(hours=2))
+        ),
+    }
+    return {"passed": all(checks.values()), "checks": checks, "due": due}
+
+
+async def _process_evening_flow(
+    context: ContextTypes.DEFAULT_TYPE,
+    snapshot: dict,
+    now: datetime,
+) -> None:
+    if snapshot.get("evening_closure_sent"):
+        return
+    due_at = _evening_due_at(snapshot)
+    if now < due_at:
+        return
+
+    try:
+        evening_state = await asyncio.to_thread(
+            read_evening_checklist_state,
+            snapshot["date"],
+        )
     except Exception as exc:
-        logger.exception("Planning self-test failed")
-        await update.effective_message.reply_text(
-            "Тест утреннего обсуждения завершился ошибкой ❌\n"
-            f"{type(exc).__name__}: {str(exc)[:500]}"
+        logger.exception("Evening checklist state read failed")
+        await _send_morning_message_once(
+            bot=context.bot,
+            chat_id=snapshot["chat_id"],
+            idempotency_key=f"evening-config-error:{snapshot['date'].isoformat()}",
+            operation="EVENING_CONFIGURATION_ERROR",
+            object_id=_morning_session_object_id(snapshot["date"]),
+            text=(
+                "Не удалось проверить вечерний чек-лист ❌\n"
+                f"Ошибка: {type(exc).__name__}: {str(exc)[:500]}\n\n"
+                "Проверьте название вкладки ответов и переменную Railway EVENING_SHEET."
+            ),
+            payload={"date": snapshot["date"].isoformat(), "due_at": due_at.isoformat()},
         )
         return
-    lines = [
-        "🧪 Тест утреннего обсуждения плана",
-        "",
-        *(f"{'✅' if ok else '❌'} {name}" for name, ok in checks.items()),
-        "",
-        f"Вкладка 17 доступна: {'да' if state.get('inbox_available') else 'нет — обработано без падения'}.",
-        f"Итог: {'PASS' if not failed else 'FAIL: ' + ', '.join(failed)}.",
-        "Рабочая планировочная сессия и таблицы не изменялись.",
-    ]
-    await update.effective_message.reply_text("\n".join(lines)[:4000])
+
+    if evening_state["filled"]:
+        if snapshot.get("evening_closure_sent"):
+            return
+        try:
+            day_data = await asyncio.to_thread(
+                read_morning_day_plan_test_data,
+                snapshot["date"],
+            )
+        except Exception:
+            logger.exception("Day context read for evening closure failed")
+            day_data = None
+        await _send_morning_message_once(
+            bot=context.bot,
+            chat_id=snapshot["chat_id"],
+            idempotency_key=_evening_closure_key(snapshot["date"]),
+            operation="EVENING_DAY_CLOSURE_REPORT",
+            object_id=_morning_session_object_id(snapshot["date"]),
+            text=format_evening_closure_report(
+                snapshot=snapshot,
+                evening_state=evening_state,
+                day_data=day_data,
+            ),
+            payload={
+                "date": snapshot["date"].isoformat(),
+                "worksheet": evening_state.get("worksheet_title"),
+                "filled_at": (
+                    evening_state["timestamp"].isoformat()
+                    if evening_state.get("timestamp")
+                    else None
+                ),
+            },
+        )
+        return
+
+    bucket = _evening_reminder_bucket(now, due_at)
+    if bucket is None:
+        return
+    first = bucket == 0
+    snoozed_cycle = (
+        isinstance(snapshot.get("evening_snooze_until"), datetime)
+        and due_at == snapshot.get("evening_snooze_until")
+    )
+    initial_prompt = (
+        not snoozed_cycle
+        and not snapshot.get("evening_initial_prompt_sent")
+    )
+    if first and snoozed_cycle:
+        text = (
+            "🌙 Наступило отложенное время вечернего чек-листа.\n\n"
+            "Сначала проверил таблицу: данных пока нет. Пожалуйста, заполните форму, "
+            "чтобы штаб закрыл день. При необходимости можно снова написать, "
+            "например: «через 1 час» или «напомни в 22:00»."
+        )
+        operation = "EVENING_CHECKLIST_SNOOZE_PROMPT"
+    elif initial_prompt:
+        text = (
+            "🌙 Прошло 15 часов с первого сообщения «Доброе утро».\n\n"
+            "Вечерний чек-лист ещё не заполнен. Пожалуйста, внесите данные, чтобы штаб закрыл день.\n\n"
+            "Если заполнять пока рано, напишите, например: «через 2 часа» "
+            "или «напомни в 22:00»."
+        )
+        operation = "EVENING_CHECKLIST_INITIAL_PROMPT"
+    else:
+        text = (
+            "⏰ Напоминание: вечерний чек-лист пока не заполнен.\n\n"
+            "После внесения данных штаб автоматически сформирует отчёт закрытия дня. "
+            "Заполнение можно отложить сообщением вроде «через 45 минут»."
+        )
+        operation = "EVENING_CHECKLIST_REMINDER"
+    cycle_id = _evening_prompt_cycle_id(due_at)
+    await _send_morning_message_once(
+        bot=context.bot,
+        chat_id=snapshot["chat_id"],
+        idempotency_key=(
+            f"evening-reminder:{snapshot['date'].isoformat()}:"
+            f"{cycle_id}:{bucket}"
+        ),
+        operation=operation,
+        object_id=_morning_session_object_id(snapshot["date"]),
+        text=text,
+        reply_markup=_evening_keyboard(),
+        payload={
+            "date": snapshot["date"].isoformat(),
+            "bucket": bucket,
+            "due_at": due_at.isoformat(),
+            "snoozed_cycle": snoozed_cycle,
+        },
+    )
+
+
+async def _find_active_evening_snapshot() -> dict | None:
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    snapshots: list[dict] = []
+    for target in (now.date(), now.date() - timedelta(days=1)):
+        snapshot = await asyncio.to_thread(
+            build_morning_session_snapshot,
+            target,
+        )
+        if snapshot is None:
+            continue
+        if snapshot.get("evening_closure_sent"):
+            continue
+        if not snapshot.get("evening_initial_prompt_sent"):
+            continue
+        snapshots.append(snapshot)
+    if not snapshots:
+        return None
+    return max(snapshots, key=lambda item: item["started_at"])
+
+
+async def _handle_evening_snooze_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
+    snooze_until = _parse_evening_snooze_request(text, now=now)
+    if snooze_until is None:
+        return False
+    try:
+        snapshot = await _find_active_evening_snapshot()
+    except Exception as exc:
+        logger.exception("Evening snooze state read failed")
+        await update.effective_message.reply_text(
+            "Не удалось проверить вечерний контур для переноса ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:400]}"
+        )
+        return True
+    if snapshot is None:
+        return False
+
+    try:
+        evening_state = await asyncio.to_thread(
+            read_evening_checklist_state,
+            snapshot["date"],
+        )
+    except Exception as exc:
+        logger.exception("Evening checklist read before snooze failed")
+        await update.effective_message.reply_text(
+            "Не удалось проверить, заполнен ли вечерний чек-лист ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:400]}"
+        )
+        return True
+
+    if evening_state.get("filled"):
+        await update.effective_message.reply_text(
+            "Вечерний чек-лист уже заполнен ✅ Формирую закрытие дня."
+        )
+        await _process_evening_flow(context, snapshot, now)
+        return True
+
+    result = await asyncio.to_thread(
+        save_evening_snooze,
+        snapshot=snapshot,
+        snooze_until=snooze_until,
+        requested_text=text,
+    )
+    until_text = snooze_until.strftime("%d.%m в %H:%M")
+    if result.get("blocked"):
+        await update.effective_message.reply_text(
+            f"Вечернее заполнение уже отложено до {until_text} ✅"
+        )
+        return True
+
+    await update.effective_message.reply_text(
+        "Хорошо, вечернее заполнение отложено ✅\n\n"
+        f"Следующая проверка: {until_text}.\n"
+        "До этого времени 15-минутных напоминаний не будет. "
+        "В назначенный момент штаб сначала проверит таблицу: если форма уже заполнена, "
+        "сразу закроет день; если нет — пришлёт новое уведомление."
+    )
+    return True
+
+
+async def _process_current_morning_snapshot(
+    context: ContextTypes.DEFAULT_TYPE,
+    snapshot: dict,
+    now: datetime,
+) -> None:
+    state = snapshot["state"]
+
+    # Morning completion produces one deterministic load report. No planning
+    # dialogue and no AI call are started.
+    if state["all_filled"] and not snapshot.get("load_report_sent"):
+        try:
+            data = await asyncio.to_thread(
+                read_morning_day_plan_test_data,
+                snapshot["date"],
+            )
+            await _send_morning_message_once(
+                bot=context.bot,
+                chat_id=snapshot["chat_id"],
+                idempotency_key=_morning_load_report_key(snapshot["date"]),
+                operation="MORNING_LOAD_DECISION_REPORT",
+                object_id=_morning_session_object_id(snapshot["date"]),
+                text=format_morning_load_report(data),
+                payload={
+                    "date": snapshot["date"].isoformat(),
+                    "assessment": data.get("assessment", {}),
+                },
+            )
+        except Exception:
+            logger.exception("Morning load report failed")
+
+    # Continue unfinished morning reminders until each form is filled.
+    if not state["all_filled"]:
+        checks = (
+            (
+                1,
+                snapshot["started_at"]
+                + timedelta(minutes=MORNING_REMINDER_INTERVAL_MINUTES),
+            ),
+            (2, snapshot["second_due_at"]),
+            (3, snapshot["third_due_at"]),
+        )
+        for checklist_number, first_due in checks:
+            if state["filled"][checklist_number]:
+                continue
+            bucket = _morning_reminder_bucket(now=now, first_due=first_due)
+            if bucket is None:
+                continue
+            try:
+                await _send_morning_checklist_prompt(
+                    bot=context.bot,
+                    snapshot=snapshot,
+                    checklist_number=checklist_number,
+                    bucket=bucket,
+                )
+            except Exception:
+                logger.exception(
+                    "Morning checklist prompt failed: checklist=%s bucket=%s",
+                    checklist_number,
+                    bucket,
+                )
+            break
 
 
 async def morning_orchestrator_tick(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     now = datetime.now(MOSCOW_TZ).replace(microsecond=0)
-    try:
-        snapshot = await asyncio.to_thread(
-            build_morning_session_snapshot,
-            now.date(),
-        )
-    except Exception:
-        logger.exception("Morning orchestrator state read failed")
-        return
-    if snapshot is None:
-        return
+    today = now.date()
+    snapshots: dict[date, dict] = {}
 
-    state = snapshot["state"]
-    if state["all_filled"]:
-        ready_at = snapshot["ready_at"]
-        if ready_at is None or now < ready_at:
-            return
+    # Read both today and yesterday. Yesterday is needed when the 15-hour
+    # evening deadline crosses midnight. This is still safely below the
+    # Google Sheets per-minute quota because each date uses batched reads.
+    for target in (today, today - timedelta(days=1)):
         try:
-            planning_entry = snapshot.get("planning_entry")
-            planning_state = snapshot.get("planning_state") or {}
-            if planning_entry is not None and planning_state:
-                return
-            planning_entry, planning_state, _ = await asyncio.to_thread(
-                _create_or_restore_planning_session,
-                chat_id=snapshot["chat_id"],
-                target_date=snapshot["date"],
-            )
-            await _send_morning_message_once(
-                bot=context.bot,
-                chat_id=snapshot["chat_id"],
-                idempotency_key=(
-                    f"morning-planning-start:{snapshot['date'].isoformat()}"
-                ),
-                operation="MORNING_PLANNING_STARTED_MESSAGE",
-                object_id=_morning_planning_object_id(snapshot["date"]),
-                text=_planning_initial_question(planning_state),
-                payload={
-                    "date": snapshot["date"].isoformat(),
-                    "planning_action_id": planning_entry["action_id"],
-                    "last_checklist_at": (
-                        snapshot["last_completed_at"].isoformat()
-                        if snapshot["last_completed_at"]
-                        else None
-                    ),
-                },
-            )
-        except Exception:
-            logger.exception("Morning planning start message failed")
-        return
-
-    checks = (
-        (
-            1,
-            snapshot["started_at"]
-            + timedelta(minutes=MORNING_REMINDER_INTERVAL_MINUTES),
-        ),
-        (2, snapshot["second_due_at"]),
-        (3, snapshot["third_due_at"]),
-    )
-    for checklist_number, first_due in checks:
-        if state["filled"][checklist_number]:
-            continue
-        bucket = _morning_reminder_bucket(now=now, first_due=first_due)
-        if bucket is None:
-            continue
-        try:
-            await _send_morning_checklist_prompt(
-                bot=context.bot,
-                snapshot=snapshot,
-                checklist_number=checklist_number,
-                bucket=bucket,
+            snapshot = await asyncio.to_thread(
+                build_morning_session_snapshot,
+                target,
             )
         except Exception:
             logger.exception(
-                "Morning checklist prompt failed: checklist=%s bucket=%s",
-                checklist_number,
-                bucket,
+                "Morning/evening orchestrator state read failed: date=%s",
+                target,
             )
+            continue
+        if snapshot is not None:
+            snapshots[target] = snapshot
 
+    current = snapshots.get(today)
+    if current is not None:
+        await _process_current_morning_snapshot(context, current, now)
+        await _process_evening_flow(context, current, now)
+
+    previous = snapshots.get(today - timedelta(days=1))
+    if previous is not None:
+        # Never continue old morning reminders on the next calendar day, but
+        # keep the evening form and its reminders alive until closure.
+        await _process_evening_flow(context, previous, now)
 
 def _morning_test_keyboard(checklist_number: int) -> InlineKeyboardMarkup:
     url = _morning_form_url(checklist_number)
@@ -6684,7 +7343,8 @@ async def deliver_morning_test_step(
             "• последовательность 1 → 2 → 3;\n"
             "• отдельное напоминание по каждому чек-листу;\n"
             "• расчёт +60/+90 минут и интервала 15 минут;\n"
-            "• готовность через 5 минут после последней записи;\n"
+            "• короткий отчёт по нагрузке после третьего чек-листа;\n"
+            "• вечерняя проверка через 15 часов и напоминания 15 минут;\n"
             "• изоляция от рабочих ответов форм.\n\n"
             f"Формы настроены: {self_check['configured_forms']}/3.\n"
             f"Сегодня реально найдено записей: "
@@ -7041,12 +7701,11 @@ async def hqtest(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     if not is_authorized(update):
-        logger.warning(
-            "Unauthorized /hqtest attempt from user_id=%s",
-            getattr(update.effective_user, "id", None),
-        )
         return
-    await start_or_continue_morning_planning(update, context)
+    await update.effective_message.reply_text(
+        "AI-планирование отключено. Для проверки текущего контура используйте "
+        "/morningtest и /eveningtest."
+    )
 
 
 async def hqstatus(
@@ -7066,21 +7725,9 @@ async def hq(
 ) -> None:
     if not is_authorized(update):
         return
-    request_text = " ".join(context.args).strip()
-    if not request_text:
-        await update.effective_message.reply_text(
-            "Формат: /hq составь план на день"
-        )
-        return
-    if MORNING_TRIGGER_PATTERN.search(request_text):
-        await start_or_continue_morning_session(update, context)
-        return
-    if _coordinator_heuristic_route(request_text)["intent"] == "BUILD_DAY_PLAN":
-        await start_or_continue_morning_planning(update, context)
-        return
-    if await handle_morning_planning_message(update, context, request_text):
-        return
-    await _process_coordinator_message(update, request_text)
+    await update.effective_message.reply_text(
+        _coordinator_system_status_message()
+    )
 
 async def fullplantest(
     update: Update,
@@ -7277,6 +7924,109 @@ async def handle_button(
     )
 
 
+async def eveningstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    try:
+        snapshot = await _find_active_evening_snapshot()
+        if snapshot is None:
+            snapshot = await asyncio.to_thread(
+                build_morning_session_snapshot,
+                datetime.now(MOSCOW_TZ).date(),
+            )
+        if snapshot is None:
+            await update.effective_message.reply_text(
+                "Сегодня дневная сессия ещё не запускалась. Напишите: Доброе утро"
+            )
+            return
+        due_at = _evening_due_at(snapshot)
+        evening_state = await asyncio.to_thread(
+            read_evening_checklist_state,
+            snapshot["date"],
+        )
+    except Exception as exc:
+        logger.exception("Evening status read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать вечерний контур ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:400]}"
+        )
+        return
+
+    now = datetime.now(MOSCOW_TZ)
+    base_due_at = _evening_base_due_at(snapshot)
+    lines = [
+        f"Вечерний контур на {snapshot['date'].strftime('%d.%m.%Y')}",
+        f"Первая проверка: {base_due_at.strftime('%H:%M')}.",
+        f"Чек-лист: {'заполнен ✅' if evening_state['filled'] else 'ожидается ⏳'}.",
+    ]
+    snooze_until = snapshot.get("evening_snooze_until")
+    if (
+        isinstance(snooze_until, datetime)
+        and snooze_until > base_due_at
+        and not evening_state["filled"]
+    ):
+        lines.append(
+            "Заполнение отложено. Следующая проверка: "
+            f"{snooze_until.strftime('%d.%m в %H:%M')}."
+        )
+    if now < due_at and not evening_state["filled"]:
+        minutes = max(0, int((due_at - now).total_seconds() // 60))
+        label = "следующей" if due_at > base_due_at else "первой"
+        lines.append(f"До {label} проверки: примерно {minutes} мин.")
+    if snapshot.get("evening_closure_sent"):
+        lines.append("Отчёт закрытия дня уже отправлен ✅")
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        reply_markup=(None if evening_state["filled"] else _evening_keyboard()),
+    )
+
+
+async def eveningcheck(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    await morning_orchestrator_tick(context)
+    await eveningstatus(update, context)
+
+
+async def eveningtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    result = run_evening_orchestrator_self_check()
+    checks = dict(result["checks"])
+    sheet_error = ""
+    try:
+        worksheet = await asyncio.to_thread(_get_evening_worksheet)
+        checks["response_sheet_available"] = True
+        sheet_name = worksheet.title
+    except Exception as exc:
+        checks["response_sheet_available"] = False
+        sheet_name = "—"
+        sheet_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+    failed = [name for name, ok in checks.items() if not ok]
+    lines = [
+        "🧪 Тест вечернего контура",
+        "",
+        *(f"{'✅' if ok else '❌'} {name}" for name, ok in checks.items()),
+        "",
+        f"Вкладка ответов: {sheet_name}.",
+        f"Тестовый расчёт первой проверки: {result['due'].strftime('%H:%M')} при старте в 04:00.",
+        f"Итог: {'PASS' if not failed else 'FAIL: ' + ', '.join(failed)}.",
+    ]
+    if sheet_error:
+        lines.append("Ошибка вкладки: " + sheet_error)
+    lines.append("Рабочие ответы и дневная сессия не изменялись.")
+    await update.effective_message.reply_text("\n".join(lines)[:4000])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         logger.warning(
@@ -7289,32 +8039,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
+    if await _handle_evening_snooze_message(update, context, text):
+        return
+
     if MORNING_TRIGGER_PATTERN.search(text):
         await start_or_continue_morning_session(update, context)
         return
 
-    defer_match = MORNING_DEFER_PATTERN.search(text)
-    if defer_match:
-        try:
-            snapshot = await asyncio.to_thread(
-                build_morning_session_snapshot,
-                datetime.now(MOSCOW_TZ).date(),
-            )
-        except Exception:
-            logger.exception("Morning defer context read failed")
-            snapshot = None
-        if snapshot is not None and snapshot["state"]["all_filled"]:
-            await handle_morning_defer(update, defer_match)
-            return
-
-    if _coordinator_heuristic_route(text)["intent"] == "BUILD_DAY_PLAN":
-        await start_or_continue_morning_planning(update, context)
-        return
-
-    if await handle_morning_planning_message(update, context, text):
-        return
-
-    await _process_coordinator_message(update, text)
+    await update.effective_message.reply_text(
+        "Сейчас штаб работает в фиксированном режиме без AI-координатора:\n"
+        "• «Доброе утро» — запуск трёх утренних чек-листов;\n"
+        "• /morningstatus — состояние утра;\n"
+        "• /eveningstatus — состояние вечернего закрытия;\n"
+        "• после первого вечернего уведомления можно написать «через 2 часа» "
+        "или «напомни в 22:00»;\n"
+        "• /hqstatus — общий статус системы."
+    )
 
 
 async def health(request: web.Request) -> web.Response:
@@ -7356,6 +8096,9 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("morningstatus", morningstatus))
     telegram_app.add_handler(CommandHandler("morningcheck", morningcheck))
     telegram_app.add_handler(CommandHandler("morningtest", morningtest))
+    telegram_app.add_handler(CommandHandler("eveningstatus", eveningstatus))
+    telegram_app.add_handler(CommandHandler("eveningcheck", eveningcheck))
+    telegram_app.add_handler(CommandHandler("eveningtest", eveningtest))
     telegram_app.add_handler(CommandHandler("planningstatus", planningstatus))
     telegram_app.add_handler(CommandHandler("planningtest", planningtest))
     telegram_app.add_handler(CommandHandler("dayplancleanup", dayplancleanup))
