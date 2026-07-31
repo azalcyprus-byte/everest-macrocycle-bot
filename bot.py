@@ -3,8 +3,10 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import threading
+import time as time_module
 import uuid
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -111,6 +113,11 @@ ACTION_STATUS_FAILED = "FAILED"
 ACTION_STATUS_BLOCKED = "BLOCKED"
 ACTION_EXECUTOR = "EverestMacrocycleBot"
 action_journal_thread_lock = threading.Lock()
+spreadsheet_connection_lock = threading.Lock()
+_cached_spreadsheet = None
+_cached_action_journal_worksheet = None
+_action_journal_headers_validated = False
+SHEETS_QUOTA_RETRY_DELAYS = (2, 4, 8, 16, 32)
 
 MORNING_SHEET = "Утро"
 MORNING_60_SHEET = "Утро 60 мин"
@@ -233,7 +240,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.4"
+COORDINATOR_VERSION = "v12.4.1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -306,23 +313,94 @@ def is_authorized(update: Update) -> bool:
     return bool(user and user.id == ALLOWED_USER_ID)
 
 
+def _is_sheets_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return (
+        status_code == 429
+        or "[429]" in text
+        or "quota exceeded" in text
+        or "too many requests" in text
+        or "rate limit" in text
+    )
+
+
+def _sheets_api_call(callable_, *, operation: str):
+    """Run one Sheets request with truncated exponential backoff on 429."""
+    for attempt in range(len(SHEETS_QUOTA_RETRY_DELAYS) + 1):
+        try:
+            return callable_()
+        except Exception as exc:
+            if not _is_sheets_quota_error(exc):
+                raise
+            if attempt >= len(SHEETS_QUOTA_RETRY_DELAYS):
+                raise
+            delay = SHEETS_QUOTA_RETRY_DELAYS[attempt] + random.random()
+            logger.warning(
+                "Google Sheets quota reached during %s; retry in %.1fs",
+                operation,
+                delay,
+            )
+            time_module.sleep(delay)
+    raise RuntimeError("Unreachable Sheets retry state.")
+
+
 def get_spreadsheet():
+    global _cached_spreadsheet
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing.")
     if not GOOGLE_SHEET_ID:
         raise RuntimeError("GOOGLE_SHEET_ID is missing.")
 
-    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials = Credentials.from_service_account_info(
-        service_account_info,
-        scopes=scopes,
+    with spreadsheet_connection_lock:
+        if _cached_spreadsheet is not None:
+            return _cached_spreadsheet
+
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=scopes,
+        )
+        client = gspread.authorize(credentials)
+        _cached_spreadsheet = _sheets_api_call(
+            lambda: client.open_by_key(GOOGLE_SHEET_ID),
+            operation="open spreadsheet",
+        )
+        return _cached_spreadsheet
+
+
+def _batch_get_values(spreadsheet, ranges: list[str]) -> list[list[list[str]]]:
+    """Read several ranges in one quota-counted request."""
+    response = _sheets_api_call(
+        lambda: spreadsheet.values_batch_get(
+            ranges,
+            params={
+                "valueRenderOption": "FORMATTED_VALUE",
+                "majorDimension": "ROWS",
+            },
+        ),
+        operation="values.batchGet",
     )
-    client = gspread.authorize(credentials)
-    return client.open_by_key(GOOGLE_SHEET_ID)
+    value_ranges = response.get("valueRanges", [])
+    result: list[list[list[str]]] = []
+    for index in range(len(ranges)):
+        item = value_ranges[index] if index < len(value_ranges) else {}
+        result.append(item.get("values", []) or [])
+    return result
+
+
+def _worksheet_get(worksheet, range_name: str) -> list[list[str]]:
+    return _sheets_api_call(
+        lambda: worksheet.get(
+            range_name,
+            value_render_option="FORMATTED_VALUE",
+        ),
+        operation=f"read {getattr(worksheet, 'title', 'worksheet')}!{range_name}",
+    )
 
 
 def read_current_working_data() -> dict:
@@ -528,22 +606,37 @@ def read_morning_checklist_state(
 ) -> dict:
     target = target_date or datetime.now(MOSCOW_TZ).date()
     spreadsheet = get_spreadsheet()
+    morning_values, checklist_60_values, checklist_90_values = _batch_get_values(
+        spreadsheet,
+        [
+            f"'{MORNING_SHEET}'!A1:O1000",
+            f"'{MORNING_60_SHEET}'!A1:Q1000",
+            f"'{MORNING_90_SHEET}'!A1:L1000",
+        ],
+    )
+
+    def latest(values: list[list[str]]) -> dict[str, str] | None:
+        records = _records_from_values(values)
+        matches = []
+        for record in records:
+            record_date = _parse_date_value(record.get("Дата", ""))
+            if record_date is None:
+                record_date = _parse_date_value(record.get("Отметка времени", ""))
+            if record_date == target:
+                matches.append(record)
+        if not matches:
+            return None
+        return max(
+            matches,
+            key=lambda record: _parse_timestamp_value(
+                record.get("Отметка времени", "")
+            ),
+        )
+
     records = {
-        1: _latest_record_for_date(
-            spreadsheet.worksheet(MORNING_SHEET),
-            "A1:O1000",
-            target,
-        ),
-        2: _latest_record_for_date(
-            spreadsheet.worksheet(MORNING_60_SHEET),
-            "A1:Q1000",
-            target,
-        ),
-        3: _latest_record_for_date(
-            spreadsheet.worksheet(MORNING_90_SHEET),
-            "A1:L1000",
-            target,
-        ),
+        1: latest(morning_values),
+        2: latest(checklist_60_values),
+        3: latest(checklist_90_values),
     }
     timestamps = {
         number: _morning_record_timestamp(record)
@@ -571,13 +664,16 @@ def _morning_session_object_id(target_date: date) -> str:
 
 def find_morning_session_entry(
     target_date: date | None = None,
+    *,
+    entries: list[dict] | None = None,
 ) -> dict | None:
     target = target_date or datetime.now(MOSCOW_TZ).date()
     key = _morning_session_key(target)
+    journal_entries = entries if entries is not None else read_action_journal_entries()
     return next(
         (
             entry
-            for entry in read_action_journal_entries()
+            for entry in journal_entries
             if entry["idempotency_key"] == key
             and entry["operation"] == MORNING_SESSION_OPERATION
         ),
@@ -652,11 +748,16 @@ def _morning_ready_action_key(target_date: date) -> str:
     return f"morning-ready:{target_date.isoformat()}"
 
 
-def _morning_action_succeeded(idempotency_key: str) -> bool:
+def _morning_action_succeeded(
+    idempotency_key: str,
+    *,
+    entries: list[dict] | None = None,
+) -> bool:
+    journal_entries = entries if entries is not None else read_action_journal_entries()
     return any(
         entry["idempotency_key"] == idempotency_key
         and entry["status"] == ACTION_STATUS_SUCCEEDED
-        for entry in read_action_journal_entries()
+        for entry in journal_entries
     )
 
 
@@ -664,7 +765,8 @@ def build_morning_session_snapshot(
     target_date: date | None = None,
 ) -> dict | None:
     target = target_date or datetime.now(MOSCOW_TZ).date()
-    entry = find_morning_session_entry(target)
+    journal_entries = read_action_journal_entries()
+    entry = find_morning_session_entry(target, entries=journal_entries)
     if entry is None:
         return None
     state = read_morning_checklist_state(target)
@@ -680,7 +782,10 @@ def build_morning_session_snapshot(
         if state["all_filled"] and last_completed_at
         else None
     )
-    planning_entry = find_morning_planning_entry(target)
+    planning_entry = find_morning_planning_entry(
+        target,
+        entries=journal_entries,
+    )
     planning_state = (
         _parse_json_object(planning_entry.get("result_json", ""))
         if planning_entry is not None
@@ -701,11 +806,16 @@ def build_morning_session_snapshot(
         "last_completed_at": last_completed_at,
         "ready_at": ready_at,
         "ready_sent": (
-            _morning_action_succeeded(_morning_ready_action_key(target))
+            _morning_action_succeeded(
+                _morning_ready_action_key(target),
+                entries=journal_entries,
+            )
             or planning_entry is not None
         ),
         "planning_started": planning_entry is not None,
         "planning_stage": planning_state.get("stage", ""),
+        "planning_entry": planning_entry,
+        "planning_state": planning_state,
     }
 
 
@@ -1273,21 +1383,39 @@ def read_morning_day_plan_test_data() -> dict:
     target_date = datetime.now(MOSCOW_TZ).date()
     target_text = target_date.strftime("%d.%m.%Y")
 
-    morning = _latest_record_for_date(
-        spreadsheet.worksheet(MORNING_SHEET),
-        "A1:O1000",
-        target_date,
+    morning_values, checklist_60_values, checklist_90_values, day_rows = (
+        _batch_get_values(
+            spreadsheet,
+            [
+                f"'{MORNING_SHEET}'!A1:O1000",
+                f"'{MORNING_60_SHEET}'!A1:Q1000",
+                f"'{MORNING_90_SHEET}'!A1:L1000",
+                "'02_День'!A4:AR1000",
+            ],
+        )
     )
-    checklist_60 = _latest_record_for_date(
-        spreadsheet.worksheet(MORNING_60_SHEET),
-        "A1:Q1000",
-        target_date,
-    )
-    checklist_90 = _latest_record_for_date(
-        spreadsheet.worksheet(MORNING_90_SHEET),
-        "A1:L1000",
-        target_date,
-    )
+
+    def latest(values: list[list[str]]) -> dict[str, str] | None:
+        records = _records_from_values(values)
+        matches = []
+        for record in records:
+            record_date = _parse_date_value(record.get("Дата", ""))
+            if record_date is None:
+                record_date = _parse_date_value(record.get("Отметка времени", ""))
+            if record_date == target_date:
+                matches.append(record)
+        if not matches:
+            return None
+        return max(
+            matches,
+            key=lambda record: _parse_timestamp_value(
+                record.get("Отметка времени", "")
+            ),
+        )
+
+    morning = latest(morning_values)
+    checklist_60 = latest(checklist_60_values)
+    checklist_90 = latest(checklist_90_values)
 
     missing_checklists = [
         label
@@ -1299,10 +1427,6 @@ def read_morning_day_plan_test_data() -> dict:
         if record is None
     ]
 
-    day_rows = spreadsheet.worksheet("02_День").get(
-        "A4:AR1000",
-        value_render_option="FORMATTED_VALUE",
-    )
     day_row = next(
         (row for row in day_rows if row and str(row[0]).strip() == target_text),
         None,
@@ -1648,8 +1772,19 @@ def _inbox_task_sort_key(task: dict[str, str]) -> tuple:
 
 def _read_inbox_tasks(spreadsheet, target_date: date) -> dict:
     try:
-        worksheet = spreadsheet.worksheet(INBOX_TASKS_SHEET)
-    except gspread.WorksheetNotFound:
+        (values,) = _batch_get_values(
+            spreadsheet,
+            [f"'{INBOX_TASKS_SHEET}'!A1:Y2000"],
+        )
+    except Exception as exc:
+        text = str(exc).lower()
+        missing_sheet = (
+            "unable to parse range" in text
+            or "not found" in text
+            or INBOX_TASKS_SHEET.lower() in text and "400" in text
+        )
+        if not missing_sheet:
+            raise
         return {
             "available": False,
             "records": [],
@@ -1657,10 +1792,6 @@ def _read_inbox_tasks(spreadsheet, target_date: date) -> dict:
             "message": f"Вкладка {INBOX_TASKS_SHEET} ещё не создана.",
         }
 
-    values = worksheet.get(
-        "A1:Y2000",
-        value_render_option="FORMATTED_VALUE",
-    )
     records = _records_from_detected_header(values, "INBOX_ID")
     active_statuses = {
         "новое",
@@ -1722,9 +1853,12 @@ def _read_full_plan_sources(spreadsheet, base_data: dict) -> dict:
     day_type = base_data["day"]["day_type"]
     phase = base_data["day"].get("phase", "")
 
-    plan_values = spreadsheet.worksheet("10_План_факт_дня").get(
-        "A4:Z1000",
-        value_render_option="FORMATTED_VALUE",
+    plan_values, task_values = _batch_get_values(
+        spreadsheet,
+        [
+            "'10_План_факт_дня'!A4:Z1000",
+            "'05_Проекты_и_задачи'!A3:AG1000",
+        ],
     )
     plan_rows = _records_from_values(plan_values)
     existing_rows = [
@@ -1733,10 +1867,6 @@ def _read_full_plan_sources(spreadsheet, base_data: dict) -> dict:
         if _parse_date_value(row.get("Дата", "")) == target_date
     ]
 
-    task_values = spreadsheet.worksheet("05_Проекты_и_задачи").get(
-        "A3:AG1000",
-        value_render_option="FORMATTED_VALUE",
-    )
     task_rows = _records_from_values(task_values)
     ready_tasks = sorted(
         (
@@ -3041,19 +3171,37 @@ def _payload_hash(payload) -> str:
 
 
 def ensure_action_journal_sheet():
+    global _cached_action_journal_worksheet
+    global _action_journal_headers_validated
+
     spreadsheet = get_spreadsheet()
+    if (
+        _cached_action_journal_worksheet is not None
+        and _action_journal_headers_validated
+    ):
+        return spreadsheet, _cached_action_journal_worksheet
+
     try:
-        worksheet = spreadsheet.worksheet(ACTION_JOURNAL_SHEET)
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=ACTION_JOURNAL_SHEET,
-            rows=2000,
-            cols=len(ACTION_JOURNAL_HEADERS),
+        worksheet = _sheets_api_call(
+            lambda: spreadsheet.worksheet(ACTION_JOURNAL_SHEET),
+            operation=f"open worksheet {ACTION_JOURNAL_SHEET}",
         )
-        worksheet.update(
-            range_name="A1:R1",
-            values=[ACTION_JOURNAL_HEADERS],
-            value_input_option="RAW",
+    except gspread.WorksheetNotFound:
+        worksheet = _sheets_api_call(
+            lambda: spreadsheet.add_worksheet(
+                title=ACTION_JOURNAL_SHEET,
+                rows=2000,
+                cols=len(ACTION_JOURNAL_HEADERS),
+            ),
+            operation=f"create worksheet {ACTION_JOURNAL_SHEET}",
+        )
+        _sheets_api_call(
+            lambda: worksheet.update(
+                range_name="A1:R1",
+                values=[ACTION_JOURNAL_HEADERS],
+                value_input_option="RAW",
+            ),
+            operation="write action journal headers",
         )
         worksheet.freeze(rows=1)
         worksheet.format(
@@ -3084,23 +3232,18 @@ def ensure_action_journal_sheet():
                 "wrapStrategy": "WRAP",
             },
         )
-        logger.info(
-            "Action journal sheet created: %s",
-            ACTION_JOURNAL_SHEET,
-        )
-        return spreadsheet, worksheet
+        logger.info("Action journal sheet created: %s", ACTION_JOURNAL_SHEET)
 
-    current_headers = worksheet.get(
-        "A1:R1",
-        value_render_option="FORMATTED_VALUE",
-    )
+    current_headers = _worksheet_get(worksheet, "A1:R1")
     found = list(current_headers[0]) if current_headers else []
     found += [""] * (len(ACTION_JOURNAL_HEADERS) - len(found))
     if found[:len(ACTION_JOURNAL_HEADERS)] != ACTION_JOURNAL_HEADERS:
         raise RuntimeError(
-            f"Action journal {ACTION_JOURNAL_SHEET} "
-            "has unexpected headers."
+            f"Action journal {ACTION_JOURNAL_SHEET} has unexpected headers."
         )
+
+    _cached_action_journal_worksheet = worksheet
+    _action_journal_headers_validated = True
     return spreadsheet, worksheet
 
 
@@ -3139,19 +3282,15 @@ def _journal_row_to_entry(
     }
 
 
-def read_action_journal_entries() -> list[dict]:
-    _, worksheet = ensure_action_journal_sheet()
-    rows = worksheet.get(
-        "A2:R2000",
-        value_render_option="FORMATTED_VALUE",
-    )
+def read_action_journal_entries(worksheet=None) -> list[dict]:
+    if worksheet is None:
+        _, worksheet = ensure_action_journal_sheet()
+    rows = _worksheet_get(worksheet, "A2:R2000")
     entries = []
     for row_number, row in enumerate(rows, start=2):
         if not row or not str(row[0]).strip():
             continue
-        entries.append(
-            _journal_row_to_entry(row_number, row)
-        )
+        entries.append(_journal_row_to_entry(row_number, row))
     return entries
 
 
@@ -3159,11 +3298,12 @@ def _write_action_journal_entry(
     worksheet,
     entry: dict,
 ) -> None:
-    worksheet.update(
-        range_name=(
-            f"A{entry['row_number']}:R{entry['row_number']}"
-        ),
-        values=[[
+    _sheets_api_call(
+        lambda: worksheet.update(
+            range_name=(
+                f"A{entry['row_number']}:R{entry['row_number']}"
+            ),
+            values=[[
             entry["action_id"],
             entry["idempotency_key"],
             entry["operation"],
@@ -3182,8 +3322,10 @@ def _write_action_journal_entry(
             entry["error"],
             entry["executor"],
             entry["system_check"],
-        ]],
-        value_input_option="RAW",
+            ]],
+            value_input_option="RAW",
+        ),
+        operation=f"update action journal row {entry['row_number']}",
     )
 
 
@@ -3203,7 +3345,7 @@ def begin_action_once(
 
     with action_journal_thread_lock:
         _, worksheet = ensure_action_journal_sheet()
-        entries = read_action_journal_entries()
+        entries = read_action_journal_entries(worksheet)
         now = datetime.now(MOSCOW_TZ).replace(
             microsecond=0
         ).isoformat()
@@ -3256,8 +3398,13 @@ def begin_action_once(
             "executor": ACTION_EXECUTOR,
             "system_check": "CLAIMED_ONCE",
         }
-        worksheet.append_row(
-            [
+        entry["row_number"] = max(
+            (candidate["row_number"] for candidate in entries),
+            default=1,
+        ) + 1
+        _sheets_api_call(
+            lambda: worksheet.append_row(
+                [
                 entry["action_id"],
                 entry["idempotency_key"],
                 entry["operation"],
@@ -3276,26 +3423,15 @@ def begin_action_once(
                 entry["error"],
                 entry["executor"],
                 entry["system_check"],
-            ],
-            value_input_option="RAW",
-        )
-
-        persisted = next(
-            (
-                candidate
-                for candidate in read_action_journal_entries()
-                if candidate["action_id"] == action_id
+                ],
+                value_input_option="RAW",
             ),
-            None,
+            operation="append action journal row",
         )
-        if persisted is None:
-            raise RuntimeError(
-                "Action journal row failed read-back check."
-            )
         return {
             "created": True,
             "blocked": False,
-            "entry": persisted,
+            "entry": entry,
         }
 
 
@@ -3318,7 +3454,7 @@ def finish_action(
         entry = next(
             (
                 candidate
-                for candidate in read_action_journal_entries()
+                for candidate in read_action_journal_entries(worksheet)
                 if candidate["action_id"] == action_id
             ),
             None,
@@ -3360,7 +3496,7 @@ def update_started_action_state(
         entry = next(
             (
                 candidate
-                for candidate in read_action_journal_entries()
+                for candidate in read_action_journal_entries(worksheet)
                 if candidate["action_id"] == action_id
             ),
             None,
@@ -3387,13 +3523,16 @@ def _morning_planning_object_id(target_date: date) -> str:
 
 def find_morning_planning_entry(
     target_date: date | None = None,
+    *,
+    entries: list[dict] | None = None,
 ) -> dict | None:
     target = target_date or datetime.now(MOSCOW_TZ).date()
     key = _morning_planning_key(target)
+    journal_entries = entries if entries is not None else read_action_journal_entries()
     return next(
         (
             entry
-            for entry in read_action_journal_entries()
+            for entry in journal_entries
             if entry["idempotency_key"] == key
             and entry["operation"] == MORNING_PLANNING_OPERATION
         ),
@@ -6388,10 +6527,8 @@ async def morning_orchestrator_tick(
         if ready_at is None or now < ready_at:
             return
         try:
-            planning_entry, planning_state = await asyncio.to_thread(
-                read_morning_planning_state,
-                snapshot["date"],
-            )
+            planning_entry = snapshot.get("planning_entry")
+            planning_state = snapshot.get("planning_state") or {}
             if planning_entry is not None and planning_state:
                 return
             planning_entry, planning_state, _ = await asyncio.to_thread(
