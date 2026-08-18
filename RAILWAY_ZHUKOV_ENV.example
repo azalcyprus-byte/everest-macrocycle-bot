@@ -1,0 +1,16 @@
+# Обязателен после того, как Алексей нажмёт Start в боте.
+ZHUKOV_TELEGRAM_USER_ID=
+
+# Локальное расписание Алексея. Время — строго ЧЧ:ММ.
+ZHUKOV_TIMEZONE=Asia/Phnom_Penh
+ZHUKOV_MORNING_TIME=10:00
+ZHUKOV_POSTGAME_TIME=23:30
+
+# Таблица ответов двух форм.
+ZHUKOV_GOOGLE_SHEET_ID=1Ax_cP0of8ezqL-COJjFBlleHz_Xcle3T1h0vxFrjUmM
+ZHUKOV_MORNING_SHEET=Утро — ответы
+ZHUKOV_POSTGAME_SHEET=После игры — ответы
+
+# Необязательно: рабочие ссылки уже есть в bot.py по умолчанию.
+ZHUKOV_MORNING_FORM_URL=https://docs.google.com/forms/d/e/1FAIpQLSd_I--HGHT-H_EgSEp-8cwoyyu-ZIJC9eFWmCRaXhJi994Y_A/viewform
+ZHUKOV_POSTGAME_FORM_URL=https://docs.google.com/forms/d/e/1FAIpQLScy-MqtW-CMza1Wh5NLrom_-3aBZrMj_i5J0KO-KCtheiWLNw/viewform

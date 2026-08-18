@@ -37,8 +37,16 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TELEGRAM_USER_ID_RAW = os.environ.get("TELEGRAM_USER_ID")
+ZHUKOV_TELEGRAM_USER_ID_RAW = os.environ.get(
+    "ZHUKOV_TELEGRAM_USER_ID",
+    "",
+).strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+ZHUKOV_GOOGLE_SHEET_ID = os.environ.get(
+    "ZHUKOV_GOOGLE_SHEET_ID",
+    "1Ax_cP0of8ezqL-COJjFBlleHz_Xcle3T1h0vxFrjUmM",
+).strip()
 GOOGLE_CALENDAR_ID = os.environ.get(
     "GOOGLE_CALENDAR_ID",
     "azalcyprus@gmail.com",
@@ -47,6 +55,29 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+def _parse_env_timezone(variable_name: str, default: str) -> ZoneInfo:
+    raw = os.environ.get(variable_name, default).strip() or default
+    try:
+        return ZoneInfo(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{variable_name} must contain a valid IANA timezone."
+        ) from exc
+
+
+def _parse_env_clock(variable_name: str, default: str) -> time:
+    raw = os.environ.get(variable_name, default).strip() or default
+    if not TIME_PATTERN.fullmatch(raw):
+        raise RuntimeError(f"{variable_name} must use 24-hour HH:MM format.")
+    hour, minute = (int(part) for part in raw.split(":"))
+    return time(hour=hour, minute=minute)
+
+
+ZHUKOV_TZ = _parse_env_timezone("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh")
+ZHUKOV_MORNING_TIME = _parse_env_clock("ZHUKOV_MORNING_TIME", "10:00")
+ZHUKOV_POSTGAME_TIME = _parse_env_clock("ZHUKOV_POSTGAME_TIME", "23:30")
 
 scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
@@ -115,6 +146,7 @@ ACTION_EXECUTOR = "EverestMacrocycleBot"
 action_journal_thread_lock = threading.Lock()
 spreadsheet_connection_lock = threading.Lock()
 _cached_spreadsheet = None
+_cached_zhukov_spreadsheet = None
 _cached_action_journal_worksheet = None
 _cached_evening_worksheet = None
 _action_journal_headers_validated = False
@@ -123,6 +155,14 @@ SHEETS_QUOTA_RETRY_DELAYS = (2, 4, 8, 16, 32)
 MORNING_SHEET = "Утро"
 MORNING_60_SHEET = "Утро 60 мин"
 MORNING_90_SHEET = "Утро 90 мин"
+ZHUKOV_MORNING_SHEET = os.environ.get(
+    "ZHUKOV_MORNING_SHEET",
+    "Утро — ответы",
+).strip() or "Утро — ответы"
+ZHUKOV_POSTGAME_SHEET = os.environ.get(
+    "ZHUKOV_POSTGAME_SHEET",
+    "После игры — ответы",
+).strip() or "После игры — ответы"
 INBOX_TASKS_SHEET = "17_Входящие_задачи"
 MORNING_PLANNING_OPERATION = "MORNING_PLANNING_DIALOGUE"
 MORNING_PLANNING_OBJECT_TYPE = "MORNING_PLANNING"
@@ -166,6 +206,21 @@ MORNING_60_FORM_URL = _normalize_google_form_url(
 )
 MORNING_90_FORM_URL = _normalize_google_form_url(
     os.environ.get("MORNING_90_FORM_URL", "")
+)
+
+# Independent observation flow for Alexey Zhukov. Railway can override every
+# value, while these responder links remain safe defaults.
+ZHUKOV_MORNING_FORM_URL = _normalize_google_form_url(
+    os.environ.get(
+        "ZHUKOV_MORNING_FORM_URL",
+        "https://docs.google.com/forms/d/e/1FAIpQLSd_I--HGHT-H_EgSEp-8cwoyyu-ZIJC9eFWmCRaXhJi994Y_A/viewform",
+    )
+)
+ZHUKOV_POSTGAME_FORM_URL = _normalize_google_form_url(
+    os.environ.get(
+        "ZHUKOV_POSTGAME_FORM_URL",
+        "https://docs.google.com/forms/d/e/1FAIpQLScy-MqtW-CMza1Wh5NLrom_-3aBZrMj_i5J0KO-KCtheiWLNw/viewform",
+    )
 )
 
 # Evening closure flow. The URL supplied by Andrey is the safe default;
@@ -274,7 +329,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.5.1"
+COORDINATOR_VERSION = "v12.6.0"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -341,10 +396,28 @@ try:
 except ValueError as exc:
     raise RuntimeError("TELEGRAM_USER_ID must be an integer.") from exc
 
+ZHUKOV_TELEGRAM_USER_ID: int | None = None
+if ZHUKOV_TELEGRAM_USER_ID_RAW:
+    try:
+        ZHUKOV_TELEGRAM_USER_ID = int(ZHUKOV_TELEGRAM_USER_ID_RAW)
+    except ValueError as exc:
+        raise RuntimeError(
+            "ZHUKOV_TELEGRAM_USER_ID must be an integer."
+        ) from exc
+
 
 def is_authorized(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id == ALLOWED_USER_ID)
+
+
+def is_zhukov(update: Update) -> bool:
+    user = update.effective_user
+    return bool(
+        user
+        and ZHUKOV_TELEGRAM_USER_ID is not None
+        and user.id == ZHUKOV_TELEGRAM_USER_ID
+    )
 
 
 def _is_sheets_quota_error(exc: Exception) -> bool:
@@ -405,6 +478,34 @@ def get_spreadsheet():
             operation="open spreadsheet",
         )
         return _cached_spreadsheet
+
+
+def get_zhukov_spreadsheet():
+    global _cached_zhukov_spreadsheet
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing.")
+    if not ZHUKOV_GOOGLE_SHEET_ID:
+        raise RuntimeError("ZHUKOV_GOOGLE_SHEET_ID is missing.")
+
+    with spreadsheet_connection_lock:
+        if _cached_zhukov_spreadsheet is not None:
+            return _cached_zhukov_spreadsheet
+
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=scopes,
+        )
+        client = gspread.authorize(credentials)
+        _cached_zhukov_spreadsheet = _sheets_api_call(
+            lambda: client.open_by_key(ZHUKOV_GOOGLE_SHEET_ID),
+            operation="open Zhukov spreadsheet",
+        )
+        return _cached_zhukov_spreadsheet
 
 
 def _batch_get_values(spreadsheet, ranges: list[str]) -> list[list[list[str]]]:
@@ -506,7 +607,14 @@ def _parse_date_value(value: object) -> date | None:
     raw = str(value or "").strip()
     if not raw:
         return None
-    for fmt in ("%d.%m.%Y", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d"):
+    for fmt in (
+        "%d.%m.%Y",
+        "%d.%m.%Y %H:%M:%S",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+    ):
         try:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
@@ -567,6 +675,46 @@ def _latest_record_for_date(
             record.get("Отметка времени", "")
         ),
     )
+
+
+def read_zhukov_checklist_state(target_date: date) -> dict:
+    spreadsheet = get_zhukov_spreadsheet()
+    morning_worksheet = _sheets_api_call(
+        lambda: spreadsheet.worksheet(ZHUKOV_MORNING_SHEET),
+        operation=f"open {ZHUKOV_MORNING_SHEET}",
+    )
+    postgame_worksheet = _sheets_api_call(
+        lambda: spreadsheet.worksheet(ZHUKOV_POSTGAME_SHEET),
+        operation=f"open {ZHUKOV_POSTGAME_SHEET}",
+    )
+    morning_record = _latest_record_for_date(
+        morning_worksheet,
+        "A1:AZ1000",
+        target_date,
+    )
+    postgame_record = _latest_record_for_date(
+        postgame_worksheet,
+        "A1:AZ1000",
+        target_date,
+    )
+    day_type = _normalize_text((morning_record or {}).get("Сегодня", ""))
+    return {
+        "date": target_date,
+        "morning_record": morning_record,
+        "morning_filled": morning_record is not None,
+        "postgame_record": postgame_record,
+        "postgame_filled": postgame_record is not None,
+        "day_type": day_type,
+        "is_game_day": day_type == "игра" if day_type else None,
+    }
+
+
+def _zhukov_postgame_target_date(now: datetime) -> date:
+    # A reminder scheduled after midnight still belongs to the game day that
+    # has just ended.
+    if now.hour < 6:
+        return (now - timedelta(days=1)).date()
+    return now.date()
 
 
 
@@ -1183,7 +1331,7 @@ def run_morning_orchestrator_self_check() -> dict:
         "second_after_start": MORNING_SECOND_DELAY_MINUTES == 60,
         "third_after_start": MORNING_THIRD_DELAY_MINUTES == 90,
         "reminder_interval": MORNING_REMINDER_INTERVAL_MINUTES == 15,
-        "load_report_mode": COORDINATOR_VERSION == "v12.5.1",
+        "load_report_mode": COORDINATOR_VERSION == "v12.6.0",
         "evening_delay": EVENING_DELAY_HOURS == 15,
     }
 
@@ -4970,20 +5118,233 @@ def test_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def zhukov_forms_keyboard(
+    *,
+    morning: bool = True,
+    postgame: bool = True,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if morning and ZHUKOV_MORNING_FORM_URL:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "☀️ Утренний чек-лист",
+                    url=ZHUKOV_MORNING_FORM_URL,
+                )
+            ]
+        )
+    if postgame and ZHUKOV_POSTGAME_FORM_URL:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🌙 Постигровой чек-лист",
+                    url=ZHUKOV_POSTGAME_FORM_URL,
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None or update.effective_message is None:
+        return
+    await update.effective_message.reply_text(
+        "Ваш Telegram ID: " + str(user.id)
+    )
+
+
+async def zhukov_forms(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not (is_zhukov(update) or is_authorized(update)):
+        return
+    await update.effective_message.reply_text(
+        "Чек-листы Алексея Жукова:",
+        reply_markup=zhukov_forms_keyboard(),
+    )
+
+
+async def zhukovstatus(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if not is_authorized(update):
-        logger.warning(
-            "Unauthorized /start attempt from user_id=%s",
-            getattr(update.effective_user, "id", None),
+        return
+
+    local_now = datetime.now(ZHUKOV_TZ)
+    lines = [
+        "Контур Алексея Жукова",
+        "",
+        "Telegram: "
+        + ("подключён ✅" if ZHUKOV_TELEGRAM_USER_ID is not None else "ожидает ID ⏳"),
+        f"Часовой пояс: {getattr(ZHUKOV_TZ, 'key', str(ZHUKOV_TZ))}.",
+        f"Утреннее напоминание: {ZHUKOV_MORNING_TIME.strftime('%H:%M')}.",
+        f"Постигровое напоминание: {ZHUKOV_POSTGAME_TIME.strftime('%H:%M')}.",
+        "Утренняя форма: " + ("готова ✅" if ZHUKOV_MORNING_FORM_URL else "нет ❌"),
+        "Постигровая форма: " + ("готова ✅" if ZHUKOV_POSTGAME_FORM_URL else "нет ❌"),
+    ]
+    try:
+        state = await asyncio.to_thread(
+            read_zhukov_checklist_state,
+            local_now.date(),
+        )
+        day_type = state["day_type"] or "не указан"
+        lines.extend(
+            [
+                "Таблица ответов: доступна ✅",
+                "Утро сегодня: "
+                + ("заполнено ✅" if state["morning_filled"] else "ожидается ⏳"),
+                f"Тип дня: {day_type}.",
+                "После игры сегодня: "
+                + ("заполнено ✅" if state["postgame_filled"] else "ожидается/не требуется"),
+            ]
+        )
+    except Exception as exc:
+        logger.exception("Zhukov status spreadsheet check failed")
+        lines.append(
+            "Таблица ответов: пока недоступна ❌ "
+            f"({type(exc).__name__}: {str(exc)[:180]})"
+        )
+
+    if ZHUKOV_TELEGRAM_USER_ID is None:
+        lines.extend(
+            [
+                "",
+                "Чтобы получить ID: Алексей открывает бота, нажимает Start "
+                "и пересылает вам число из ответа.",
+            ]
+        )
+    await update.effective_message.reply_text(
+        "\n".join(lines)[:4000],
+        reply_markup=zhukov_forms_keyboard(),
+    )
+
+
+async def zhukovtest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_authorized(update):
+        return
+    if ZHUKOV_TELEGRAM_USER_ID is None:
+        await update.effective_message.reply_text(
+            "Алексей ещё не подключён: в Railway нет ZHUKOV_TELEGRAM_USER_ID."
+        )
+        return
+    await context.bot.send_message(
+        chat_id=ZHUKOV_TELEGRAM_USER_ID,
+        text=(
+            "Тест Everest ✅\n\n"
+            "Обе персональные ссылки подключены. Плановые напоминания будут "
+            "приходить сюда."
+        ),
+        reply_markup=zhukov_forms_keyboard(),
+    )
+    await update.effective_message.reply_text(
+        "Тестовое сообщение отправлено Алексею ✅"
+    )
+
+
+async def zhukov_morning_reminder(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if ZHUKOV_TELEGRAM_USER_ID is None:
+        return
+    local_now = datetime.now(ZHUKOV_TZ)
+    try:
+        state = await asyncio.to_thread(
+            read_zhukov_checklist_state,
+            local_now.date(),
+        )
+        if state["morning_filled"]:
+            logger.info("Zhukov morning checklist already filled; reminder skipped")
+            return
+    except Exception:
+        logger.exception(
+            "Zhukov morning state check failed; sending safe reminder"
+        )
+
+    await context.bot.send_message(
+        chat_id=ZHUKOV_TELEGRAM_USER_ID,
+        text=(
+            "Доброе утро, Алексей ☀️\n\n"
+            "Заполни утренний чек-лист через 30–60 минут после пробуждения. "
+            "Это займёт несколько минут."
+        ),
+        reply_markup=zhukov_forms_keyboard(morning=True, postgame=False),
+    )
+
+
+async def zhukov_postgame_reminder(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if ZHUKOV_TELEGRAM_USER_ID is None:
+        return
+    local_now = datetime.now(ZHUKOV_TZ)
+    target_date = _zhukov_postgame_target_date(local_now)
+    game_day: bool | None = None
+    try:
+        state = await asyncio.to_thread(
+            read_zhukov_checklist_state,
+            target_date,
+        )
+        if state["postgame_filled"]:
+            logger.info("Zhukov postgame checklist already filled; reminder skipped")
+            return
+        game_day = state["is_game_day"]
+        if game_day is False:
+            logger.info("Zhukov has a non-game day; postgame reminder skipped")
+            return
+    except Exception:
+        logger.exception(
+            "Zhukov postgame state check failed; sending conditional reminder"
+        )
+
+    text = (
+        "Алексей, после завершения игры заполни короткий постигровой чек-лист 🌙"
+        if game_day is True
+        else (
+            "Алексей, если сегодня был игровой день, после завершения игры "
+            "заполни короткий постигровой чек-лист 🌙\n\n"
+            "Если сегодня отдых или перелёт — ничего заполнять не нужно."
+        )
+    )
+    await context.bot.send_message(
+        chat_id=ZHUKOV_TELEGRAM_USER_ID,
+        text=text,
+        reply_markup=zhukov_forms_keyboard(morning=False, postgame=True),
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_zhukov(update):
+        await update.effective_message.reply_text(
+            "Алексей, бот Everest подключён ✅\n\n"
+            "Здесь будут приходить напоминания о двух чек-листах. "
+            "Открыть обе ссылки в любой момент: /forms",
+            reply_markup=zhukov_forms_keyboard(),
         )
         return
 
+    if not is_authorized(update):
+        user_id = getattr(update.effective_user, "id", None)
+        logger.info("Unconfigured /start attempt from user_id=%s", user_id)
+        if user_id is not None:
+            await update.effective_message.reply_text(
+                "Для подключения передайте координатору этот Telegram ID:\n"
+                f"{user_id}"
+            )
+        return
+
     await update.effective_message.reply_text(
-        "Everest Macrocycle Bot v12.5 запущен ✅\n"
+        "Everest Macrocycle Bot v12.6 запущен ✅\n"
         "Авторизация подтверждена.\n\n"
         "Для запуска дневного контура напишите: Доброе утро\n"
         "Статус утра: /morningstatus\n"
-        "Статус вечернего закрытия: /eveningstatus"
+        "Статус вечернего закрытия: /eveningstatus\n"
+        "Статус контура Жукова: /zhukovstatus"
     )
 
 
@@ -8078,6 +8439,10 @@ async def main() -> None:
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("myid", myid))
+    telegram_app.add_handler(CommandHandler("forms", zhukov_forms))
+    telegram_app.add_handler(CommandHandler("zhukovstatus", zhukovstatus))
+    telegram_app.add_handler(CommandHandler("zhukovtest", zhukovtest))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
     telegram_app.add_handler(CommandHandler("writetest", writetest))
@@ -8125,6 +8490,28 @@ async def main() -> None:
             first=5,
             name="morning-orchestrator",
         )
+        if ZHUKOV_TELEGRAM_USER_ID is not None:
+            telegram_app.job_queue.run_daily(
+                zhukov_morning_reminder,
+                time=ZHUKOV_MORNING_TIME.replace(tzinfo=ZHUKOV_TZ),
+                name="zhukov-morning-reminder",
+            )
+            telegram_app.job_queue.run_daily(
+                zhukov_postgame_reminder,
+                time=ZHUKOV_POSTGAME_TIME.replace(tzinfo=ZHUKOV_TZ),
+                name="zhukov-postgame-reminder",
+            )
+            logger.info(
+                "Zhukov reminders scheduled: morning=%s postgame=%s timezone=%s",
+                ZHUKOV_MORNING_TIME.strftime("%H:%M"),
+                ZHUKOV_POSTGAME_TIME.strftime("%H:%M"),
+                getattr(ZHUKOV_TZ, "key", str(ZHUKOV_TZ)),
+            )
+        else:
+            logger.info(
+                "Zhukov reminders are disabled until "
+                "ZHUKOV_TELEGRAM_USER_ID is configured."
+            )
         await telegram_app.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
