@@ -67,20 +67,26 @@ def _parse_env_timezone(variable_name: str, default: str) -> ZoneInfo:
         ) from exc
 
 
-def _parse_env_clock(variable_name: str, default: str) -> time:
-    raw = os.environ.get(variable_name, default).strip() or default
-    if not TIME_PATTERN.fullmatch(raw):
-        raise RuntimeError(f"{variable_name} must use 24-hour HH:MM format.")
-    hour, minute = (int(part) for part in raw.split(":"))
-    return time(hour=hour, minute=minute)
-
-
 ZHUKOV_TZ = _parse_env_timezone("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh")
-ZHUKOV_MORNING_TIME = _parse_env_clock("ZHUKOV_MORNING_TIME", "10:00")
-ZHUKOV_POSTGAME_TIME = _parse_env_clock("ZHUKOV_POSTGAME_TIME", "23:30")
+ZHUKOV_POSTGAME_DELAY_HOURS = float(
+    os.environ.get("ZHUKOV_POSTGAME_DELAY_HOURS", "15")
+)
+ZHUKOV_REMINDER_INTERVAL_MINUTES = int(
+    os.environ.get("ZHUKOV_REMINDER_INTERVAL_MINUTES", "15")
+)
+ZHUKOV_ORCHESTRATOR_TICK_SECONDS = int(
+    os.environ.get("ZHUKOV_ORCHESTRATOR_TICK_SECONDS", "60")
+)
+if min(
+    ZHUKOV_POSTGAME_DELAY_HOURS,
+    ZHUKOV_REMINDER_INTERVAL_MINUTES,
+    ZHUKOV_ORCHESTRATOR_TICK_SECONDS,
+) <= 0:
+    raise RuntimeError("Zhukov reminder timing values must be positive.")
 
 scheduled_notification_keys: set[str] = set()
 sent_notification_keys: set[str] = set()
+zhukov_sent_notification_keys: set[str] = set()
 write_test_lock = asyncio.Lock()
 event_test_lock = asyncio.Lock()
 journal_test_lock = asyncio.Lock()
@@ -329,7 +335,7 @@ ONLINE_GAME_START = os.environ.get("ONLINE_GAME_START", "09:00")
 # Block 26: coordinator as manager-agent.
 COORDINATOR_SOURCE = "/hq"
 COORDINATOR_OPERATION = "COORDINATOR_MANAGER_AGENT"
-COORDINATOR_VERSION = "v12.6.0"
+COORDINATOR_VERSION = "v12.6.1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.environ.get(
@@ -709,12 +715,56 @@ def read_zhukov_checklist_state(target_date: date) -> dict:
     }
 
 
-def _zhukov_postgame_target_date(now: datetime) -> date:
-    # A reminder scheduled after midnight still belongs to the game day that
-    # has just ended.
-    if now.hour < 6:
-        return (now - timedelta(days=1)).date()
-    return now.date()
+def _zhukov_session_key(target_date: date) -> str:
+    return f"zhukov-morning:{target_date.isoformat()}"
+
+
+def _zhukov_session_object_id(target_date: date) -> str:
+    return f"zhukov-day:{target_date.isoformat()}"
+
+
+def find_zhukov_morning_session(
+    target_date: date,
+    *,
+    entries: list[dict] | None = None,
+) -> dict | None:
+    journal_entries = entries if entries is not None else read_action_journal_entries()
+    key = _zhukov_session_key(target_date)
+    return next(
+        (
+            entry
+            for entry in reversed(journal_entries)
+            if entry.get("idempotency_key") == key
+            and entry.get("status") == ACTION_STATUS_SUCCEEDED
+        ),
+        None,
+    )
+
+
+def _zhukov_session_started_at(entry: dict) -> datetime:
+    result = _parse_json_object(entry.get("result_json"))
+    for raw in (
+        result.get("sent_at"),
+        entry.get("finished_at"),
+        entry.get("created_at"),
+    ):
+        parsed = _parse_iso_datetime(raw)
+        if parsed is not None:
+            return parsed
+    raise ValueError("Zhukov morning session has no valid start timestamp.")
+
+
+def _zhukov_postgame_due_at(entry: dict) -> datetime:
+    return _zhukov_session_started_at(entry) + timedelta(
+        hours=ZHUKOV_POSTGAME_DELAY_HOURS
+    )
+
+
+def _zhukov_reminder_bucket(now: datetime, due_at: datetime) -> int | None:
+    if now < due_at:
+        return None
+    interval_seconds = ZHUKOV_REMINDER_INTERVAL_MINUTES * 60
+    return int((now - due_at).total_seconds() // interval_seconds)
 
 
 
@@ -1331,7 +1381,7 @@ def run_morning_orchestrator_self_check() -> dict:
         "second_after_start": MORNING_SECOND_DELAY_MINUTES == 60,
         "third_after_start": MORNING_THIRD_DELAY_MINUTES == 90,
         "reminder_interval": MORNING_REMINDER_INTERVAL_MINUTES == 15,
-        "load_report_mode": COORDINATOR_VERSION == "v12.6.0",
+        "load_report_mode": COORDINATOR_VERSION == "v12.6.1",
         "evening_delay": EVENING_DELAY_HOURS == 15,
     }
 
@@ -5180,11 +5230,34 @@ async def zhukovstatus(
         "Telegram: "
         + ("подключён ✅" if ZHUKOV_TELEGRAM_USER_ID is not None else "ожидает ID ⏳"),
         f"Часовой пояс: {getattr(ZHUKOV_TZ, 'key', str(ZHUKOV_TZ))}.",
-        f"Утреннее напоминание: {ZHUKOV_MORNING_TIME.strftime('%H:%M')}.",
-        f"Постигровое напоминание: {ZHUKOV_POSTGAME_TIME.strftime('%H:%M')}.",
+        "Запуск утра: сообщение «Доброе утро».",
+        f"Постигровой чек-лист: через {ZHUKOV_POSTGAME_DELAY_HOURS:g} ч.",
+        f"Повтор напоминаний: каждые {ZHUKOV_REMINDER_INTERVAL_MINUTES} мин.",
         "Утренняя форма: " + ("готова ✅" if ZHUKOV_MORNING_FORM_URL else "нет ❌"),
         "Постигровая форма: " + ("готова ✅" if ZHUKOV_POSTGAME_FORM_URL else "нет ❌"),
     ]
+    try:
+        entries = await asyncio.to_thread(read_action_journal_entries)
+        session = find_zhukov_morning_session(
+            local_now.date(),
+            entries=entries,
+        )
+        if session is None:
+            lines.append("Утренний запуск сегодня: ещё не было.")
+        else:
+            due_at = _zhukov_postgame_due_at(session).astimezone(ZHUKOV_TZ)
+            lines.extend(
+                [
+                    "Утренний запуск сегодня: был ✅",
+                    f"Первая постигровая проверка: {due_at.strftime('%H:%M')}.",
+                ]
+            )
+    except Exception as exc:
+        logger.exception("Zhukov session status read failed")
+        lines.append(
+            "Статус запуска: не удалось прочитать "
+            f"({type(exc).__name__}: {str(exc)[:160]})."
+        )
     try:
         state = await asyncio.to_thread(
             read_zhukov_checklist_state,
@@ -5237,8 +5310,8 @@ async def zhukovtest(
         chat_id=ZHUKOV_TELEGRAM_USER_ID,
         text=(
             "Тест Everest ✅\n\n"
-            "Обе персональные ссылки подключены. Плановые напоминания будут "
-            "приходить сюда."
+            "Обе персональные ссылки подключены. Для запуска утреннего "
+            "чек-листа напиши: Доброе утро"
         ),
         reply_markup=zhukov_forms_keyboard(),
     )
@@ -5247,82 +5320,132 @@ async def zhukovtest(
     )
 
 
-async def zhukov_morning_reminder(
+async def start_zhukov_morning_session(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not is_zhukov(update) or ZHUKOV_TELEGRAM_USER_ID is None:
+        return
+    local_now = datetime.now(ZHUKOV_TZ)
+    try:
+        sent = await _send_morning_message_once(
+            bot=context.bot,
+            chat_id=ZHUKOV_TELEGRAM_USER_ID,
+            idempotency_key=_zhukov_session_key(local_now.date()),
+            operation="ZHUKOV_MORNING_SESSION",
+            object_id=_zhukov_session_object_id(local_now.date()),
+            text=(
+                "Доброе утро, Алексей ☀️\n\n"
+                "Заполни утренний чек-лист через 30–60 минут после "
+                "пробуждения. Это займёт несколько минут."
+            ),
+            reply_markup=zhukov_forms_keyboard(morning=True, postgame=False),
+            payload={
+                "date": local_now.date().isoformat(),
+                "timezone": getattr(ZHUKOV_TZ, "key", str(ZHUKOV_TZ)),
+            },
+        )
+    except Exception as exc:
+        logger.exception("Zhukov morning session start failed")
+        await update.effective_message.reply_text(
+            "Не удалось запустить утренний чек-лист ❌\n"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:250]}"
+        )
+        return
+
+    if not sent:
+        await update.effective_message.reply_text(
+            "Утренний чек-лист на сегодня уже отправлен ✅",
+            reply_markup=zhukov_forms_keyboard(morning=True, postgame=False),
+        )
+
+
+async def zhukov_orchestrator_tick(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     if ZHUKOV_TELEGRAM_USER_ID is None:
         return
-    local_now = datetime.now(ZHUKOV_TZ)
+
+    now = datetime.now(ZHUKOV_TZ)
     try:
-        state = await asyncio.to_thread(
-            read_zhukov_checklist_state,
-            local_now.date(),
-        )
-        if state["morning_filled"]:
-            logger.info("Zhukov morning checklist already filled; reminder skipped")
-            return
+        entries = await asyncio.to_thread(read_action_journal_entries)
     except Exception:
-        logger.exception(
-            "Zhukov morning state check failed; sending safe reminder"
-        )
-
-    await context.bot.send_message(
-        chat_id=ZHUKOV_TELEGRAM_USER_ID,
-        text=(
-            "Доброе утро, Алексей ☀️\n\n"
-            "Заполни утренний чек-лист через 30–60 минут после пробуждения. "
-            "Это займёт несколько минут."
-        ),
-        reply_markup=zhukov_forms_keyboard(morning=True, postgame=False),
-    )
-
-
-async def zhukov_postgame_reminder(
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if ZHUKOV_TELEGRAM_USER_ID is None:
+        logger.exception("Zhukov orchestrator journal read failed")
         return
-    local_now = datetime.now(ZHUKOV_TZ)
-    target_date = _zhukov_postgame_target_date(local_now)
-    game_day: bool | None = None
-    try:
-        state = await asyncio.to_thread(
-            read_zhukov_checklist_state,
+
+    for target_date in (now.date(), (now - timedelta(days=1)).date()):
+        session = find_zhukov_morning_session(
             target_date,
+            entries=entries,
         )
-        if state["postgame_filled"]:
-            logger.info("Zhukov postgame checklist already filled; reminder skipped")
-            return
-        game_day = state["is_game_day"]
-        if game_day is False:
-            logger.info("Zhukov has a non-game day; postgame reminder skipped")
-            return
-    except Exception:
-        logger.exception(
-            "Zhukov postgame state check failed; sending conditional reminder"
-        )
+        if session is None:
+            continue
 
-    text = (
-        "Алексей, после завершения игры заполни короткий постигровой чек-лист 🌙"
-        if game_day is True
-        else (
-            "Алексей, если сегодня был игровой день, после завершения игры "
-            "заполни короткий постигровой чек-лист 🌙\n\n"
-            "Если сегодня отдых или перелёт — ничего заполнять не нужно."
+        due_at = _zhukov_postgame_due_at(session)
+        bucket = _zhukov_reminder_bucket(now, due_at)
+        if bucket is None:
+            continue
+
+        try:
+            state = await asyncio.to_thread(
+                read_zhukov_checklist_state,
+                target_date,
+            )
+        except Exception:
+            logger.exception(
+                "Zhukov checklist state read failed: date=%s",
+                target_date,
+            )
+            continue
+
+        if state["postgame_filled"] or state["is_game_day"] is not True:
+            continue
+
+        reminder_key = (
+            f"zhukov-postgame:{target_date.isoformat()}:bucket:{bucket}"
         )
-    )
-    await context.bot.send_message(
-        chat_id=ZHUKOV_TELEGRAM_USER_ID,
-        text=text,
-        reply_markup=zhukov_forms_keyboard(morning=False, postgame=True),
-    )
+        if reminder_key in zhukov_sent_notification_keys:
+            continue
+
+        try:
+            await _send_morning_message_once(
+                bot=context.bot,
+                chat_id=ZHUKOV_TELEGRAM_USER_ID,
+                idempotency_key=reminder_key,
+                operation="ZHUKOV_POSTGAME_REMINDER",
+                object_id=_zhukov_session_object_id(target_date),
+                text=(
+                    "Алексей, после завершения игры заполни короткий "
+                    "постигровой чек-лист 🌙\n\n"
+                    "Напоминание будет повторяться каждые 15 минут, пока "
+                    "чек-лист не заполнен."
+                ),
+                reply_markup=zhukov_forms_keyboard(
+                    morning=False,
+                    postgame=True,
+                ),
+                payload={
+                    "date": target_date.isoformat(),
+                    "bucket": bucket,
+                    "due_at": due_at.isoformat(),
+                },
+            )
+            zhukov_sent_notification_keys.add(reminder_key)
+        except Exception:
+            logger.exception(
+                "Zhukov postgame reminder failed: date=%s bucket=%s",
+                target_date,
+                bucket,
+            )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_zhukov(update):
         await update.effective_message.reply_text(
             "Алексей, бот Everest подключён ✅\n\n"
-            "Здесь будут приходить напоминания о двух чек-листах. "
+            "Чтобы получить утренний чек-лист, напиши: Доброе утро\n\n"
+            "В игровой день через 15 часов бот пришлёт постигровой "
+            "чек-лист и будет напоминать о нём каждые 15 минут.\n\n"
             "Открыть обе ссылки в любой момент: /forms",
             reply_markup=zhukov_forms_keyboard(),
         )
@@ -5339,7 +5462,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.effective_message.reply_text(
-        "Everest Macrocycle Bot v12.6 запущен ✅\n"
+        "Everest Macrocycle Bot v12.6.1 запущен ✅\n"
         "Авторизация подтверждена.\n\n"
         "Для запуска дневного контура напишите: Доброе утро\n"
         "Статус утра: /morningstatus\n"
@@ -8389,15 +8512,25 @@ async def eveningtest(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        return
+
+    if is_zhukov(update):
+        if MORNING_TRIGGER_PATTERN.search(text):
+            await start_zhukov_morning_session(update, context)
+            return
+        await update.effective_message.reply_text(
+            "Чтобы получить утренний чек-лист, напиши: Доброе утро\n"
+            "Обе ссылки доступны по команде /forms"
+        )
+        return
+
     if not is_authorized(update):
         logger.warning(
             "Unauthorized message from user_id=%s",
             getattr(update.effective_user, "id", None),
         )
-        return
-
-    text = (update.effective_message.text or "").strip()
-    if not text:
         return
 
     if await _handle_evening_snooze_message(update, context, text):
@@ -8491,20 +8624,17 @@ async def main() -> None:
             name="morning-orchestrator",
         )
         if ZHUKOV_TELEGRAM_USER_ID is not None:
-            telegram_app.job_queue.run_daily(
-                zhukov_morning_reminder,
-                time=ZHUKOV_MORNING_TIME.replace(tzinfo=ZHUKOV_TZ),
-                name="zhukov-morning-reminder",
-            )
-            telegram_app.job_queue.run_daily(
-                zhukov_postgame_reminder,
-                time=ZHUKOV_POSTGAME_TIME.replace(tzinfo=ZHUKOV_TZ),
-                name="zhukov-postgame-reminder",
+            telegram_app.job_queue.run_repeating(
+                zhukov_orchestrator_tick,
+                interval=ZHUKOV_ORCHESTRATOR_TICK_SECONDS,
+                first=10,
+                name="zhukov-orchestrator",
             )
             logger.info(
-                "Zhukov reminders scheduled: morning=%s postgame=%s timezone=%s",
-                ZHUKOV_MORNING_TIME.strftime("%H:%M"),
-                ZHUKOV_POSTGAME_TIME.strftime("%H:%M"),
+                "Zhukov flow enabled: trigger=good-morning "
+                "postgame_delay=%sh reminder_interval=%sm timezone=%s",
+                ZHUKOV_POSTGAME_DELAY_HOURS,
+                ZHUKOV_REMINDER_INTERVAL_MINUTES,
                 getattr(ZHUKOV_TZ, "key", str(ZHUKOV_TZ)),
             )
         else:

@@ -1,10 +1,12 @@
 # Обязателен после того, как Алексей нажмёт Start в боте.
 ZHUKOV_TELEGRAM_USER_ID=
 
-# Локальное расписание Алексея. Время — строго ЧЧ:ММ.
+# Утро запускается сообщением «Доброе утро».
+# Постигровой чек-лист — через 15 часов, затем каждые 15 минут.
 ZHUKOV_TIMEZONE=Asia/Phnom_Penh
-ZHUKOV_MORNING_TIME=10:00
-ZHUKOV_POSTGAME_TIME=23:30
+ZHUKOV_POSTGAME_DELAY_HOURS=15
+ZHUKOV_REMINDER_INTERVAL_MINUTES=15
+ZHUKOV_ORCHESTRATOR_TICK_SECONDS=60
 
 # Таблица ответов двух форм.
 ZHUKOV_GOOGLE_SHEET_ID=1Ax_cP0of8ezqL-COJjFBlleHz_Xcle3T1h0vxFrjUmM
