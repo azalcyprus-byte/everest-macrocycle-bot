@@ -210,11 +210,12 @@ class HistoricalReportsTests(unittest.TestCase):
     def test_reconstructed_historical_report_does_not_use_current_phase(self):
         result = m.read_curator_report(self.book, date(2026, 10, 19))
         self.assertIn("Ретроспективная", result)
-        self.assertIn("ФАКТ", result)
-        self.assertIn("НАБЛЮДЕНИЕ", result)
-        self.assertIn("ГИПОТЕЗА", result)
-        self.assertIn("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ", result)
-        self.assertIn("исторические данные не подключены", result)
+        self.assertIn("🏔️ Everest", result)
+        self.assertIn("🔎 Значимые изменения", result)
+        self.assertIn("💡 Гипотеза", result)
+        self.assertIn("🎯 Рекомендация куратору", result)
+        self.assertNotIn("ФАКТ\n", result)
+        self.assertNotIn("Весь наблюдаемый период", result)
         self.assertNotIn("Demo tournament", result)
         self.assertNotIn("prepeak", result)
         self.assertTrue(m.read_curator_report(self.book).startswith("🔎 Архив Everest"))
@@ -279,8 +280,9 @@ class HistoricalReportsTests(unittest.TestCase):
         self.assertIsNotNone(data)
         report, record, morning, games = data
         self.assertEqual(record["date"], date(2026, 10, 20))
-        self.assertIn("ФАКТ", report)
-        self.assertIn("исторические данные не подключены", report)
+        self.assertIn("🏔️ Everest", report)
+        self.assertIn("🔎 Значимые изменения", report)
+        self.assertNotIn("исторические данные не подключены", report)
         self.assertIsNone(m.read_ai_report_inputs(self.book, date(2026, 10, 18)))
         self.assertEqual(before, {
             name: sheet.get_all_values()
@@ -374,7 +376,9 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
                     m.concrete_lapse, m.quality_drop,
                 )
             session.assert_not_called()
-        self.assertEqual(result, self.base_report)
+        self.assertIn("🏔️ Everest", result)
+        self.assertIn("AI-анализ недоступен", result)
+        self.assertNotIn("ФАКТ\n", result)
 
     def test_telegram_html_bolds_cost_only_and_escapes_report_content(self):
         plain = (
@@ -435,7 +439,7 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
         valid = {"input_tokens": 1000, "output_tokens": 200}
         unknown = {"model": "unknown-model-2035", "usage": valid}
         self.assertIsNone(ai.calculate_response_cost_usd(unknown))
-        self.assertIn("не удалось рассчитать", ai.response_cost_footer(unknown))
+        self.assertIn("стоимость неизвестна", ai.response_cost_footer(unknown))
         self.assertIsNone(
             ai.calculate_response_cost_usd({"model": "gpt-4.1-mini"})
         )
@@ -463,8 +467,9 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
                 "output_tokens": 200,
             },
             "output": [{"content": [{"type": "output_text", "text": json.dumps({
-                "hypotheses": [], "proposed_action": "Наблюдать.",
-                "limitations": "Недостаточно данных."
+                "observation": "Резкого ухудшения по доступным данным нет.",
+                "hypothesis": "",
+                "curator_action": "Сохранить план."
             })}]}],
         }
         class FakeResponse:
@@ -491,16 +496,12 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
                     m.get, m.sleep_window, m.game_hours,
                     m.automation, m.concrete_lapse, m.quality_drop,
                 )
-        self.assertIn("Недостаточно данных для индивидуальной гипотезы", enriched)
-        self.assertTrue(
-            enriched.endswith(
-                "💳 OpenAI API: ≈ $0.000690 за этот анализ "
-                "(по токенам и стандартному тарифу; фактическое списание "
-                "может отличаться)."
-            )
-        )
-        self.assertGreater(enriched.index("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ"), enriched.index("НАБЛЮДЕНИЕ"))
-        self.assertGreater(enriched.index("💳 OpenAI API"), enriched.index("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ"))
+        self.assertIn("Проверяемой закономерности пока не выявлено", enriched)
+        self.assertTrue(enriched.endswith("💳 OpenAI API: ≈ $0.000690"))
+        self.assertGreater(enriched.index("💳 OpenAI API"), enriched.index("🎯 Рекомендация куратору"))
+        self.assertLess(len(enriched), 900)
+        self.assertNotIn("за этот анализ", enriched)
+        self.assertNotIn("ФАКТ\n", enriched)
         self.assertEqual(fake.url, "https://api.openai.com/v1/responses")
         self.assertIs(fake.payload["store"], False)
         self.assertEqual(fake.payload["text"]["format"]["type"], "json_schema")
@@ -517,7 +518,9 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
         }):
             with self.assertRaisesRegex(ai.AIAnalysisError, "AI выключен"):
                 await ai.enrich_report(*args, strict=True)
-            self.assertEqual(await ai.enrich_report(*args), self.base_report)
+            fallback = await ai.enrich_report(*args)
+            self.assertIn("🏔️ Everest", fallback)
+            self.assertIn("AI-анализ недоступен", fallback)
         with patch.dict(os.environ, {
             "ZHUKOV_MONITOR_OPENAI_ENABLED": "true",
             "OPENAI_API_KEY": "",
@@ -545,7 +548,9 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
             with patch("zhukov_ai.aiohttp.ClientSession", return_value=Session()):
                 with self.assertRaisesRegex(ai.AIAnalysisError, "не вернул полный"):
                     await ai.enrich_report(*args, strict=True)
-                self.assertEqual(await ai.enrich_report(*args), self.base_report)
+                fallback = await ai.enrich_report(*args)
+                self.assertIn("🏔️ Everest", fallback)
+                self.assertIn("AI-анализ недоступен", fallback)
 
     async def test_auto_report_formats_card_cost_as_html(self):
         env = patch.dict(os.environ, {
@@ -663,7 +668,7 @@ class MonitoringTests(unittest.IsolatedAsyncioTestCase):
         await m.tick(self.bot, self.book, datetime(2026, 10, 2, 15, tzinfo=TZ))
         messages = [text for _, text in self.bot.messages]
         self.assertEqual(sum("На контрольный момент" in x for x in messages), 1)
-        self.assertEqual(sum("ФАКТ" in x for x in messages), 1)
+        self.assertEqual(sum("🔎 Значимые изменения" in x for x in messages), 1)
         await m.tick(self.bot, self.book, datetime(2026, 10, 2, 17, tzinfo=TZ))
         self.assertEqual(len(self.bot.messages), 2)
 
@@ -673,7 +678,7 @@ class MonitoringTests(unittest.IsolatedAsyncioTestCase):
         )
         await m.tick(self.bot, self.book, datetime(2026, 10, 2, 15, tzinfo=TZ))
         self.assertEqual(len(self.bot.messages), 1)
-        self.assertIn("ФАКТ", self.bot.messages[0][1])
+        self.assertIn("🎯 Рекомендация куратору", self.bot.messages[0][1])
 
     async def test_script_mode_requires_event(self):
         os.environ["ZHUKOV_MONITOR_EVENT_MODE"] = "script"
@@ -687,7 +692,7 @@ class MonitoringTests(unittest.IsolatedAsyncioTestCase):
              ["Утро — ответы:3", "Утро — ответы", "02.10.2026"]])
         await m.tick(self.bot, self.book, datetime(2026, 10, 2, 15, tzinfo=TZ))
         self.assertEqual(len(self.bot.messages), 1)
-        self.assertIn("НАБЛЮДЕНИЕ", self.bot.messages[0][1])
+        self.assertIn("🔎 Значимые изменения", self.bot.messages[0][1])
 
 
 if __name__ == "__main__":
