@@ -85,7 +85,44 @@ class PureLogicTests(unittest.TestCase):
         )
         due = m.due_checks(anchor, datetime(2026, 10, 3, 5, 0, tzinfo=TZ), date(2026, 10, 1))
         self.assertEqual([(d.isoformat(), t.strftime("%H:%M")) for d, t in due],
-                         [("2026-10-03", "05:00")])
+                         [("2026-10-02", "05:00")])
+
+    def test_sheet_timestamp_requires_no_trainee_timezone(self):
+        with patch.dict(os.environ, {
+            "ZHUKOV_TIMEZONE": "Pacific/Auckland",
+            "ZHUKOV_SHEET_TIMEZONE": "Asia/Shanghai",
+            "ZHUKOV_CURATOR_CHAT_ID": "900",
+        }):
+            monitor_tz, sheet_tz, chat_id = m.config()
+        self.assertEqual(monitor_tz.key, "Asia/Shanghai")
+        self.assertEqual(sheet_tz.key, "Asia/Shanghai")
+        self.assertEqual(chat_id, 900)
+        records = m.normalize_records(
+            [HEAD, morning("01.10.2026 08:00:00", "01.10.2026")], sheet_tz
+        )
+        chosen = m.anchor_local(records, sheet_tz, date(2026, 10, 1))
+        self.assertEqual(chosen[1], date(2026, 10, 1))
+        deadlines = m.due_checks(
+            chosen[0], datetime(2026, 10, 2, 14, 0, tzinfo=sheet_tz),
+            date(2026, 10, 1), chosen[1],
+        )
+        self.assertEqual(deadlines[0][0], date(2026, 10, 2))
+        self.assertEqual(deadlines[0][1].strftime("%H:%M"), "14:00")
+
+    def test_elapsed_24h_across_daylight_saving(self):
+        # US spring-forward changes the wall clock, not the 24h elapsed cadence.
+        ny = ZoneInfo("America/New_York")
+        anchor = datetime(2026, 3, 7, 8, 0, tzinfo=ny)
+        now = datetime(2026, 3, 9, 15, 0, tzinfo=ny)
+        deadlines = m.due_checks(anchor, now, date(2026, 3, 7))
+        self.assertEqual(
+            [(day.isoformat(), stamp.strftime("%H:%M")) for day, stamp in deadlines],
+            [("2026-03-08", "15:00"), ("2026-03-09", "15:00")],
+        )
+        self.assertEqual(
+            (deadlines[1][1].timestamp() - deadlines[0][1].timestamp()) / 3600,
+            24.0,
+        )
 
     def test_exact_control_boundary(self):
         anchor = datetime(2026, 10, 1, 8, tzinfo=TZ)
