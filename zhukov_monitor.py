@@ -9,6 +9,7 @@ from datetime import date, datetime, time, timedelta
 import json
 import logging
 import os
+import uuid
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -386,6 +387,21 @@ def worksheet(spreadsheet):
 def _mark(ws, row_number, status, error=""):
     ws.update(range_name=f"F{row_number}:G{row_number}",
               values=[[status, error[:400]]])
+
+
+def record_curator_decision(spreadsheet, day, decision, curator_id):
+    """Append (never overwrite) a curator's decision to the isolated audit journal."""
+    if not isinstance(day, date) or not str(decision).strip():
+        raise ValueError("Date and non-empty curator decision are required.")
+    note = str(decision).strip()[:1500]
+    now = datetime.now(ZoneInfo(os.getenv("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh")))
+    sheet = worksheet(spreadsheet)
+    key = f"zhukov:decision:{day.isoformat()}:{uuid.uuid4().hex[:12]}"
+    sheet.append_row([
+        key, "CURATOR_DECISION", day.isoformat(), now.isoformat(),
+        f"Куратор {curator_id}: {note}", "CONFIRMED", "", note,
+    ])
+    return key
 
 
 async def _send_once(bot, ws, records, event):
