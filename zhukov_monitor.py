@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import gspread
 import zhukov_ai
+import zhukov_brief
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -452,7 +453,7 @@ def read_ai_report_inputs(spreadsheet, day):
     target = next((row for row in morning if row["date"] == day), None)
     if target is None:
         return None
-    return (report_text(target, morning, postgame, historical=True),
+    return (zhukov_brief.render(target, morning, postgame, get, ai_unavailable=True),
             target, morning, postgame)
 
 
@@ -491,7 +492,8 @@ def read_curator_report(spreadsheet, day=None):
             f"🔎 Архив Everest — {date_label}\n"
             "Ретроспективная сводка, рассчитанная сейчас по существующим анкетам. "
             "Не является копией прежнего Telegram-сообщения; данные могли быть исправлены позже.\n\n"
-            + report_text(morning_by_day[day], morning, postgame, historical=True)
+            + zhukov_brief.render(morning_by_day[day], morning, postgame,
+                                          get, ai_unavailable=True)
         )
     elif day in games_by_day:
         game = games_by_day[day]
@@ -573,10 +575,9 @@ def read_curator_history(spreadsheet, limit=15):
 
 
 def telegram_report_html(text):
-    """Escape all untrusted report text, format only the OpenAI-cost line.
+    """Escape report text; add safe Telegram formatting only to known headings.
 
-    Existing Google Forms answers and AI outputs can contain HTML-like text.
-    Telegram HTML parsing is enabled only after escaping the entire message.
+    No AI output or questionnaire answer can inject Telegram HTML markup.
     """
     output = html.escape(str(text), quote=False)
     output = re.sub(
@@ -588,6 +589,23 @@ def telegram_report_html(text):
         r"(?m)^💳 <b>OpenAI API</b>: ≈ (\$[0-9]+(?:\.[0-9]+)?)",
         r"💳 <b>OpenAI API</b>: ≈ <b>\1</b>",
         output,
+    )
+    # Compact brief title, objective status, and its fixed section headings.
+    output = re.sub(
+        r"(?m)^(🏔️ Everest \| Алексей Жуков \| \d{2}\.\d{2}\.\d{4})$",
+        r"<b>\1</b>", output,
+    )
+    output = re.sub(
+        r"(?m)^([✅🟡🟠] [^\n]+)$",
+        r"<b>\1</b>", output,
+    )
+    output = re.sub(
+        r"(?m)^(🔎 Значимые изменения|💡 Гипотеза|🎯 Рекомендация куратору)$",
+        r"<b>\1</b>", output,
+    )
+    output = re.sub(
+        r"(?m)^(ℹ️ Надёжность:)",
+        r"<b>\1</b>", output,
     )
     return output
 
@@ -763,7 +781,9 @@ async def tick(bot, spreadsheet, now=None):
                 continue
             # One curator analysis per day. A late form is still analyzed.
             events.append((f"zhukov:analysis:{day.isoformat()}", "ANALYSIS",
-                           day, record["timestamp"], report_text(record, morning, postgame)))
+                           day, record["timestamp"], zhukov_brief.render(
+                               record, morning, postgame, get, ai_unavailable=True,
+                           )))
         for key, kind, day, when, message in sorted(events, key=lambda x: (x[2], x[1])):
             if key in known:
                 continue
