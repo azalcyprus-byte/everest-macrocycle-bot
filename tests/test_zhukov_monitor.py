@@ -77,6 +77,16 @@ class PureLogicTests(unittest.TestCase):
             [("2026-10-02", "14:00"), ("2026-10-03", "14:00")]
         )
 
+    def test_evening_anchor_30h_falls_two_calendar_dates_later(self):
+        anchor = datetime(2026, 10, 1, 23, 0, tzinfo=TZ)
+        self.assertEqual(
+            m.due_checks(anchor, datetime(2026, 10, 2, 23, 30, tzinfo=TZ), date(2026, 10, 1)),
+            [],
+        )
+        due = m.due_checks(anchor, datetime(2026, 10, 3, 5, 0, tzinfo=TZ), date(2026, 10, 1))
+        self.assertEqual([(d.isoformat(), t.strftime("%H:%M")) for d, t in due],
+                         [("2026-10-03", "05:00")])
+
     def test_exact_control_boundary(self):
         anchor = datetime(2026, 10, 1, 8, tzinfo=TZ)
         self.assertEqual(m.due_checks(anchor, datetime(2026, 10, 2, 13, 59, tzinfo=TZ),
