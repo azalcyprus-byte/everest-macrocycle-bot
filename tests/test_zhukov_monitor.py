@@ -213,7 +213,7 @@ class HistoricalReportsTests(unittest.TestCase):
         self.assertIn("исторические данные не подключены", result)
         self.assertNotIn("Demo tournament", result)
         self.assertNotIn("prepeak", result)
-        self.assertEqual(m.read_curator_report(self.book)[:2], "🔎")
+        self.assertTrue(m.read_curator_report(self.book).startswith("🔎 Архив Everest"))
 
     def test_history_index_and_date_selection(self):
         sheet = self.book.add_worksheet(m.LOG_TAB, rows=100, cols=8)
@@ -244,7 +244,7 @@ class HistoricalReportsTests(unittest.TestCase):
         ]
         result = m.read_curator_report(self.book, date(2026, 10, 20))
         self.assertIn("Утреннего чек-листа за эту дату нет", result)
-        self.assertIn("Фактическая игра: 6.0 ч", result)
+        self.assertIn("Фактическая игра: 6 ч", result)
 
     def test_pending_report_not_represented_as_delivered(self):
         sheet = self.book.add_worksheet(m.LOG_TAB, rows=100, cols=8)
