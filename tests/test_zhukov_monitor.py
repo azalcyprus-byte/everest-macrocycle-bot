@@ -5,6 +5,8 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import gspread
+import json
+import zhukov_ai as ai
 import zhukov_monitor as m
 
 
@@ -264,6 +266,157 @@ class HistoricalReportsTests(unittest.TestCase):
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(p) <= 3400 for p in parts))
         self.assertEqual("".join(parts), report)
+
+
+class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.target = {
+            "date": date(2026, 10, 20),
+            "fields": {
+                "1. Во сколько лег спать?": "22:00",
+                "2. Во сколько окончательно проснулся?": "08:00",
+                "6. Через 30–60 минут": "заметная сонливость",
+                "7. Что сейчас": "признаки болезни",
+                "8. Когда читаешь": "часто",
+                "9. Простые утренние дела": "заметно тяжелее обычного",
+                "Сегодня": "игра",
+                "Город": "Владивосток",
+                "Имя": "Алексей Жуков",
+                "Свободный комментарий": "личный медицинский комментарий",
+            },
+        }
+        self.base_report = (
+            "📊 Everest | Алексей Жуков | 20.10.2026\n\n"
+            "ФАКТ\nУтреннее состояние.\n\n"
+            "НАБЛЮДЕНИЕ\n3 дня: данных мало.\n\n"
+            "ГИПОТЕЗА\nОбщий шаблон.\n\n"
+            "ПРЕДЛАГАЕМОЕ РЕШЕНИЕ\nОбщий шаблон действия."
+        )
+
+    def _context(self):
+        return ai.build_context(
+            self.target, [self.target], [],
+            m.get, m.sleep_window, m.game_hours,
+            m.automation, m.concrete_lapse, m.quality_drop,
+        )
+
+    def test_anonymized_context_contains_no_identifiers_or_raw_answers(self):
+        data = json.dumps(self._context(), ensure_ascii=False)
+        self.assertNotIn("Алексей", data)
+        self.assertNotIn("Жуков", data)
+        self.assertNotIn("Владивосток", data)
+        self.assertNotIn("медицинский комментарий", data)
+        self.assertNotIn("2026-10-20", data)
+        self.assertEqual(len(self._context()["timeline"]), 1)
+        self.assertEqual(self._context()["timeline"][0]["morning"]["sleep_window_hours_not_measured_sleep"], 10)
+
+    def test_invalid_or_incomplete_openai_response_falls_back(self):
+        self.assertIsNone(ai.parse_response({"status": "incomplete", "output": []}))
+        self.assertIsNone(ai.parse_response({"status": "completed", "output": [
+            {"content": [{"type": "output_text", "text": '{"hypotheses": []}'}]}
+        ]}))
+        self.assertEqual(ai.render_analysis(self.base_report, None), self.base_report)
+
+    def test_valid_individual_hypotheses_replace_templates_preserve_facts(self):
+        obj = {
+            "hypotheses": [{
+                "version": "Возможно, сложные решения требуют больше усилий.",
+                "evidence": "Отмечены затруднения внимания и простых решений.",
+                "alternative": "Состояние может быть связано с недомоганием.",
+                "check_next": "Сравнить с ближайшим утром после отдыха.",
+            }],
+            "proposed_action": "Согласовать с куратором осторожный план.",
+            "limitations": "Наблюдений всего один день.",
+        }
+        api_body = {"status": "completed", "output": [
+            {"content": [{"type": "output_text", "text": json.dumps(obj)}]}
+        ]}
+        parsed = ai.parse_response(api_body)
+        enriched = ai.render_analysis(self.base_report, parsed)
+        self.assertIn("ФАКТ\nУтреннее состояние", enriched)
+        self.assertIn("НАБЛЮДЕНИЕ\n3 дня: данных мало", enriched)
+        self.assertIn("ГИПОТЕЗА (OpenAI API", enriched)
+        self.assertIn("Возможно, сложные решения", enriched)
+        self.assertIn("Альтернатива:", enriched)
+        self.assertIn("Проверить:", enriched)
+        self.assertIn("Решение о фактической нагрузке остаётся за куратором", enriched)
+        self.assertNotIn("ГИПОТЕЗА\nОбщий шаблон.", enriched)
+
+    async def test_no_key_no_external_call(self):
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "true",
+            "OPENAI_API_KEY": "",
+        }):
+            with patch("zhukov_ai.aiohttp.ClientSession") as session:
+                result = await ai.enrich_report(
+                    self.base_report, self.target, [self.target], [],
+                    m.get, m.sleep_window, m.game_hours, m.automation,
+                    m.concrete_lapse, m.quality_drop,
+                )
+            session.assert_not_called()
+        self.assertEqual(result, self.base_report)
+
+    async def test_api_payload_uses_structured_output_and_store_false(self):
+        reply = {
+            "status": "completed",
+            "output": [{"content": [{"type": "output_text", "text": json.dumps({
+                "hypotheses": [], "proposed_action": "Наблюдать.",
+                "limitations": "Недостаточно данных."
+            })}]}],
+        }
+        class FakeResponse:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            def raise_for_status(self): pass
+            async def json(self): return reply
+        class FakeSession:
+            def __init__(self): self.payload = None
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            def post(self, url, **kwargs):
+                self.payload = kwargs["json"]
+                self.url = url
+                return FakeResponse()
+        fake = FakeSession()
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "true",
+            "OPENAI_API_KEY": "TEST_FAKE_KEY_NOT_REAL",
+        }):
+            with patch("zhukov_ai.aiohttp.ClientSession", return_value=fake):
+                enriched = await ai.enrich_report(
+                    self.base_report, self.target, [self.target], [],
+                    m.get, m.sleep_window, m.game_hours,
+                    m.automation, m.concrete_lapse, m.quality_drop,
+                )
+        self.assertIn("Недостаточно данных для индивидуальной гипотезы", enriched)
+        self.assertEqual(fake.url, "https://api.openai.com/v1/responses")
+        self.assertIs(fake.payload["store"], False)
+        self.assertEqual(fake.payload["text"]["format"]["type"], "json_schema")
+        self.assertNotIn("Жуков", fake.payload["input"])
+        self.assertNotIn("Владивосток", fake.payload["input"])
+
+    async def test_long_ai_report_delivered_in_multiple_messages(self):
+        env = patch.dict(os.environ, {
+            "TELEGRAM_USER_ID": "900",
+            "ZHUKOV_CURATOR_CHAT_ID": "900",
+            "ZHUKOV_TELEGRAM_USER_ID": "901",
+            "ZHUKOV_SHEET_TIMEZONE": "Europe/Moscow",
+        })
+        with env:
+            longtext = "ГИПОТЕЗА проверяемая\n" * 420
+            ws = Sheet("журнал", [m.HEADERS])
+            bot = Bot()
+            await m._send_once(bot, ws, set(), (
+                "zhukov:analysis:2026-10-20", "ANALYSIS",
+                date(2026, 10, 20),
+                datetime(2026, 10, 20, 8, tzinfo=TZ),
+                longtext,
+            ))
+            self.assertGreater(len(bot.messages), 1)
+            self.assertTrue(all(chat == 900 for chat, _ in bot.messages))
+            self.assertEqual("\n".join(text for _, text in bot.messages), longtext)
+            self.assertEqual(ws.rows[1][5], "SENT")
+
 
 class MonitoringTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
