@@ -183,6 +183,25 @@ class MonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.bot.messages), 2)
         self.assertIn("21.10.2026", self.bot.messages[-1][1])
 
+    async def test_late_report_cannot_erase_missed_deadline(self):
+        self.book.worksheet("Утро — ответы").append_row(
+            morning("02.10.2026 14:30:00", "02.10.2026")
+        )
+        await m.tick(self.bot, self.book, datetime(2026, 10, 2, 15, tzinfo=TZ))
+        messages = [text for _, text in self.bot.messages]
+        self.assertEqual(sum("На контрольный момент" in x for x in messages), 1)
+        self.assertEqual(sum("ФАКТ" in x for x in messages), 1)
+        await m.tick(self.bot, self.book, datetime(2026, 10, 2, 17, tzinfo=TZ))
+        self.assertEqual(len(self.bot.messages), 2)
+
+    async def test_timely_report_does_not_trigger_missed_alert(self):
+        self.book.worksheet("Утро — ответы").append_row(
+            morning("02.10.2026 13:59:00", "02.10.2026")
+        )
+        await m.tick(self.bot, self.book, datetime(2026, 10, 2, 15, tzinfo=TZ))
+        self.assertEqual(len(self.bot.messages), 1)
+        self.assertIn("ФАКТ", self.bot.messages[0][1])
+
     async def test_script_mode_requires_event(self):
         os.environ["ZHUKOV_MONITOR_EVENT_MODE"] = "script"
         self.book.worksheet("Утро — ответы").append_row(
