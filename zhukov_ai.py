@@ -12,6 +12,7 @@ import os
 from decimal import Decimal
 
 import aiohttp
+import zhukov_brief
 
 logger = logging.getLogger(__name__)
 _ENABLED = {"1", "true", "yes", "on"}
@@ -132,20 +133,12 @@ def calculate_response_cost_usd(response, requested_model=None):
 
 
 def response_cost_footer(response, requested_model=None):
-    """Present clearly qualified API costs below the curator recommendation."""
+    """Short, approximate token-charge line under the curator recommendation."""
     cost = calculate_response_cost_usd(response, requested_model)
     if cost is None:
-        return (
-            "\n\n💳 OpenAI API: стоимость этого запроса не удалось рассчитать "
-            "(нет данных об использовании или известного тарифа)."
-        )
+        return "\n\n💳 OpenAI API: стоимость неизвестна"
     precision = ".8f" if cost < Decimal("0.000001") else ".6f"
-    dollars = format(cost, precision)
-    return (
-        "\n\n💳 OpenAI API: ≈ $" + dollars + " за этот анализ "
-        "(по токенам и стандартному тарифу; фактическое списание "
-        "может отличаться)."
-    )
+    return "\n\n💳 OpenAI API: ≈ $" + format(cost, precision)
 
 
 def is_enabled():
@@ -319,44 +312,42 @@ class AIAnalysisError(Exception):
 async def enrich_report(base_report, record, morning, games,
                         get_field, sleep_window, hours_fn,
                         automation_fn, lapses_fn, drops_fn, *, strict=False):
-    """Augment a report with AI; optional checks fall back, manual checks fail clearly.
+    """Return one compact curated brief regardless of AI availability.
 
-    In strict=True mode, never claim an AI report succeeded when the API is
-    disabled, unauthorized, rate-limited, or returns unusable output.
+    Strict manual checks explicitly report API failure; scheduled checks
+    always deliver a compact deterministic fallback, without a cost line.
     """
+    fallback = zhukov_brief.render(
+        record, morning, games, get_field, ai_unavailable=True,
+    )
     if not os.getenv("OPENAI_API_KEY", "").strip():
         if strict:
             raise AIAnalysisError(
                 "В Railway отсутствует OPENAI_API_KEY. Добавь API-ключ в Variables."
             )
-        return base_report
+        return fallback
     if os.getenv("ZHUKOV_MONITOR_OPENAI_ENABLED", "").strip().lower() not in _ENABLED:
         if strict:
             raise AIAnalysisError(
                 "AI выключен: установи ZHUKOV_MONITOR_OPENAI_ENABLED=true "
                 "в Railway и дождись завершения Deploy."
             )
-        return base_report
-    if strict and (
-        "\n\nГИПОТЕЗА\n" not in base_report
-        or "\n\nПРЕДЛАГАЕМОЕ РЕШЕНИЕ\n" not in base_report
-    ):
-        raise AIAnalysisError("Формат исходного отчёта изменился. AI-проверка отменена.")
+        return fallback
     context = build_context(
         record, morning, games, get_field, sleep_window,
         hours_fn, automation_fn, lapses_fn, drops_fn,
     )
     payload = {
         "model": os.getenv("ZHUKOV_MONITOR_OPENAI_MODEL", "gpt-4.1-mini"),
-        "instructions": INSTRUCTIONS,
+        "instructions": zhukov_brief.INSTRUCTIONS,
         "input": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
         "text": {"format": {
             "type": "json_schema",
-            "name": "everest_curator_hypotheses",
+            "name": "everest_curator_brief",
             "strict": True,
-            "schema": SCHEMA,
+            "schema": zhukov_brief.SCHEMA,
         }},
-        "max_output_tokens": 1100,
+        "max_output_tokens": 600,
         "store": False,
     }
     try:
@@ -369,23 +360,21 @@ async def enrich_report(base_report, record, morning, games,
             ) as response:
                 response.raise_for_status()
                 result = await response.json()
-        parsed = parse_response(result)
+        parsed = zhukov_brief.parse_response(result)
         if parsed is None:
             raise AIAnalysisError(
                 "OpenAI ответил, но не вернул полный корректный анализ. "
                 "Проверь выбранную модель и повтори запрос."
             )
-        enriched = render_analysis(base_report, parsed)
-        if strict and enriched == base_report:
-            raise AIAnalysisError(
-                "Не удалось вставить гипотезы в отчёт; исходные данные не изменены."
-            )
+        enriched = zhukov_brief.render(
+            record, morning, games, get_field, insight=parsed,
+        )
         return enriched + response_cost_footer(result, payload["model"])
     except AIAnalysisError:
         if strict:
             raise
-        logger.warning("OpenAI returned an incomplete/invalid analysis; deterministic report retained")
-        return base_report
+        logger.warning("OpenAI returned an incomplete/invalid brief; compact fallback retained")
+        return fallback
     except aiohttp.ClientResponseError as exc:
         logger.warning("OpenAI HTTP error: status=%s", exc.status)
         if strict:
@@ -402,18 +391,18 @@ async def enrich_report(base_report, record, morning, games,
             raise AIAnalysisError(
                 f"OpenAI вернул HTTP {exc.status}. Проверь настройки модели/API."
             ) from None
-        return base_report
+        return fallback
     except (aiohttp.ClientError, TimeoutError) as exc:
         logger.warning("OpenAI request error: %s", type(exc).__name__)
         if strict:
             raise AIAnalysisError(
                 "Не удалось получить ответ OpenAI: сеть или тайм-аут (20 секунд)."
             ) from None
-        return base_report
+        return fallback
     except Exception:
-        logger.exception("Optional OpenAI analysis failed; deterministic report retained")
+        logger.exception("Optional OpenAI analysis failed; compact fallback retained")
         if strict:
             raise AIAnalysisError(
                 "Ошибка выполнения AI-анализа; сохранённые отчёты не изменены."
             ) from None
-        return base_report
+        return fallback
