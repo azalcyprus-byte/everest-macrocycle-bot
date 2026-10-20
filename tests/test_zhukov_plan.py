@@ -31,12 +31,12 @@ def get_value(rec, prefix, default="нет данных"):
 class PlannedLoadTests(unittest.TestCase):
     def setUp(self):
         self.rows = [
-            ["Дата", "Фаза", "Day Type", "Game MIN (ч)"],
-            ["20.10", "Стабилизация", "O", "0.0"],
-            ["21.10", "Стабилизация", "L", "3.0"],
-            ["22.10", "Интенсив", "M", "3.0"],
-            ["26.10", "Интенсив", "L+", "3.0"],
-            ["03.11", "Peak", "T", "3.0"],
+            ["Дата", "Фаза", "Day Type", "Game MIN (ч)", "Game OPT (ч)"],
+            ["20.10", "Стабилизация", "O", "0.0", "0.0"],
+            ["21.10", "Стабилизация", "L", "3.0", "3.5"],
+            ["22.10", "Интенсив", "M", "3.0", "5.5"],
+            ["26.10", "Интенсив", "L+", "3.0", "4.5"],
+            ["03.11", "Peak", "T", "3.0", "8.5"],
         ]
         self.types = plan.parse_plan_rows(self.rows, year=2026)
 
@@ -54,6 +54,55 @@ class PlannedLoadTests(unittest.TestCase):
                     plan.planned_type_for(self.types, date.fromisoformat(day)),
                     code,
                 )
+
+    def test_uses_game_opt_not_minimum_and_includes_zero_hours(self):
+        expectations = [
+            ("2026-10-20", "O", "0 ч игры"),
+            ("2026-10-21", "L", "3,5 ч игры"),
+            ("2026-10-22", "M", "5,5 ч игры"),
+            ("2026-10-26", "L+", "4,5 ч игры"),
+            ("2026-11-03", "T", "8,5 ч игры"),
+        ]
+        for day, code, hours_label in expectations:
+            with self.subTest(day=day):
+                current = record(day, "игра")
+                entry = plan.planned_type_for(self.types, current["date"])
+                with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
+                    txt = brief.render(
+                        current, [current], [], get_value, plan_type=entry,
+                    )
+                self.assertIn(
+                    "📅 План нагрузки: " + code + " (" + hours_label + ")",
+                    txt,
+                )
+                self.assertEqual(txt.splitlines()[1], "Утренний отчёт")
+                self.assertNotIn("Game MIN", txt)
+
+    def test_unknown_or_invalid_opt_hours_never_invented(self):
+        fixture = [
+            ["Дата", "Day Type", "Game OPT (ч)"],
+            ["23.10", "L", ""],
+            ["24.10", "M", "не установлено"],
+            ["25.10", "T", "99"],
+            ["26.10", "L+", "4,25"],
+            ["27.10", "O", "0"],
+        ]
+        parsed = plan.parse_plan_rows(fixture, year=2026)
+        for day in (23, 24, 25):
+            current = record("2026-10-" + str(day), "игра")
+            txt = brief.render(
+                current, [current], [], get_value,
+                plan_type=parsed[current["date"]],
+            )
+            self.assertIn("(часы игры не указаны)", txt)
+        self.assertEqual(
+            str(plan.planned_opt_hours(parsed[date(2026, 10, 26)])),
+            "4.25",
+        )
+        self.assertEqual(
+            str(plan.planned_opt_hours(parsed[date(2026, 10, 27)])),
+            "0",
+        )
 
     def test_never_reuses_a_prior_year_or_guesses_unlisted_days(self):
         self.assertIsNone(plan.planned_type_for(self.types, date(2027, 10, 20)))
@@ -104,6 +153,18 @@ class PlannedLoadTests(unittest.TestCase):
             )
         self.assertIn("📅 План нагрузки: L", txt)
         self.assertIn("🎮 Игровой день: не указан", txt)
+
+    def test_html_bolds_subtitle_and_formatted_hours(self):
+        from zhukov_monitor import telegram_report_html
+        current = record("2026-10-21", "игра")
+        rendered = brief.render(
+            current, [current], [], get_value,
+            plan_type=self.types[current["date"]],
+        )
+        html = telegram_report_html(rendered)
+        self.assertIn("<b>Утренний отчёт</b>", html)
+        self.assertIn("<b>📅 План нагрузки:</b> L (3,5 ч игры)", html)
+        self.assertIn("<b>🎮 Игровой день:</b> Да (заявлено утром)", html)
 
     def test_html_bolds_two_new_labels_safely(self):
         from zhukov_monitor import telegram_report_html
