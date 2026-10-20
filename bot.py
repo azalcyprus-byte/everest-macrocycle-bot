@@ -8,6 +8,7 @@ import re
 import threading
 import time as time_module
 import uuid
+import zhukov_monitor
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -5360,6 +5361,19 @@ async def start_zhukov_morning_session(
         )
 
 
+async def zhukov_curator_monitor_tick(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Separate curator-only analysis; does not alter Alexey's Telegram flow."""
+    if not zhukov_monitor.enabled():
+        return
+    try:
+        sheet = await asyncio.to_thread(get_zhukov_spreadsheet)
+        await zhukov_monitor.tick(context.bot, sheet)
+    except Exception:
+        logger.exception("Zhukov curator monitoring tick failed")
+
+
 async def zhukov_orchestrator_tick(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -8623,6 +8637,14 @@ async def main() -> None:
             first=5,
             name="morning-orchestrator",
         )
+        if zhukov_monitor.enabled():
+            telegram_app.job_queue.run_repeating(
+                zhukov_curator_monitor_tick,
+                interval=300,
+                first=30,
+                name="zhukov-curator-monitor",
+            )
+            logger.info("Zhukov curator monitoring enabled.")
         if ZHUKOV_TELEGRAM_USER_ID is not None:
             telegram_app.job_queue.run_repeating(
                 zhukov_orchestrator_tick,
