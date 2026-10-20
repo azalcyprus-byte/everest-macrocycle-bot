@@ -414,7 +414,7 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
             ))
             self.assertGreater(len(bot.messages), 1)
             self.assertTrue(all(chat == 900 for chat, _ in bot.messages))
-            self.assertEqual("\n".join(text for _, text in bot.messages), longtext.rstrip("\n"))
+            self.assertEqual("\n".join(text for _, text in bot.messages), longtext)
             self.assertEqual(ws.rows[1][5], "SENT")
 
 
