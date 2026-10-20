@@ -9,6 +9,8 @@ from datetime import date, datetime, time, timedelta, timezone
 import json
 import logging
 import os
+import html
+import re
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -570,6 +572,26 @@ def read_curator_history(spreadsheet, limit=15):
     return "\n".join(lines)
 
 
+def telegram_report_html(text):
+    """Escape all untrusted report text, format only the OpenAI-cost line.
+
+    Existing Google Forms answers and AI outputs can contain HTML-like text.
+    Telegram HTML parsing is enabled only after escaping the entire message.
+    """
+    output = html.escape(str(text), quote=False)
+    output = re.sub(
+        r"(?m)^💳 OpenAI API:(?= ≈ \$| стоимость)",
+        "💳 <b>OpenAI API</b>:",
+        output,
+    )
+    output = re.sub(
+        r"(?m)^💳 <b>OpenAI API</b>: ≈ (\$[0-9]+(?:\.[0-9]+)?)",
+        r"💳 <b>OpenAI API</b>: ≈ <b>\1</b>",
+        output,
+    )
+    return output
+
+
 def split_telegram_text(text, max_chars=3400):
     """Split an arbitrarily long analysis without truncating its conclusion."""
     if max_chars < 250:
@@ -632,7 +654,11 @@ async def _send_once(bot, ws, records, event):
         _, _, chat_id = config()
         # AI reports may exceed Telegram's single-message limit.
         for part in split_telegram_text(text):
-            await bot.send_message(chat_id=chat_id, text=part)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=telegram_report_html(part),
+                parse_mode="HTML",
+            )
     except Exception as exc:
         logger.exception("Zhukov monitor notification failed for %s", key)
         # Do not automatically retry ambiguous network failures: no duplicate alerts.
