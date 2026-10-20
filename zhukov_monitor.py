@@ -82,15 +82,22 @@ def normalize_records(rows, sheet_tz):
     return sorted(result.values(), key=lambda item: item["date"])
 
 
-def anchor_local(records, user_tz):
-    """Explicit local anchor removes ambiguity when the first submission was abroad."""
+def anchor_local(records, user_tz, activated, received_dates=None):
+    """Use an explicit anchor or the first report on/after activation.
+
+    No historical August/September response can silently determine October
+    reminder times. Persist the resolved wall-clock anchor in the journal.
+    """
     override = os.getenv("ZHUKOV_MONITOR_ANCHOR_LOCAL", "").strip()
     if override:
         stamp = datetime.fromisoformat(override)
         return stamp.replace(tzinfo=user_tz) if stamp.tzinfo is None else stamp.astimezone(user_tz)
     for rec in records:
-        if rec["timestamp"]:
-            return rec["timestamp"].replace(tzinfo=user_tz)  # sheet display time treated as anchor wall time
+        if rec["date"] < activated or rec["timestamp"] is None:
+            continue
+        if received_dates is not None and rec["date"] not in received_dates:
+            continue
+        return rec["timestamp"].astimezone(user_tz)
     return None
 
 
@@ -466,9 +473,23 @@ async def tick(bot, spreadsheet, now=None):
                                 "First enabled date; no historical missed-day flood.",
                                 "SENT", "", ""])
             known.add("zhukov:monitor:activation")
-        ref = anchor_local(morning, tz)
+        anchor_record = next(
+            (row for row in log_rows[1:]
+             if row and row[0] == "zhukov:monitor:anchor"), None
+        )
+        if anchor_record and len(anchor_record) > 3:
+            saved = datetime.fromisoformat(anchor_record[3])
+            # Preserve the original local control clock when the user travels.
+            ref = saved.replace(tzinfo=tz)
+        else:
+            ref = anchor_local(morning, tz, activated, received_dates)
+            if ref:
+                log_tab.append_row(["zhukov:monitor:anchor", "CONFIG",
+                                    ref.date().isoformat(), ref.isoformat(),
+                                    "Fixed anchor for the 30h + daily control schedule.",
+                                    "SENT", "", ""])
         if not ref:
-            logger.error("Zhukov monitoring: reference report timestamp unavailable")
+            logger.info("Zhukov monitoring: waiting for the first post-activation report")
             return
         # Do not reinterpret completed reports when a form was submitted late.
         has_report = {r["date"] for r in morning}
