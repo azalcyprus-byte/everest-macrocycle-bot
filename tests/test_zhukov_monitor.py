@@ -153,6 +153,26 @@ class MonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum("отсутствует" in x[1] for x in self.bot.messages), 1)
         self.assertTrue(all(chat == 900 for chat, _ in self.bot.messages))
 
+    async def test_no_historical_anchor_before_first_new_report(self):
+        os.environ.pop("ZHUKOV_MONITOR_ANCHOR_LOCAL", None)
+        # Old history exists but must not set the new monitoring clock.
+        await m.tick(self.bot, self.book, datetime(2026, 10, 20, 16, tzinfo=TZ))
+        self.assertEqual(self.bot.messages, [])
+        rows = self.book.worksheet(m.LOG_TAB).get_all_values()
+        self.assertFalse(any(row[0] == "zhukov:monitor:anchor" for row in rows[1:]))
+        # First post-activation report, 20 Oct at 08:00, becomes the anchor.
+        self.book.worksheet("Утро — ответы").append_row(
+            morning("20.10.2026 08:00:00", "20.10.2026"))
+        await m.tick(self.bot, self.book, datetime(2026, 10, 20, 16, 5, tzinfo=TZ))
+        self.assertEqual(len(self.bot.messages), 1)  # morning analysis
+        self.assertTrue(any(row[0] == "zhukov:monitor:anchor"
+                            for row in self.book.worksheet(m.LOG_TAB).get_all_values()[1:]))
+        await m.tick(self.bot, self.book, datetime(2026, 10, 21, 13, 59, tzinfo=TZ))
+        self.assertEqual(len(self.bot.messages), 1)
+        await m.tick(self.bot, self.book, datetime(2026, 10, 21, 14, tzinfo=TZ))
+        self.assertEqual(len(self.bot.messages), 2)
+        self.assertIn("21.10.2026", self.bot.messages[-1][1])
+
     async def test_script_mode_requires_event(self):
         os.environ["ZHUKOV_MONITOR_EVENT_MODE"] = "script"
         self.book.worksheet("Утро — ответы").append_row(
