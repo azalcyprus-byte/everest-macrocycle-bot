@@ -385,7 +385,7 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         self.assertEqual(
-            str(ai.calculate_response_cost_usd(response)), "0.000690"
+            format(ai.calculate_response_cost_usd(response), ".6f"), "0.000690"
         )
         self.assertIn(
             "💳 OpenAI API: ≈ $0.000690",
@@ -396,14 +396,14 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
             "usage": {"input_tokens": 1500, "output_tokens": 300},
         }
         self.assertEqual(
-            str(ai.calculate_response_cost_usd(no_cache)), "0.001080"
+            format(ai.calculate_response_cost_usd(no_cache), ".6f"), "0.001080"
         )
         gpt_five = {
             "model": "gpt-5-mini",
             "usage": {"input_tokens": 1000, "output_tokens": 200},
         }
         self.assertEqual(
-            str(ai.calculate_response_cost_usd(gpt_five)), "0.000650"
+            format(ai.calculate_response_cost_usd(gpt_five), ".6f"), "0.000650"
         )
 
     def test_api_cost_is_not_invented_without_reliable_usage_or_rate(self):
