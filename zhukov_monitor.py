@@ -697,6 +697,8 @@ async def _send_once(bot, ws, records, event):
 async def tick(bot, spreadsheet, now=None, plan_types=None):
     if not enabled():
         return
+    if plan_types is None and os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        plan_types = await asyncio.to_thread(zhukov_plan.optional_plan_types)
     async with _lock:
         tz, sheet_tz, _ = config()
         now = (now or datetime.now(tz)).astimezone(tz)
