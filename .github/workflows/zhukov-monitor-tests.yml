@@ -4,6 +4,8 @@ on:
     paths:
       - "zhukov_monitor.py"
       - "zhukov_ai.py"
+      - "zhukov_brief.py"
+      - "tests/test_zhukov_brief.py"
       - "bot.py"
       - "tests/test_zhukov_monitor.py"
       - "tests/test_zhukov_apps_script.js"
@@ -23,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install -r requirements.txt
-      - run: python -m compileall -q bot.py zhukov_monitor.py zhukov_ai.py tests/test_zhukov_monitor.py
-      - run: python -m unittest discover -s tests -p "test_zhukov_monitor.py" -v
+      - run: python -m compileall -q bot.py zhukov_monitor.py zhukov_ai.py zhukov_brief.py tests/test_zhukov_monitor.py tests/test_zhukov_brief.py
+      - run: python -m unittest discover -s tests -p "test_zhukov_*.py" -v
       - run: cp apps_script/ZhukovEvents.gs /tmp/ZhukovEvents.js && node --check /tmp/ZhukovEvents.js
       - run: node tests/test_zhukov_apps_script.js
