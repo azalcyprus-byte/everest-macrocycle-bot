@@ -5405,10 +5405,6 @@ async def zhukovai(
 
     report, record, morning, games = source
     try:
-        await update.effective_message.reply_text(
-            "⏳ Отправляю обезличенные показатели в OpenAI. "
-            "Результат будет только в этом чате; история не изменится."
-        )
         enriched = await zhukov_ai.enrich_report(
             report, record, morning, games,
             zhukov_monitor.get,
@@ -5433,13 +5429,9 @@ async def zhukovai(
         )
         return
 
-    response = (
-        f"🧪 Everest | AI-анализ за {target_day.strftime('%d.%m.%Y')}\n"
-        "Создан по запросу куратора сейчас, не сохраняется в журнал. "
-        "Гипотезы предварительные.\n\n"
-        + enriched
-    )
-    for part in zhukov_monitor.split_telegram_text(response):
+    # Exactly the same compact curator brief as automatic monitoring.
+    # No duplicate date header or extra explanatory paragraph.
+    for part in zhukov_monitor.split_telegram_text(enriched):
         await update.effective_message.reply_text(
             zhukov_monitor.telegram_report_html(part),
             parse_mode="HTML",
