@@ -6,9 +6,42 @@ Dates in that sheet are DD.MM without the year; the cycle year is explicit.
 Do not infer a plan for dates absent from the source.
 """
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 import re
 
 _ALLOWED_CODE = re.compile(r"^[A-Z][A-Z0-9+/-]{0,7}$")
+
+
+class PlannedLoadCode(str):
+    """A day-type string with the optional Game OPT hours for that same date.
+
+    As a str subclass it preserves existing monitoring code that expects
+    a plain 'O', 'L', 'M', 'T', 'L+' code.
+    """
+
+    def __new__(cls, code, game_opt_hours=None):
+        instance = super().__new__(cls, code)
+        instance.game_opt_hours = game_opt_hours
+        return instance
+
+
+def _parse_hours(raw):
+    """Parse only plausible nonnegative planned game hours, never guess them."""
+    text = str(raw or "").strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        hours = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not hours.is_finite() or hours < 0 or hours > 24:
+        return None
+    return hours
+
+
+def planned_opt_hours(plan_type):
+    """Show what Game OPT states, retaining 0 for true non-playing days."""
+    return getattr(plan_type, "game_opt_hours", None)
 
 
 def parse_plan_rows(rows, *, year=2026):
@@ -22,6 +55,7 @@ def parse_plan_rows(rows, *, year=2026):
         raise ValueError("Plan tab must contain Дата and Day Type columns")
     date_col = headers.index("Дата")
     type_col = headers.index("Day Type")
+    opt_col = headers.index("Game OPT (ч)") if "Game OPT (ч)" in headers else None
     result = {}
     conflicting = set()
     for row in rows[1:]:
@@ -41,10 +75,18 @@ def parse_plan_rows(rows, *, year=2026):
                 continue
         if day is None:
             continue
-        if day in result and result[day] != code:
+        opt_hours = (
+            _parse_hours(row[opt_col])
+            if opt_col is not None and opt_col < len(row)
+            else None
+        )
+        entry = PlannedLoadCode(code, opt_hours)
+        if (day in result
+                and (result[day] != entry
+                     or planned_opt_hours(result[day]) != opt_hours)):
             conflicting.add(day)
         else:
-            result[day] = code
+            result[day] = entry
     for day in conflicting:
         result.pop(day, None)
     return result
@@ -92,7 +134,7 @@ def load_plan_types():
         client = gspread.authorize(credentials)
         rows = client.open_by_key(spreadsheet_id).worksheet(
             "Волна по дням"
-        ).get("A1:C250", value_render_option="FORMATTED_VALUE")
+        ).get("A1:E250", value_render_option="FORMATTED_VALUE")
         parsed = parse_plan_rows(rows, year=year)
         _cache = parsed
         _cache_time = now

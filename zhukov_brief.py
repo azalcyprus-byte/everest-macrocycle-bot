@@ -218,10 +218,20 @@ def render(record, morning, games, get, insight=None, *,
     plan_code = zhukov_plan.planned_type_for(
         {record["date"]: plan_type}, record["date"]
     )
+    if plan_code:
+        hours = zhukov_plan.planned_opt_hours(plan_code)
+        if hours is None:
+            workload_label = str(plan_code) + " (часы игры не указаны)"
+        else:
+            hours_text = format(hours.normalize(), "f").replace(".", ",")
+            workload_label = str(plan_code) + " (" + hours_text + " ч игры)"
+    else:
+        workload_label = "не указан"
     brief = (
         "🏔️ Everest | Алексей Жуков | "
         + record["date"].strftime("%d.%m.%Y")
-        + "\n📅 План нагрузки: " + (plan_code or "не указан")
+        + "\nУтренний отчёт"
+        + "\n\n📅 План нагрузки: " + workload_label
         + "\n🎮 Игровой день: " + declared_game_day(record, get)
         + "\n\n" + snapshot["status"]
         + "\n\n🔎 Значимые изменения\n" + observed
