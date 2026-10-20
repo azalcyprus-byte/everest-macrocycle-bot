@@ -5,7 +5,7 @@ No changes to form schemas or to the curator's personal checklist sheets.
 """
 import asyncio
 from collections import Counter
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import json
 import logging
 import os
@@ -30,8 +30,10 @@ def enabled():
 
 
 def config():
-    tz = ZoneInfo(os.getenv("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh"))
+    # Form timestamps are displayed in the response spreadsheet's timezone.
+    # The monitoring schedule must never depend on Alexey's location.
     sheet_tz = ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai"))
+    tz = sheet_tz
     curator = os.getenv("ZHUKOV_CURATOR_CHAT_ID") or os.getenv("TELEGRAM_USER_ID")
     zhukov = os.getenv("ZHUKOV_TELEGRAM_USER_ID")
     if not curator or not curator.lstrip("-").isdigit():
@@ -100,46 +102,53 @@ def earliest_submission_by_day(rows, sheet_tz):
     return result
 
 
-def anchor_local(records, user_tz, activated, received_dates=None):
-    """Use an explicit anchor or the first report on/after activation.
+def anchor_local(records, sheet_tz, activated, received_dates=None):
+    """Return (first timestamp, reported date) after monitoring activation.
 
-    No historical August/September response can silently determine October
-    reminder times. Persist the resolved wall-clock anchor in the journal.
+    Responses display timestamps in the Google Sheet timezone, irrespective of
+    Alexey's current location. Never use archival responses to set the schedule.
     """
+    candidates = [
+        rec for rec in records
+        if rec["date"] >= activated
+        and rec["timestamp"] is not None
+        and (received_dates is None or rec["date"] in received_dates)
+    ]
+    if not candidates:
+        return None
+    first = min(candidates, key=lambda rec: rec["timestamp"])
     override = os.getenv("ZHUKOV_MONITOR_ANCHOR_LOCAL", "").strip()
     if override:
         stamp = datetime.fromisoformat(override)
-        return stamp.replace(tzinfo=user_tz) if stamp.tzinfo is None else stamp.astimezone(user_tz)
-    for rec in records:
-        if rec["date"] < activated or rec["timestamp"] is None:
-            continue
-        if received_dates is not None and rec["date"] not in received_dates:
-            continue
-        return rec["timestamp"].astimezone(user_tz)
-    return None
+        stamp = stamp.replace(tzinfo=sheet_tz) if stamp.tzinfo is None else stamp.astimezone(sheet_tz)
+    else:
+        stamp = first["timestamp"].astimezone(sheet_tz)
+    return stamp, first["date"]
 
 
-def due_checks(anchor, now, activation_date):
-    """First date + 1 at anchor+30h clock; +1 local calendar day thereafter.
+def due_checks(anchor, now, activation_date, anchor_report_date=None):
+    """At T0+30 elapsed hours, and T0+30+24*n hours for subsequent reports.
 
-    Calendar dates (rather than UTC durations) retain the same control clock
-    through DST changes. Late submissions do not change the anchor.
+    The report *date* comes from the form's "Дата" field, not from the local
+    date of its deadline. Work in UTC for elapsed hours, even across DST.
     """
     if anchor is None:
         return []
-    now = now.astimezone(anchor.tzinfo)
-    first_due = anchor + timedelta(hours=30)
-    first_clock = first_due.timetz().replace(tzinfo=None)
-    first_day = first_due.date()
-    if now.date() < first_day:
-        return []
+    if anchor.tzinfo is None or now.tzinfo is None:
+        raise ValueError("Schedule timestamps must include timezone information")
+    anchor_report_date = anchor_report_date or anchor.date()
+    first_due_utc = anchor.astimezone(timezone.utc) + timedelta(hours=30)
+    now_utc = now.astimezone(timezone.utc)
+    days_since_anchor = max(1, (activation_date - anchor_report_date).days)
     out = []
-    cursor = max(first_day, activation_date)
-    while cursor <= now.date():
-        due = datetime.combine(cursor, first_clock, tzinfo=anchor.tzinfo)
-        if due <= now:
-            out.append((cursor, due))
-        cursor += timedelta(days=1)
+    index = days_since_anchor
+    while True:
+        due_utc = first_due_utc + timedelta(days=index - 1)
+        if due_utc > now_utc:
+            break
+        report_date = anchor_report_date + timedelta(days=index)
+        out.append((report_date, due_utc.astimezone(anchor.tzinfo)))
+        index += 1
     return out
 
 
@@ -500,21 +509,27 @@ async def tick(bot, spreadsheet, now=None):
         )
         if anchor_record and len(anchor_record) > 3:
             saved = datetime.fromisoformat(anchor_record[3])
-            # Preserve the original local control clock when the user travels.
-            ref = saved.replace(tzinfo=tz)
+            ref = saved.astimezone(tz)
+            anchor_report_date = parse_date(anchor_record[2])
+            if anchor_report_date is None:
+                logger.error("Zhukov monitor: stored anchor report date is invalid")
+                return
         else:
-            ref = anchor_local(morning, tz, activated, received_dates)
-            if ref:
+            selected_anchor = anchor_local(morning, sheet_tz, activated, received_dates)
+            if selected_anchor:
+                ref, anchor_report_date = selected_anchor
                 log_tab.append_row(["zhukov:monitor:anchor", "CONFIG",
-                                    ref.date().isoformat(), ref.isoformat(),
-                                    "Fixed anchor for the 30h + daily control schedule.",
+                                    anchor_report_date.isoformat(), ref.isoformat(),
+                                    "Fixed source-sheet timestamp for 30h +24h checks.",
                                     "SENT", "", ""])
+            else:
+                ref = None
         if not ref:
             logger.info("Zhukov monitoring: waiting for the first post-activation report")
             return
         # Deadline history uses the earliest submission, not a later correction.
         events = []
-        for day, deadline in due_checks(ref, now, activated):
+        for day, deadline in due_checks(ref, now, activated, anchor_report_date):
             first = first_submissions.get(day)
             late = first is not None and first.astimezone(tz) > deadline
             if first is None or late:
@@ -526,7 +541,7 @@ async def tick(bot, spreadsheet, now=None):
                     f"zhukov:missing:{day.isoformat()}", "MISSING",
                     day, deadline,
                     f"⚠️ Everest | Алексей Жуков\nНа контрольный момент "
-                    f"{deadline.strftime('%d.%m.%Y %H:%M')} ({getattr(tz,'key',str(tz))}) "
+                    f"{deadline.strftime('%d.%m.%Y %H:%M')} (время Google Таблицы: {getattr(tz,'key',str(tz))}) "
                     f"утреннего отчёта за {day.strftime('%d.%m.%Y')} не было. {qualifier}",
                 ))
         for record in morning:
