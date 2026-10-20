@@ -110,8 +110,9 @@ def due_checks(anchor, now, activation_date):
     if anchor is None:
         return []
     now = now.astimezone(anchor.tzinfo)
-    first_clock = (anchor + timedelta(hours=30)).timetz().replace(tzinfo=None)
-    first_day = anchor.date() + timedelta(days=1)
+    first_due = anchor + timedelta(hours=30)
+    first_clock = first_due.timetz().replace(tzinfo=None)
+    first_day = first_due.date()
     if now.date() < first_day:
         return []
     out = []
