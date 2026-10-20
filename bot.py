@@ -5361,6 +5361,87 @@ async def start_zhukov_morning_session(
         )
 
 
+async def zhukovreport(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """View archived curator analysis or retrospectively inspect any Form date."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        # Private trainee state must not be exposed in shared Telegram groups.
+        return
+
+    args = context.args or []
+    if len(args) > 1:
+        await update.effective_message.reply_text(
+            "Формат: /zhukovreport 20.10.2026\n"
+            "Без даты — последний доступный отчёт.\n"
+            "Список дат: /zhukovhistory"
+        )
+        return
+    target_date = zhukov_monitor.parse_date(args[0]) if args else None
+    if args and target_date is None:
+        await update.effective_message.reply_text(
+            "Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД.\n"
+            "Например: /zhukovreport 20.10.2026"
+        )
+        return
+    try:
+        book = await asyncio.to_thread(get_zhukov_spreadsheet)
+        report = await asyncio.to_thread(
+            zhukov_monitor.read_curator_report, book, target_date,
+        )
+    except Exception:
+        logger.exception("Zhukov historical report read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать историю Алексея из Google Sheets. "
+            "Попробуй позднее."
+        )
+        return
+    for part in zhukov_monitor.split_telegram_text(report):
+        await update.effective_message.reply_text(part)
+
+
+async def zhukovhistory(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Read-only date index for the curator's private chat."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    args = context.args or []
+    if len(args) > 1 or (args and not args[0].isdigit()):
+        await update.effective_message.reply_text(
+            "Формат: /zhukovhistory\n"
+            "Или /zhukovhistory 30 (не больше 30 дат)."
+        )
+        return
+    count = min(int(args[0]), 30) if args else 15
+    if count < 1:
+        await update.effective_message.reply_text(
+            "Укажи количество дат от 1 до 30."
+        )
+        return
+    try:
+        book = await asyncio.to_thread(get_zhukov_spreadsheet)
+        history = await asyncio.to_thread(
+            zhukov_monitor.read_curator_history, book, count,
+        )
+    except Exception:
+        logger.exception("Zhukov history index read failed")
+        await update.effective_message.reply_text(
+            "Не удалось загрузить историю Алексея из Google Sheets."
+        )
+        return
+    for part in zhukov_monitor.split_telegram_text(history):
+        await update.effective_message.reply_text(part)
+
+
 async def zhukovdecision(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8631,6 +8712,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("zhukovstatus", zhukovstatus))
     telegram_app.add_handler(CommandHandler("zhukovtest", zhukovtest))
     telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
+    telegram_app.add_handler(CommandHandler("zhukovreport", zhukovreport))
+    telegram_app.add_handler(CommandHandler("zhukovhistory", zhukovhistory))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
     telegram_app.add_handler(CommandHandler("writetest", writetest))
