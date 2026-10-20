@@ -374,9 +374,69 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
             session.assert_not_called()
         self.assertEqual(result, self.base_report)
 
+    def test_openai_cost_uses_actual_input_output_and_cached_tokens(self):
+        response = {
+            "model": "gpt-4.1-mini-2025-04-14",
+            "usage": {
+                "input_tokens": 1000,
+                "input_tokens_details": {"cached_tokens": 100},
+                "output_tokens": 200,
+                "total_tokens": 1200,
+            },
+        }
+        self.assertEqual(
+            format(ai.calculate_response_cost_usd(response), ".6f"), "0.000690"
+        )
+        self.assertIn(
+            "💳 OpenAI API: ≈ $0.000690",
+            ai.response_cost_footer(response)
+        )
+        no_cache = {
+            "model": "gpt-4.1-mini",
+            "usage": {"input_tokens": 1500, "output_tokens": 300},
+        }
+        self.assertEqual(
+            format(ai.calculate_response_cost_usd(no_cache), ".6f"), "0.001080"
+        )
+        gpt_five = {
+            "model": "gpt-5-mini",
+            "usage": {"input_tokens": 1000, "output_tokens": 200},
+        }
+        self.assertEqual(
+            format(ai.calculate_response_cost_usd(gpt_five), ".6f"), "0.000650"
+        )
+
+    def test_api_cost_is_not_invented_without_reliable_usage_or_rate(self):
+        valid = {"input_tokens": 1000, "output_tokens": 200}
+        unknown = {"model": "unknown-model-2035", "usage": valid}
+        self.assertIsNone(ai.calculate_response_cost_usd(unknown))
+        self.assertIn("не удалось рассчитать", ai.response_cost_footer(unknown))
+        self.assertIsNone(
+            ai.calculate_response_cost_usd({"model": "gpt-4.1-mini"})
+        )
+        self.assertIsNone(ai.calculate_response_cost_usd({
+            "model": "gpt-4.1-mini",
+            "usage": {"input_tokens": 1000, "output_tokens": 200,
+                      "input_tokens_details": {"cached_tokens": 1001}},
+        }))
+        self.assertIsNone(ai.calculate_response_cost_usd({
+            "model": "gpt-4.1-mini", "usage": valid,
+            "service_tier": "priority",
+        }))
+        self.assertIsNone(ai.calculate_response_cost_usd({
+            "model": "gpt-4.1-mini",
+            "usage": {"input_tokens": True, "output_tokens": 10},
+        }))
+
     async def test_api_payload_uses_structured_output_and_store_false(self):
         reply = {
             "status": "completed",
+            "model": "gpt-4.1-mini-2025-04-14",
+            "usage": {
+                "input_tokens": 1000,
+                "input_tokens_details": {"cached_tokens": 100},
+                "output_tokens": 200,
+            },
             "output": [{"content": [{"type": "output_text", "text": json.dumps({
                 "hypotheses": [], "proposed_action": "Наблюдать.",
                 "limitations": "Недостаточно данных."
@@ -407,6 +467,15 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
                     m.automation, m.concrete_lapse, m.quality_drop,
                 )
         self.assertIn("Недостаточно данных для индивидуальной гипотезы", enriched)
+        self.assertTrue(
+            enriched.endswith(
+                "💳 OpenAI API: ≈ $0.000690 за этот анализ "
+                "(по токенам и стандартному тарифу; фактическое списание "
+                "может отличаться)."
+            )
+        )
+        self.assertGreater(enriched.index("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ"), enriched.index("НАБЛЮДЕНИЕ"))
+        self.assertGreater(enriched.index("💳 OpenAI API"), enriched.index("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ"))
         self.assertEqual(fake.url, "https://api.openai.com/v1/responses")
         self.assertIs(fake.payload["store"], False)
         self.assertEqual(fake.payload["text"]["format"]["type"], "json_schema")
