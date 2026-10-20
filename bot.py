@@ -5361,6 +5361,46 @@ async def start_zhukov_morning_session(
         )
 
 
+async def zhukovdecision(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Curator confirms/records a decision without changing Alexey's forms."""
+    if not is_authorized(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.effective_message.reply_text(
+            "Формат: /zhukovdecision ГГГГ-ММ-ДД текст решения"
+        )
+        return
+    target = zhukov_monitor.parse_date(args[0])
+    if target is None:
+        await update.effective_message.reply_text(
+            "Неверная дата. Пример: /zhukovdecision 2026-10-20 оставить нагрузку"
+        )
+        return
+    decision = " ".join(args[1:]).strip()
+    try:
+        sheet = await asyncio.to_thread(get_zhukov_spreadsheet)
+        await asyncio.to_thread(
+            zhukov_monitor.record_curator_decision,
+            sheet,
+            target,
+            decision,
+            update.effective_user.id,
+        )
+    except Exception:
+        logger.exception("Could not save Zhukov curator decision")
+        await update.effective_message.reply_text(
+            "Не удалось сохранить решение; проверьте доступ к таблице Алексея."
+        )
+        return
+    await update.effective_message.reply_text(
+        f"Решение куратора за {target.isoformat()} сохранено в отдельном журнале ✅"
+    )
+
+
 async def zhukov_curator_monitor_tick(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -8590,6 +8630,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("forms", zhukov_forms))
     telegram_app.add_handler(CommandHandler("zhukovstatus", zhukovstatus))
     telegram_app.add_handler(CommandHandler("zhukovtest", zhukovtest))
+    telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
     telegram_app.add_handler(CommandHandler("writetest", writetest))
