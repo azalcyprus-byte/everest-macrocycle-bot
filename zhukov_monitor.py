@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import zhukov_ai
 import zhukov_brief
+import zhukov_plan
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -251,11 +252,12 @@ def context_text():
 
 
 
-async def maybe_ai_commentary(report, record, morning, games):
+async def maybe_ai_commentary(report, record, morning, games, plan_type=None):
     """Optional individual hypotheses; never needed for reminders or data access."""
     return await zhukov_ai.enrich_report(
         report, record, morning, games,
         get, sleep_window, game_hours, automation, concrete_lapse, quality_drop,
+        plan_type=plan_type,
     )
 
 
@@ -426,7 +428,7 @@ def _audit_saved_report(audit_rows, day):
     return None
 
 
-def read_ai_report_inputs(spreadsheet, day):
+def read_ai_report_inputs(spreadsheet, day, plan_types=None):
     """Read only historical Forms, without writing audit rows or calling OpenAI.
 
     The report text is generated retrospectively from data available through
@@ -453,11 +455,12 @@ def read_ai_report_inputs(spreadsheet, day):
     target = next((row for row in morning if row["date"] == day), None)
     if target is None:
         return None
-    return (zhukov_brief.render(target, morning, postgame, get, ai_unavailable=True),
+    return (zhukov_brief.render(target, morning, postgame, get,
+                                ai_unavailable=True, plan_type=zhukov_plan.planned_type_for(plan_types, day)),
             target, morning, postgame)
 
 
-def read_curator_report(spreadsheet, day=None):
+def read_curator_report(spreadsheet, day=None, plan_types=None):
     """Return a saved sent report or an explicitly labelled historical reconstruction.
 
     Read-only by design. Do not send alerts, modify Forms, call OpenAI, or
@@ -493,7 +496,8 @@ def read_curator_report(spreadsheet, day=None):
             "Ретроспективная сводка, рассчитанная сейчас по существующим анкетам. "
             "Не является копией прежнего Telegram-сообщения; данные могли быть исправлены позже.\n\n"
             + zhukov_brief.render(morning_by_day[day], morning, postgame,
-                                          get, ai_unavailable=True)
+                                          get, ai_unavailable=True,
+                                          plan_type=zhukov_plan.planned_type_for(plan_types, day))
         )
     elif day in games_by_day:
         game = games_by_day[day]
@@ -607,6 +611,11 @@ def telegram_report_html(text):
         r"(?m)^(ℹ️ Надёжность:)",
         r"<b>\1</b>", output,
     )
+    # Exact labels are ours; all plan codes and form choices were HTML-escaped.
+    output = re.sub(
+        r"(?m)^(📅 План нагрузки:|🎮 Игровой день:)([^\n]*)$",
+        r"<b>\1</b>\2", output,
+    )
     return output
 
 
@@ -685,9 +694,11 @@ async def _send_once(bot, ws, records, event):
     _mark(ws, row_number, "SENT")
 
 
-async def tick(bot, spreadsheet, now=None):
+async def tick(bot, spreadsheet, now=None, plan_types=None):
     if not enabled():
         return
+    if plan_types is None and os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        plan_types = await asyncio.to_thread(zhukov_plan.optional_plan_types)
     async with _lock:
         tz, sheet_tz, _ = config()
         now = (now or datetime.now(tz)).astimezone(tz)
@@ -783,6 +794,7 @@ async def tick(bot, spreadsheet, now=None):
             events.append((f"zhukov:analysis:{day.isoformat()}", "ANALYSIS",
                            day, record["timestamp"], zhukov_brief.render(
                                record, morning, postgame, get, ai_unavailable=True,
+                               plan_type=zhukov_plan.planned_type_for(plan_types, day),
                            )))
         for key, kind, day, when, message in sorted(events, key=lambda x: (x[2], x[1])):
             if key in known:
@@ -792,5 +804,6 @@ async def tick(bot, spreadsheet, now=None):
                 if target is not None:
                     message = await maybe_ai_commentary(
                         message, target, morning, postgame,
+                        plan_type=zhukov_plan.planned_type_for(plan_types, day),
                     )
             await _send_once(bot, log_tab, known, (key, kind, day, when, message))
