@@ -108,6 +108,13 @@ def anchor_local(records, sheet_tz, activated, received_dates=None):
     Responses display timestamps in the Google Sheet timezone, irrespective of
     Alexey's current location. Never use archival responses to set the schedule.
     """
+    override = os.getenv("ZHUKOV_MONITOR_ANCHOR_LOCAL", "").strip()
+    if override:
+        stamp = datetime.fromisoformat(override)
+        stamp = stamp.replace(tzinfo=sheet_tz) if stamp.tzinfo is None else stamp.astimezone(sheet_tz)
+        report_date = parse_date(os.getenv("ZHUKOV_MONITOR_ANCHOR_REPORT_DATE", "")) or stamp.date()
+        return stamp, report_date
+
     candidates = [
         rec for rec in records
         if rec["date"] >= activated
@@ -117,13 +124,7 @@ def anchor_local(records, sheet_tz, activated, received_dates=None):
     if not candidates:
         return None
     first = min(candidates, key=lambda rec: rec["timestamp"])
-    override = os.getenv("ZHUKOV_MONITOR_ANCHOR_LOCAL", "").strip()
-    if override:
-        stamp = datetime.fromisoformat(override)
-        stamp = stamp.replace(tzinfo=sheet_tz) if stamp.tzinfo is None else stamp.astimezone(sheet_tz)
-    else:
-        stamp = first["timestamp"].astimezone(sheet_tz)
-    return stamp, first["date"]
+    return first["timestamp"].astimezone(sheet_tz), first["date"]
 
 
 def due_checks(anchor, now, activation_date, anchor_report_date=None):
