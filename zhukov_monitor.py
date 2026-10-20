@@ -82,6 +82,24 @@ def normalize_records(rows, sheet_tz):
     return sorted(result.values(), key=lambda item: item["date"])
 
 
+def earliest_submission_by_day(rows, sheet_tz):
+    """Keep earliest submission for deadline checks, independently of corrections."""
+    if not rows:
+        return {}
+    headers = [str(x).strip() for x in rows[0]]
+    result = {}
+    for row in rows[1:]:
+        fields = {name: str(row[i] if i < len(row) else "").strip()
+                  for i, name in enumerate(headers) if name}
+        stamp = parse_stamp(fields.get("Отметка времени"), sheet_tz)
+        day = parse_date(fields.get("Дата")) or (stamp.date() if stamp else None)
+        if day is None or stamp is None:
+            continue
+        if day not in result or stamp < result[day]:
+            result[day] = stamp
+    return result
+
+
 def anchor_local(records, user_tz, activated, received_dates=None):
     """Use an explicit anchor or the first report on/after activation.
 
@@ -439,7 +457,9 @@ async def tick(bot, spreadsheet, now=None):
         now = (now or datetime.now(tz)).astimezone(tz)
         morning_tab = spreadsheet.worksheet(os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы"))
         game_tab = spreadsheet.worksheet(os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы"))
-        morning = normalize_records(morning_tab.get_all_values(), sheet_tz)
+        morning_rows = morning_tab.get_all_values()
+        morning = normalize_records(morning_rows, sheet_tz)
+        first_submissions = earliest_submission_by_day(morning_rows, sheet_tz)
         postgame = normalize_records(game_tab.get_all_values(), sheet_tz)
         if not morning:
             logger.warning("Zhukov monitor: no dated morning reports")
@@ -492,18 +512,22 @@ async def tick(bot, spreadsheet, now=None):
         if not ref:
             logger.info("Zhukov monitoring: waiting for the first post-activation report")
             return
-        # Do not reinterpret completed reports when a form was submitted late.
-        has_report = {r["date"] for r in morning}
+        # Deadline history uses the earliest submission, not a later correction.
         events = []
         for day, deadline in due_checks(ref, now, activated):
-            if day not in has_report:
+            first = first_submissions.get(day)
+            late = first is not None and first.astimezone(tz) > deadline
+            if first is None or late:
+                qualifier = (
+                    "Отчёт заполнен после срока; опорный график неизменен."
+                    if late else "Отчёт пока не поступил."
+                )
                 events.append((
                     f"zhukov:missing:{day.isoformat()}", "MISSING",
                     day, deadline,
-                    f"⚠️ Everest | Алексей Жуков\nУтренний отчёт за "
-                    f"{day.strftime('%d.%m.%Y')} отсутствует на контрольный момент "
-                    f"{deadline.strftime('%H:%M')} ({getattr(tz,'key',str(tz))}). "
-                    "Напоминание куратору, не Алексею.",
+                    f"⚠️ Everest | Алексей Жуков\nНа контрольный момент "
+                    f"{deadline.strftime('%d.%m.%Y %H:%M')} ({getattr(tz,'key',str(tz))}) "
+                    f"утреннего отчёта за {day.strftime('%d.%m.%Y')} не было. {qualifier}",
                 ))
         for record in morning:
             day = record["date"]
