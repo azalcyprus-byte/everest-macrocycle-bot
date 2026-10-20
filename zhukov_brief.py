@@ -7,6 +7,7 @@ copies that were already sent remain unchanged in the audit journal.
 from datetime import timedelta
 import json
 import re
+import os
 
 import zhukov_plan
 
@@ -208,6 +209,12 @@ def render(record, morning, games, get, insight=None, *,
     elif not action or re.search(r"\b(снизить|уменьшить|сократить|отменить)\b", action, re.I):
         action = _fallback_action(snapshot)
 
+    if plan_type is None and os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        # The source schedule is a different Google spreadsheet. The bot
+        # reads it using its read-only shared service-account access.
+        plan_type = zhukov_plan.planned_type_for(
+            zhukov_plan.optional_plan_types(), record["date"]
+        )
     plan_code = zhukov_plan.planned_type_for(
         {record["date"]: plan_type}, record["date"]
     )
