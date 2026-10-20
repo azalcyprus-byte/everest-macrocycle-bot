@@ -429,7 +429,7 @@ def record_curator_decision(spreadsheet, day, decision, curator_id):
     if not isinstance(day, date) or not str(decision).strip():
         raise ValueError("Date and non-empty curator decision are required.")
     note = str(decision).strip()[:1500]
-    now = datetime.now(ZoneInfo(os.getenv("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh")))
+    now = datetime.now(ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai")))
     sheet = worksheet(spreadsheet)
     key = f"zhukov:decision:{day.isoformat()}:{uuid.uuid4().hex[:12]}"
     sheet.append_row([
