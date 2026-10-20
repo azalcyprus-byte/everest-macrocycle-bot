@@ -1,203 +1,390 @@
-"""Independent curator-only monitoring of Zhukov's existing Forms responses.
+"""Curator-only monitoring of Alexey Zhukov's existing Google Forms response sheets.
 
-No changes to Google Forms or to the curator's personal checklists.
-The bot reads Sheets populated by the existing Forms/Apps Script pipeline.
+Disabled by default. Never sends monitored data to Alexey's own Telegram chat.
+No changes to form schemas or to the curator's personal checklist sheets.
 """
-from datetime import datetime, date, timedelta, time
-from zoneinfo import ZoneInfo
-import hashlib
+import asyncio
+from collections import Counter
+from datetime import date, datetime, time, timedelta
 import json
 import logging
 import os
-import re
+from zoneinfo import ZoneInfo
 
-log = logging.getLogger(__name__)
-MONITOR_SHEET = "Everest_Алексей_мониторинг"
-HEADERS = ["Ключ", "Тип", "Дата отчёта", "Время события ISO", "Текст", "Статус", "Ошибка"]
-TIMEZONE = os.getenv("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh")
-CURATOR_CHAT = os.getenv("ZHUKOV_CURATOR_CHAT_ID") or os.getenv("TELEGRAM_USER_ID")
-ENABLED = os.getenv("ZHUKOV_MONITOR_ENABLED", "false").lower() == "true"
+import gspread
+
+logger = logging.getLogger(__name__)
+LOG_TAB = "Everest_Алексей_мониторинг"
+HEADERS = [
+    "Ключ", "Тип", "Дата отчёта", "Контрольный момент ISO",
+    "Сообщение", "Статус", "Ошибка", "Решение куратора",
+]
+_ENABLED = {"1", "true", "yes", "on"}
+_lock = asyncio.Lock()
+
+
+def enabled():
+    return os.getenv("ZHUKOV_MONITOR_ENABLED", "").strip().lower() in _ENABLED
+
+
+def config():
+    tz = ZoneInfo(os.getenv("ZHUKOV_TIMEZONE", "Asia/Phnom_Penh"))
+    sheet_tz = ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai"))
+    curator = os.getenv("ZHUKOV_CURATOR_CHAT_ID") or os.getenv("TELEGRAM_USER_ID")
+    zhukov = os.getenv("ZHUKOV_TELEGRAM_USER_ID")
+    if not curator or not curator.lstrip("-").isdigit():
+        raise ValueError("A valid curator Telegram chat ID is required.")
+    if zhukov and curator == zhukov:
+        raise ValueError("Curator chat must not be Alexey's Telegram chat.")
+    return tz, sheet_tz, int(curator)
 
 
 def parse_date(raw):
-    raw = str(raw or "").strip()
     for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
         try:
-            return datetime.strptime(raw, fmt).date()
+            return datetime.strptime(str(raw or "").strip(), fmt).date()
         except ValueError:
             pass
     return None
 
 
-def parse_stamp(raw, tz):
+def parse_stamp(raw, sheet_tz):
     raw = str(raw or "").strip()
-    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            return datetime.strptime(raw, fmt).replace(tzinfo=tz)
+            return datetime.strptime(raw, fmt).replace(tzinfo=sheet_tz)
         except ValueError:
             pass
     return None
 
 
-def normalize_records(rows, tz):
+def normalize_records(rows, sheet_tz):
+    """Keep last submitted response by explicit report date, not submission date."""
     if not rows:
         return []
     headers = [str(x).strip() for x in rows[0]]
-    found = {}
+    result = {}
     for row in rows[1:]:
-        item = dict(zip(headers, list(row) + [""] * len(headers)))
-        day = parse_date(item.get("Дата"))
-        timestamp = parse_stamp(item.get("Отметка времени"), tz)
-        if day is None and timestamp:
-            day = timestamp.date()
+        fields = {name: str(row[i] if i < len(row) else "").strip()
+                  for i, name in enumerate(headers) if name}
+        stamp = parse_stamp(fields.get("Отметка времени"), sheet_tz)
+        day = parse_date(fields.get("Дата")) or (stamp.date() if stamp else None)
         if day is None:
             continue
-        # Late correction supersedes earlier submissions for the same report date.
-        if day not in found or (timestamp and timestamp > (found[day]["timestamp"] or datetime.min.replace(tzinfo=tz))):
-            found[day] = {"date": day, "timestamp": timestamp, "fields": item}
-    return sorted(found.values(), key=lambda x: x["date"])
+        item = {"date": day, "timestamp": stamp, "fields": fields}
+        existing = result.get(day)
+        if existing is None or ((stamp or datetime.min.replace(tzinfo=sheet_tz))
+                                >= (existing["timestamp"] or datetime.min.replace(tzinfo=sheet_tz))):
+            result[day] = item
+    return sorted(result.values(), key=lambda item: item["date"])
 
 
-def due_days(anchor_timestamp, now):
-    """Fixed local wall-clock 30h first check, then +24h; no drift on late forms."""
-    if not anchor_timestamp:
+def anchor_local(records, user_tz):
+    """Explicit local anchor removes ambiguity when the first submission was abroad."""
+    override = os.getenv("ZHUKOV_MONITOR_ANCHOR_LOCAL", "").strip()
+    if override:
+        stamp = datetime.fromisoformat(override)
+        return stamp.replace(tzinfo=user_tz) if stamp.tzinfo is None else stamp.astimezone(user_tz)
+    for rec in records:
+        if rec["timestamp"]:
+            return rec["timestamp"].astimezone(user_tz)
+    return None
+
+
+def due_checks(anchor, now, activation_date):
+    """First date + 1 at anchor+30h clock; +1 local calendar day thereafter.
+
+    Calendar dates (rather than UTC durations) retain the same control clock
+    through DST changes. Late submissions do not change the anchor.
+    """
+    if anchor is None:
         return []
-    tz = anchor_timestamp.tzinfo
-    first = anchor_timestamp + timedelta(hours=30)
-    if now < first:
+    now = now.astimezone(anchor.tzinfo)
+    first_clock = (anchor + timedelta(hours=30)).timetz().replace(tzinfo=None)
+    first_day = anchor.date() + timedelta(days=1)
+    if now.date() < first_day:
         return []
+    out = []
+    cursor = max(first_day, activation_date)
+    while cursor <= now.date():
+        due = datetime.combine(cursor, first_clock, tzinfo=anchor.tzinfo)
+        if due <= now:
+            out.append((cursor, due))
+        cursor += timedelta(days=1)
+    return out
+
+
+def get(rec, prefix, default="нет данных"):
+    if not rec:
+        return default
+    for name, value in rec["fields"].items():
+        if name.startswith(prefix):
+            return value or default
+    return default
+
+
+def sleep_window(rec):
+    try:
+        a = datetime.strptime(get(rec, "1. Во сколько лег")[:5], "%H:%M")
+        b = datetime.strptime(get(rec, "2. Во сколько окончательно")[:5], "%H:%M")
+        diff = (b - a).total_seconds() / 3600
+        return round(diff if diff >= 0 else diff + 24, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def game_hours(rec):
+    try:
+        h = float(get(rec, "1. Сколько часов фактически").replace(",", "."))
+        return h if 0 <= h <= 24 else None
+    except ValueError:
+        return None
+
+
+def automation(rec):
+    text = get(rec, "5. Были ли моменты").lower()
+    return "повторялось" in text or "один-два" in text
+
+
+def concrete_lapse(rec):
+    return get(rec, "6. Были ли конкретные сбои").lower() not in ("нет", "нет данных")
+
+
+def quality_drop(rec):
+    """Compare explicitly ordered questionnaire answers, not arbitrary readiness score."""
+    attention = {"почти не следил": 0, "время от времени": 1,
+                 "большую часть времени": 2, "почти всегда": 3}
+    depth = {"практически нет": 0, "редко": 1, "выборочно": 2, "регулярно": 3}
+    comparisons = (
+        (get(rec, "3. В первой").lower(), get(rec, "3. В последней").lower(), attention),
+        (get(rec, "4. В первой").lower(), get(rec, "4. В последней").lower(), depth),
+    )
     result = []
-    cursor = first
-    while cursor <= now and len(result) < 500:
-        result.append((cursor.date(), cursor))
-        cursor = cursor + timedelta(days=1)
+    for before, after, scale in comparisons:
+        result.append(None if before not in scale or after not in scale
+                      else scale[after] < scale[before])
     return result
 
 
-def field(record, prefix):
-    if not record:
-        return "нет данных"
-    for key, value in record["fields"].items():
-        if key.strip().startswith(prefix):
-            return str(value or "не указано")
-    return "нет данных"
+def stats(morning, games):
+    windows = [sleep_window(x) for x in morning]
+    hours = [game_hours(x) for x in games]
+    drops = [quality_drop(x) for x in games]
+    return {
+        "mornings": len(morning),
+        "games": len(games),
+        "game_hours": round(sum(x for x in hours if x is not None), 1),
+        "known_game_hours": sum(x is not None for x in hours),
+        "sleep_windows": [x for x in windows if x is not None],
+        "noticeable_sleepiness": sum("заметная" in get(x, "6. Через").lower() for x in morning),
+        "attention_issue": sum(get(x, "8. Когда").lower() in ("иногда", "часто") for x in morning),
+        "slower_decisions": sum(get(x, "9. Простые").lower() != "как обычно" for x in morning),
+        "automatisms": sum(automation(x) for x in games),
+        "lapses": sum(concrete_lapse(x) for x in games),
+        "attention_drops": sum(x[0] is True for x in drops),
+        "analysis_drops": sum(x[1] is True for x in drops),
+    }
 
 
-def sleep_hours(record):
-    if not record:
-        return None
-    try:
-        a = field(record, "1. Во сколько лег")
-        b = field(record, "2. Во сколько окончательно")
-        start = datetime.strptime(a[:5], "%H:%M")
-        end = datetime.strptime(b[:5], "%H:%M")
-        diff = (end - start).total_seconds() / 3600
-        return round(diff if diff >= 0 else diff + 24, 1)
-    except (ValueError, TypeError):
-        return None
+def fmt_stats(x, days):
+    if not x["mornings"] and not x["games"]:
+        return f"{days} дн.: нет наблюдений"
+    win = x["sleep_windows"]
+    sleep = f"; среднее окно сна {sum(win)/len(win):.1f} ч" if win else ""
+    return (f"{days} дн.: утро {x['mornings']}/{days}, игра {x['games']} сессий, "
+            f"{x['game_hours']} ч подтверждено в {x['known_game_hours']} сессиях"
+            f"{sleep}; заметная сонливость {x['noticeable_sleepiness']}; "
+            f"замедление решений {x['slower_decisions']}; автоматизм {x['automatisms']}; "
+            f"конкретные сбои {x['lapses']}; снижение внимания/глубины анализа "
+            f"{x['attention_drops']}/{x['analysis_drops']} сессий.")
 
 
-def report_text(record, records, postgame_records=None, context=None):
+def context_text():
+    phase = os.getenv("ZHUKOV_MACROCYCLE_PHASE", "").strip()
+    tournaments = os.getenv("ZHUKOV_PRIORITY_TOURNAMENTS", "").strip()
+    return (f"Фаза: {phase or 'не указана'}; ближайшие приоритетные турниры: "
+            f"{tournaments or 'не указаны'} (только сведения, заданные куратором).")
+
+
+def report_text(record, morning, postgame):
     day = record["date"]
-    recent3 = [r for r in records if day - timedelta(days=2) <= r["date"] <= day]
-    recent7 = [r for r in records if day - timedelta(days=6) <= r["date"] <= day]
-    earlier = next((r for r in reversed(records) if r["date"] < day), None)
-    hours = sleep_hours(record)
-    sleep_label = f"{hours} ч между отходом ко сну и подъёмом (не фактическая длительность сна)" if hours is not None else "не определено"
-    daytime = field(record, "6. Через")
-    attention = field(record, "8. Когда")
-    decisions = field(record, "9. Простые")
-    body = field(record, "7. Что")
-    wake = field(record, "5. Как")
-    day_type = record["fields"].get("Сегодня", "не указан")
-    # Never interpret long sleep as daytime sleepiness or as proof of overload.
-    facts = [
-        f"Сон: {sleep_label}; пробуждение: {wake}.",
-        f"Сонливость через 30–60 минут: {daytime}.",
-        f"Тело: {body}; внимание: {attention}; простые решения: {decisions}.",
-        f"План дня: {day_type}.",
-    ]
-    if earlier:
-        facts.append(f"Предыдущий отчёт: {earlier['date'].isoformat()}, сонливость: {field(earlier, '6. Через')}, внимание: {field(earlier, '8. Когда')}.")
-    else:
-        facts.append("Предыдущего отчёта нет.")
-    post = postgame_records or []
-    game7 = [r for r in post if day - timedelta(days=6) <= r["date"] <= day]
-    facts.append(f"Постигровых отчётов за 7 дней: {len(game7)}; без отдельного анализа раздач качество решений не подтверждено.")
-    if context:
-        facts.append(f"Контекст макроцикла: {context}.")
-    else:
-        facts.append("Фаза макроцикла и приоритетные турниры: данные не подключены.")
-    note = (
-        "Данных для устойчивой тенденции недостаточно."
-        if len(recent7) < 4
-        else "Есть серия наблюдений, но причинная связь с нагрузкой не установлена."
+    m3 = [x for x in morning if day - timedelta(days=2) <= x["date"] <= day]
+    m7 = [x for x in morning if day - timedelta(days=6) <= x["date"] <= day]
+    g3 = [x for x in postgame if day - timedelta(days=2) <= x["date"] <= day]
+    g7 = [x for x in postgame if day - timedelta(days=6) <= x["date"] <= day]
+    prev = next((x for x in reversed(morning) if x["date"] < day), None)
+    previous_3 = [x for x in morning if day - timedelta(days=5) <= x["date"] < day - timedelta(days=2)]
+    previous_7 = [x for x in morning if day - timedelta(days=13) <= x["date"] < day - timedelta(days=6)]
+    g_cycle = [x for x in postgame if x["date"] <= day]
+    m_cycle = [x for x in morning if x["date"] <= day]
+    today_win = sleep_window(record)
+    rest = [x for x in m7 if get(x, "Сегодня").lower() == "отдых"]
+    consecutive = any(
+        (x["date"] - timedelta(days=1)) in {g["date"] for g in g7}
+        for x in g7
     )
+    long_prev = next(
+        (x for x in reversed(postgame) if x["date"] == day - timedelta(days=1)
+         and game_hours(x) is not None and game_hours(x) >= 9), None
+    )
+    today_game = next((x for x in postgame if x["date"] == day), None)
+    fact = [
+        f"Окно между отходом ко сну и подъёмом: {f'{today_win} ч' if today_win is not None else 'нет данных'}"
+        " (не равняется фактическому сну).",
+        f"Пробуждение: {get(record, '5. Как')}; сонливость через 30–60 минут: {get(record, '6. Через')}.",
+        f"Тело: {get(record, '7. Что')}; внимание: {get(record, '8. Когда')}; "
+        f"простые решения: {get(record, '9. Простые')}.",
+        f"План дня: {get(record, 'Сегодня')}; "
+        f"возможные факторы: {get(record, '11. Что со вчера')}.",
+    ]
+    if today_game:
+        fact.append(f"Игра за дату отчёта: {game_hours(today_game)} ч; "
+                    f"автоматизм: {get(today_game, '5. Были ли моменты')}; "
+                    f"сбои: {get(today_game, '6. Были ли конкретные сбои')}.")
+    if prev:
+        fact.append(f"Относительно {prev['date'].strftime('%d.%m')}: сонливость "
+                    f"{get(prev, '6. Через')} → {get(record, '6. Через')}; "
+                    f"внимание {get(prev, '8. Когда')} → {get(record, '8. Когда')}.")
+    else:
+        fact.append("Нет предыдущего утреннего отчёта для сравнения.")
+    latest = stats(m3, g3)
+    week = stats(m7, g7)
+    cycle = stats(m_cycle, g_cycle)
+    notes = [
+        fmt_stats(latest, 3),
+        fmt_stats(week, 7),
+        f"Весь наблюдаемый период ({len(m_cycle)} утренних и {len(g_cycle)} постигровых): "
+        f"{cycle['game_hours']} ч игры в {cycle['known_game_hours']} сессиях; "
+        f"автоматизм {cycle['automatisms']}, сбои {cycle['lapses']}.",
+    ]
+    if len(previous_3) >= 2 and len(m3) >= 2:
+        notes.append("Сравнение 3 дней с предшествующими 3: "
+                     f"заметная сонливость {stats(previous_3, [])['noticeable_sleepiness']}"
+                     f" → {latest['noticeable_sleepiness']}, "
+                     f"замедление решений {stats(previous_3, [])['slower_decisions']}"
+                     f" → {latest['slower_decisions']} (число заполненных форм различается).")
+    if len(previous_7) >= 4 and len(m7) >= 4:
+        notes.append("Сравнение 7 дней с предыдущими 7: "
+                     f"заметная сонливость {stats(previous_7, [])['noticeable_sleepiness']}"
+                     f" → {week['noticeable_sleepiness']}.")
+    if len(m7) < 4:
+        notes.append("Для надёжной 7-дневной динамики данных недостаточно.")
+    notes.append(f"Последовательные игровые дни за 7 дней: {'есть' if consecutive else 'не подтверждены'}; "
+                 f"утренних дней отдыха {len(rest)}; "
+                 f"после игры 9+ ч накануне: {'да' if long_prev else 'нет подтверждения'}.")
+    notes.append(context_text())
+    independent_flags = [
+        get(record, "8. Когда").lower() == "часто",
+        get(record, "9. Простые").lower() == "заметно тяжелее обычного",
+        "признаки болезни" in get(record, "7. Что").lower(),
+        bool(long_prev and (get(record, "9. Простые").lower() != "как обычно")),
+    ]
+    if sum(independent_flags) >= 2:
+        proposal = ("Обсудить с куратором уменьшение дополнительной нагрузки, "
+                    "использовать контроль внимания на перерывах; не менять обязательную "
+                    "турнирную программу без отдельного решения.")
+    elif "признаки болезни" in get(record, "7. Что").lower():
+        proposal = "Учитывать признаки болезни и самочувствие отдельно от усталости; согласовать щадящий режим."
+    else:
+        proposal = ("Сохранить согласованный план с проверкой внимания на перерывах. "
+                    "Нет оснований автоматически снижать нагрузку только из-за длительного сна или одной сонливости.")
     return (
         f"📊 Everest | Алексей Жуков | {day.strftime('%d.%m.%Y')}\n\n"
-        "ФАКТ\n" + "\n".join(facts) + "\n\n"
-        f"НАБЛЮДЕНИЕ\n3 дня: {len(recent3)}/3 отчётов; 7 дней: {len(recent7)}/7; весь период: {len(records)}. {note}\n\n"
-        "ГИПОТЕЗА\nДлинный сон может отражать восстановление; сам по себе не доказывает перегрузку. "
-        "Оценка автоматизма и глубины анализа раздач требует постигровых данных.\n\n"
-        "ПРЕДЛАГАЕМОЕ РЕШЕНИЕ\nНе снижать нагрузку по длительности сна или одному признаку сонливости. "
-        "Сопоставить внимание, самочувствие, игру и фазу макроцикла. Решение предварительное, требуется подтверждение куратора."
+        "ФАКТ\n" + "\n".join(fact) + "\n\n"
+        "НАБЛЮДЕНИЕ\n" + "\n".join(notes) + "\n\n"
+        "ГИПОТЕЗА\nСонливость или длинное окно сна не доказывают накопленную усталость. "
+        "Влияние длительности и последовательности игр, перелётов и отдыха проверяется на сопоставимых сессиях.\n\n"
+        "ПРЕДЛАГАЕМОЕ РЕШЕНИЕ\n" + proposal
+        + "\nРекомендация предварительная. Решение принимает куратор."
     )
 
 
-def _worksheet(spreadsheet):
+def worksheet(spreadsheet):
     try:
-        return spreadsheet.worksheet(MONITOR_SHEET)
+        return spreadsheet.worksheet(LOG_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=LOG_TAB, rows=3000, cols=len(HEADERS))
+        ws.append_row(HEADERS)
+        return ws
+
+
+def _mark(ws, row_number, status, error=""):
+    ws.update(range_name=f"F{row_number}:G{row_number}",
+              values=[[status, error[:400]]])
+
+
+async def _send_once(bot, ws, records, event):
+    key, kind, day, due, text = event
+    if key in records:
+        return
+    ws.append_row([key, kind, day.isoformat(), due.isoformat(), text,
+                   "PENDING", "", ""])
+    row_number = len(ws.get_all_values())
+    records.add(key)
+    try:
+        _, _, chat_id = config()
+        await bot.send_message(chat_id=chat_id, text=text[:4096])
     except Exception as exc:
-        # Only create if the sheet is genuinely absent.
-        if exc.__class__.__name__ != "WorksheetNotFound":
-            raise
-        sheet = spreadsheet.add_worksheet(title=MONITOR_SHEET, rows=3000, cols=len(HEADERS))
-        sheet.append_row(HEADERS)
-        return sheet
+        logger.exception("Zhukov monitor notification failed for %s", key)
+        # Do not automatically retry ambiguous network failures: no duplicate alerts.
+        _mark(ws, row_number, "REVIEW", f"{type(exc).__name__}: {exc}")
+        return
+    _mark(ws, row_number, "SENT")
 
 
 async def tick(bot, spreadsheet, now=None):
-    """Periodic polling; persistent keys prevent duplicate Telegram sends after restart.
-
-    Delivery is at-least-once on ambiguous Telegram/network failures; pending rows
-    are retained for diagnosis. Only curator chat receives reports.
-    """
-    if not ENABLED or not CURATOR_CHAT:
+    if not enabled():
         return
-    tz = ZoneInfo(TIMEZONE)
-    now = now or datetime.now(tz)
-    morning = spreadsheet.worksheet(os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы"))
-    records = normalize_records(morning.get_all_values(), tz)
-    if not records:
-        return
-    ledger = _worksheet(spreadsheet)
-    rows = ledger.get_all_values()
-    known = {row[0] for row in rows[1:] if row}
-    anchor = next((r["timestamp"] for r in records if r["timestamp"]), None)
-    if not anchor:
-        log.warning("Zhukov monitor: missing anchor timestamp")
-        return
-    latest = {r["date"]: r for r in records}
-    events = []
-    for day, due in due_days(anchor, now):
-        if day not in latest:
-            key = f"zhukov:missing:{day.isoformat()}"
-            events.append((key, "MISSING", day, due, f"⚠️ Алексей Жуков: нет утреннего отчёта за {day.strftime('%d.%m.%Y')}. Контрольное время: {due.strftime('%H:%M')} ({TIMEZONE})."))
-    for record in records:
-        key = f"zhukov:analysis:{record['date'].isoformat()}:{hashlib.sha256(json.dumps(record['fields'],sort_keys=True,ensure_ascii=False).encode()).hexdigest()[:12]}"
-        if record["date"] >= anchor.date() and record["timestamp"] and record["timestamp"] <= now:
-            events.append((key, "ANALYSIS", record["date"], record["timestamp"], report_text(record, records)))
-    # Backfill analysis only for latest 7 days; avoid flooding curator with historical data.
-    for key, kind, day, when, message in events:
-        if key in known or (kind == "ANALYSIS" and day < now.date() - timedelta(days=7)):
-            continue
-        ledger.append_row([key, kind, day.isoformat(), when.isoformat(), message, "PENDING", ""])
-        known.add(key)
-        try:
-            await bot.send_message(chat_id=int(CURATOR_CHAT), text=message[:4096])
-        except Exception as exc:
-            log.exception("Zhukov curator notification failed: %s", key)
-            continue
-        # Mark sent in persistent sheet. If Telegram succeeded but sheet update
-        # failed, PENDING remains; do not blindly resend ambiguous deliveries.
-        ledger.update_cell(len(ledger.get_all_values()), 6, "SENT")
+    async with _lock:
+        tz, sheet_tz, _ = config()
+        now = (now or datetime.now(tz)).astimezone(tz)
+        morning_tab = spreadsheet.worksheet(os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы"))
+        game_tab = spreadsheet.worksheet(os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы"))
+        morning = normalize_records(morning_tab.get_all_values(), sheet_tz)
+        postgame = normalize_records(game_tab.get_all_values(), sheet_tz)
+        if not morning:
+            logger.warning("Zhukov monitor: no dated morning reports")
+            return
+        log_tab = worksheet(spreadsheet)
+        log_rows = log_tab.get_all_values()
+        known = {row[0] for row in log_rows[1:] if row}
+        activated = next(
+            (parse_date(row[2]) for row in log_rows[1:]
+             if row and row[0] == "zhukov:monitor:activation"), None
+        )
+        if not activated:
+            activated = now.date()
+            log_tab.append_row(["zhukov:monitor:activation", "CONFIG",
+                                activated.isoformat(), now.isoformat(),
+                                "First enabled date; no historical missed-day flood.",
+                                "SENT", "", ""])
+            known.add("zhukov:monitor:activation")
+        ref = anchor_local(morning, tz)
+        if not ref:
+            logger.error("Zhukov monitoring: reference report timestamp unavailable")
+            return
+        # Do not reinterpret completed reports when a form was submitted late.
+        has_report = {r["date"] for r in morning}
+        events = []
+        for day, deadline in due_checks(ref, now, activated):
+            if day not in has_report:
+                events.append((
+                    f"zhukov:missing:{day.isoformat()}", "MISSING",
+                    day, deadline,
+                    f"⚠️ Everest | Алексей Жуков\nУтренний отчёт за "
+                    f"{day.strftime('%d.%m.%Y')} отсутствует на контрольный момент "
+                    f"{deadline.strftime('%H:%M')} ({getattr(tz,'key',str(tz))}). "
+                    "Напоминание куратору, не Алексею.",
+                ))
+        for record in morning:
+            day = record["date"]
+            if day < activated or not record["timestamp"]:
+                continue
+            if record["timestamp"].astimezone(tz) > now:
+                continue
+            # One curator analysis per day. A late form is still analyzed.
+            events.append((f"zhukov:analysis:{day.isoformat()}", "ANALYSIS",
+                           day, record["timestamp"], report_text(record, morning, postgame)))
+        for item in sorted(events, key=lambda x: (x[2], x[1])):
+            await _send_once(bot, log_tab, known, item)
