@@ -163,6 +163,108 @@ class PureLogicTests(unittest.TestCase):
         self.assertTrue(m.concrete_lapse(rec))
 
 
+
+class HistoricalReportsTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {
+            "ZHUKOV_SHEET_TIMEZONE": "Europe/Moscow",
+            "ZHUKOV_MACROCYCLE_PHASE": "prepeak",
+            "ZHUKOV_PRIORITY_TOURNAMENTS": "Demo tournament",
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.book = Spreadsheet([
+            HEAD,
+            morning("19.10.2026 07:00:00", "19.10.2026"),
+            morning("20.10.2026 08:00:00", "20.10.2026"),
+        ])
+
+    def test_original_sent_report_is_replayed_verbatim(self):
+        sheet = self.book.add_worksheet(m.LOG_TAB, rows=100, cols=8)
+        sheet.append_row(m.HEADERS)
+        original = "📊 Сохранённый отчёт: факты и рекомендации за 20 октября."
+        sheet.append_row([
+            "zhukov:analysis:2026-10-20", "ANALYSIS",
+            "2026-10-20", "2026-10-20T08:00:00+03:00",
+            original, "SENT", "", "",
+        ])
+        # A stored curator decision should be visible with the original report.
+        sheet.append_row([
+            "zhukov:decision:2026-10-20:abc", "CURATOR_DECISION",
+            "2026-10-20", "2026-10-20T11:00:00+03:00",
+            "Куратор: сохранить нагрузку", "CONFIRMED", "",
+            "сохранить нагрузку",
+        ])
+        before = sheet.get_all_values()
+        result = m.read_curator_report(self.book, date(2026, 10, 20))
+        self.assertIn("💾 История Everest", result)
+        self.assertIn(original, result)
+        self.assertIn("сохранить нагрузку", result)
+        self.assertEqual(sheet.get_all_values(), before)
+        self.assertEqual(len(self.book.worksheet("Утро — ответы").rows), 3)
+
+    def test_reconstructed_historical_report_does_not_use_current_phase(self):
+        result = m.read_curator_report(self.book, date(2026, 10, 19))
+        self.assertIn("Ретроспективная", result)
+        self.assertIn("ФАКТ", result)
+        self.assertIn("НАБЛЮДЕНИЕ", result)
+        self.assertIn("ГИПОТЕЗА", result)
+        self.assertIn("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ", result)
+        self.assertIn("исторические данные не подключены", result)
+        self.assertNotIn("Demo tournament", result)
+        self.assertNotIn("prepeak", result)
+        self.assertEqual(m.read_curator_report(self.book)[:2], "🔎")
+
+    def test_history_index_and_date_selection(self):
+        sheet = self.book.add_worksheet(m.LOG_TAB, rows=100, cols=8)
+        sheet.append_row(m.HEADERS)
+        sheet.append_row([
+            "zhukov:missing:2026-10-21", "MISSING",
+            "2026-10-21", "2026-10-21T14:00:00+03:00",
+            "Пропущен утренний отчёт", "SENT", "", "",
+        ])
+        sheet.append_row([
+            "zhukov:monitor:activation", "CONFIG",
+            "2026-11-01", "", "", "SENT", "", "",
+        ])
+        listing = m.read_curator_history(self.book, limit=3)
+        self.assertIn("21.10.2026 — ⚠️ пропуск срока", listing)
+        self.assertIn("20.10.2026 — 🔎 утренняя анкета", listing)
+        self.assertNotIn("01.11.2026", listing)
+        missing = m.read_curator_report(self.book, date(2026, 10, 21))
+        self.assertIn("зафиксирован пропуск", missing)
+        empty = m.read_curator_report(self.book, date(2026, 10, 18))
+        self.assertIn("Это не доказательство пропуска", empty)
+
+    def test_only_postgame_report_still_available(self):
+        self.book.worksheet("Утро — ответы").rows = [HEAD]
+        self.book.worksheet("После игры — ответы").rows = [
+            ["Отметка времени", "Дата", "1. Сколько часов фактически играл сегодня?"],
+            ["20.10.2026 22:00:00", "20.10.2026", "6"],
+        ]
+        result = m.read_curator_report(self.book, date(2026, 10, 20))
+        self.assertIn("Утреннего чек-листа за эту дату нет", result)
+        self.assertIn("Фактическая игра: 6.0 ч", result)
+
+    def test_pending_report_not_represented_as_delivered(self):
+        sheet = self.book.add_worksheet(m.LOG_TAB, rows=100, cols=8)
+        sheet.append_row(m.HEADERS)
+        sheet.append_row([
+            "zhukov:analysis:2026-10-20", "ANALYSIS",
+            "2026-10-20", "", "UNDELIVERED CONTENT",
+            "REVIEW", "Telegram error", "",
+        ])
+        result = m.read_curator_report(self.book, date(2026, 10, 20))
+        self.assertIn("Ретроспективная", result)
+        self.assertNotIn("UNDELIVERED CONTENT", result)
+
+    def test_long_reports_are_not_truncated(self):
+        report = "ФАКТ " * 2200
+        parts = m.split_telegram_text(report)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(p) <= 3400 for p in parts))
+        self.assertEqual("".join(parts), report)
+
 class MonitoringTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         cfg = {
