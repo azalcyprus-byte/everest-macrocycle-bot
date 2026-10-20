@@ -136,6 +136,8 @@ def signal_snapshot(record, morning, get):
 
 
 def _fallback_observation(snapshot):
+    if snapshot["has_illness"]:
+        return "Отмечен сигнал недомогания, не позволяющий судить о влиянии игровой нагрузки."
     if snapshot["deteriorations"]:
         changes = ", ".join(snapshot["deteriorations"])
         return "В сравнении с предыдущим близким отчётом ухудшились: " + changes + "."
@@ -163,16 +165,12 @@ def render(record, morning, games, get, insight=None, *, ai_unavailable=False):
     snapshot = signal_snapshot(record, morning, get)
     observed = _fallback_observation(snapshot)
     chosen_observation = _one_line((insight or {}).get("observation"), 190)
+    # With fewer than three recent observations, never replace verified
+    # changes with an AI extrapolation or attribute symptoms to a cause.
     if insight is not None and snapshot["count7"] >= 3:
         observed = chosen_observation or observed
-    elif insight is not None and snapshot["deteriorations"]:
-        observed = chosen_observation or observed
-    # When data are sparse, force the verifiable Python observation instead
-    # of an AI's causal-sounding or ungrounded narrative.
     hypothesis = _one_line((insight or {}).get("hypothesis"), 160)
-    if (snapshot["count7"] < 3
-            and not snapshot["deteriorations"]
-            and not snapshot["caution"]):
+    if snapshot["count7"] < 3:
         hypothesis = ""
     if not hypothesis:
         hypothesis = "Проверяемой закономерности пока не выявлено."
