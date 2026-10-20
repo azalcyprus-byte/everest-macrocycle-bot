@@ -130,7 +130,8 @@ def sleep_window(rec):
         a = datetime.strptime(get(rec, "1. Во сколько лег")[:5], "%H:%M")
         b = datetime.strptime(get(rec, "2. Во сколько окончательно")[:5], "%H:%M")
         diff = (b - a).total_seconds() / 3600
-        return round(diff if diff >= 0 else diff + 24, 1)
+        diff = diff if diff >= 0 else diff + 24
+        return round(diff, 1) if diff > 0 else None  # equal times are ambiguous
     except (TypeError, ValueError):
         return None
 
@@ -319,6 +320,30 @@ def report_text(record, morning, postgame):
                      f" → {week['noticeable_sleepiness']}.")
     if len(m7) < 4:
         notes.append("Для надёжной 7-дневной динамики данных недостаточно.")
+    long_pairs = [
+        (game, next_morning)
+        for game in g7 if game_hours(game) is not None and game_hours(game) >= 9
+        for next_morning in m7 if next_morning["date"] == game["date"] + timedelta(days=1)
+    ]
+    after_rest = [
+        (rest_day, next_morning)
+        for rest_day in rest
+        for next_morning in m7 if next_morning["date"] == rest_day["date"] + timedelta(days=1)
+    ]
+    if long_pairs:
+        next_sleepy = sum("заметная" in get(morn, "6. Через").lower()
+                          for _, morn in long_pairs)
+        notes.append(f"После игровых дней 9+ ч: {len(long_pairs)} утренних наблюдений, "
+                     f"заметная сонливость {next_sleepy}; сравнение без доказательства причины.")
+    else:
+        notes.append("После игровых дней 9+ ч: недостаточно пар «игра → следующее утро».")
+    if after_rest:
+        normal = sum(get(morn, "9. Простые").lower() == "как обычно"
+                     for _, morn in after_rest)
+        notes.append(f"После дней отдыха: {len(after_rest)} наблюдений, "
+                     f"обычный темп решений {normal}; эффект отдыха пока не установлен.")
+    else:
+        notes.append("Эффект дней отдыха: недостаточно пар «отдых → следующее утро».")
     notes.append(f"Последовательные игровые дни за 7 дней: {'есть' if consecutive else 'не подтверждены'}; "
                  f"утренних дней отдыха {len(rest)}; "
                  f"после игры 9+ ч накануне: {'да' if long_prev else 'нет подтверждения'}.")
