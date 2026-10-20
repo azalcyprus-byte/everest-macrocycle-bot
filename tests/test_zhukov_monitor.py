@@ -268,6 +268,24 @@ class HistoricalReportsTests(unittest.TestCase):
         self.assertEqual("".join(parts), report)
 
 
+    def test_manual_ai_date_reader_does_not_write(self):
+        before = {
+            name: sheet.get_all_values()
+            for name, sheet in self.book.tabs.items()
+        }
+        data = m.read_ai_report_inputs(self.book, date(2026, 10, 20))
+        self.assertIsNotNone(data)
+        report, record, morning, games = data
+        self.assertEqual(record["date"], date(2026, 10, 20))
+        self.assertIn("ФАКТ", report)
+        self.assertIn("исторические данные не подключены", report)
+        self.assertIsNone(m.read_ai_report_inputs(self.book, date(2026, 10, 18)))
+        self.assertEqual(before, {
+            name: sheet.get_all_values()
+            for name, sheet in self.book.tabs.items()
+        })
+
+
 class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.target = {
@@ -394,6 +412,46 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.payload["text"]["format"]["type"], "json_schema")
         self.assertNotIn("Жуков", fake.payload["input"])
         self.assertNotIn("Владивосток", fake.payload["input"])
+
+    async def test_manual_ai_refuses_disabled_or_missing_configuration(self):
+        args = (self.base_report, self.target, [self.target], [],
+                m.get, m.sleep_window, m.game_hours,
+                m.automation, m.concrete_lapse, m.quality_drop)
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "false",
+            "OPENAI_API_KEY": "test-placeholder",
+        }):
+            with self.assertRaisesRegex(ai.AIAnalysisError, "AI выключен"):
+                await ai.enrich_report(*args, strict=True)
+            self.assertEqual(await ai.enrich_report(*args), self.base_report)
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "true",
+            "OPENAI_API_KEY": "",
+        }):
+            with self.assertRaisesRegex(ai.AIAnalysisError, "OPENAI_API_KEY"):
+                await ai.enrich_report(*args, strict=True)
+
+    async def test_manual_ai_rejects_incomplete_api_response(self):
+        class Response:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            def raise_for_status(self): pass
+            async def json(self): return {"status": "incomplete", "output": []}
+        class Session:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            def post(self, *args, **kwargs): return Response()
+        args = (self.base_report, self.target, [self.target], [],
+                m.get, m.sleep_window, m.game_hours,
+                m.automation, m.concrete_lapse, m.quality_drop)
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "true",
+            "OPENAI_API_KEY": "test-placeholder",
+        }):
+            with patch("zhukov_ai.aiohttp.ClientSession", return_value=Session()):
+                with self.assertRaisesRegex(ai.AIAnalysisError, "не вернул полный"):
+                    await ai.enrich_report(*args, strict=True)
+                self.assertEqual(await ai.enrich_report(*args), self.base_report)
 
     async def test_long_ai_report_delivered_in_multiple_messages(self):
         env = patch.dict(os.environ, {

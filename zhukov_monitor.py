@@ -423,6 +423,37 @@ def _audit_saved_report(audit_rows, day):
     return None
 
 
+def read_ai_report_inputs(spreadsheet, day):
+    """Read only historical Forms, without writing audit rows or calling OpenAI.
+
+    The report text is generated retrospectively from data available through
+    the selected day; future entries and current macrocycle context are excluded.
+    Returns None when the requested day has no morning questionnaire.
+    """
+    if not isinstance(day, date):
+        raise ValueError("A specific report date is required.")
+    sheet_tz = ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai"))
+    morning_tab = spreadsheet.worksheet(
+        os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы")
+    )
+    game_tab = spreadsheet.worksheet(
+        os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы")
+    )
+    morning = [
+        row for row in normalize_records(morning_tab.get_all_values(), sheet_tz)
+        if row["date"] <= day
+    ]
+    postgame = [
+        row for row in normalize_records(game_tab.get_all_values(), sheet_tz)
+        if row["date"] <= day
+    ]
+    target = next((row for row in morning if row["date"] == day), None)
+    if target is None:
+        return None
+    return (report_text(target, morning, postgame, historical=True),
+            target, morning, postgame)
+
+
 def read_curator_report(spreadsheet, day=None):
     """Return a saved sent report or an explicitly labelled historical reconstruction.
 

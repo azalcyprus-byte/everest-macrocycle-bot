@@ -9,6 +9,7 @@ import threading
 import time as time_module
 import uuid
 import zhukov_monitor
+import zhukov_ai
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -5361,6 +5362,87 @@ async def start_zhukov_morning_session(
         )
 
 
+async def zhukovai(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Read-only OpenAI check for an existing morning report on a specified date."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+
+    args = context.args or []
+    if len(args) != 1 or zhukov_monitor.parse_date(args[0]) is None:
+        await update.effective_message.reply_text(
+            "Формат: /zhukovai 20.10.2026\n"
+            "Можно указать дату как 2026-10-20.\n"
+            "AI проверит существующую утреннюю анкету; ничего не запишет в таблицу."
+        )
+        return
+
+    target_day = zhukov_monitor.parse_date(args[0])
+    try:
+        book = await asyncio.to_thread(get_zhukov_spreadsheet)
+        source = await asyncio.to_thread(
+            zhukov_monitor.read_ai_report_inputs, book, target_day,
+        )
+    except Exception:
+        logger.exception("Zhukov manual OpenAI source read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать анкеты из Google Sheets. "
+            "Исходные данные не изменены."
+        )
+        return
+
+    if source is None:
+        await update.effective_message.reply_text(
+            f"За {target_day.strftime('%d.%m.%Y')} нет утреннего чек-листа.\n"
+            "AI-проверка не выполнена; укажи дату из /zhukovhistory."
+        )
+        return
+
+    report, record, morning, games = source
+    try:
+        await update.effective_message.reply_text(
+            "⏳ Отправляю обезличенные показатели в OpenAI. "
+            "Результат будет только в этом чате; история не изменится."
+        )
+        enriched = await zhukov_ai.enrich_report(
+            report, record, morning, games,
+            zhukov_monitor.get,
+            zhukov_monitor.sleep_window,
+            zhukov_monitor.game_hours,
+            zhukov_monitor.automation,
+            zhukov_monitor.concrete_lapse,
+            zhukov_monitor.quality_drop,
+            strict=True,
+        )
+    except zhukov_ai.AIAnalysisError as exc:
+        await update.effective_message.reply_text(
+            f"❌ AI-проверка за {target_day.strftime('%d.%m.%Y')} не выполнена.\n"
+            + str(exc)
+        )
+        return
+    except Exception:
+        logger.exception("Zhukov on-demand OpenAI analysis failed")
+        await update.effective_message.reply_text(
+            "❌ AI-проверка не выполнена из-за технической ошибки. "
+            "Исходные анкеты и сохранённая история не изменены."
+        )
+        return
+
+    response = (
+        f"🧪 Everest | AI-анализ за {target_day.strftime('%d.%m.%Y')}\n"
+        "Создан по запросу куратора сейчас, не сохраняется в журнал. "
+        "Гипотезы предварительные.\n\n"
+        + enriched
+    )
+    for part in zhukov_monitor.split_telegram_text(response):
+        await update.effective_message.reply_text(part)
+
+
 async def zhukovreport(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8713,6 +8795,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("zhukovtest", zhukovtest))
     telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
     telegram_app.add_handler(CommandHandler("zhukovreport", zhukovreport))
+    telegram_app.add_handler(CommandHandler("zhukovai", zhukovai))
     telegram_app.add_handler(CommandHandler("zhukovhistory", zhukovhistory))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
