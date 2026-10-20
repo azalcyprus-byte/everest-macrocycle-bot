@@ -8,6 +8,8 @@ from datetime import timedelta
 import json
 import re
 
+import zhukov_plan
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -77,6 +79,30 @@ def parse_response(response):
                 "curator_action": _one_line(data["curator_action"], 175),
             }
     return None
+
+
+_NO_GAME_CHOICES = {
+    "перелёт": "перелёт",
+    "перелет": "перелёт",
+    "отдых": "отдых",
+    "учёба": "учёба",
+    "учеба": "учёба",
+    "без игры": "без игры",
+}
+
+
+def declared_game_day(record, get):
+    """The trainee's declaration is independent from macrocycle load type.
+
+    'Игра' means a declared playing day, not proof of actual participation;
+    the separate postgame form is the source for completed sessions.
+    """
+    choice = get(record, "Сегодня").strip().lower()
+    if choice == "игра":
+        return "Да (заявлено утром)"
+    if choice in _NO_GAME_CHOICES:
+        return "Нет (" + _NO_GAME_CHOICES[choice] + ")"
+    return "не указан"
 
 
 def _features(rec, get):
@@ -156,7 +182,8 @@ def _fallback_action(snapshot):
     return "Сохранить согласованный план и сравнить внимание в следующем отчёте."
 
 
-def render(record, morning, games, get, insight=None, *, ai_unavailable=False):
+def render(record, morning, games, get, insight=None, *,
+           ai_unavailable=False, plan_type=None):
     """Render ONE compact plain-text Telegram brief.
 
     User-facing text retains only a conclusion, a genuinely useful change,
@@ -181,9 +208,14 @@ def render(record, morning, games, get, insight=None, *, ai_unavailable=False):
     elif not action or re.search(r"\b(снизить|уменьшить|сократить|отменить)\b", action, re.I):
         action = _fallback_action(snapshot)
 
+    plan_code = zhukov_plan.planned_type_for(
+        {record["date"]: plan_type}, record["date"]
+    )
     brief = (
         "🏔️ Everest | Алексей Жуков | "
         + record["date"].strftime("%d.%m.%Y")
+        + "\n📅 План нагрузки: " + (plan_code or "не указан")
+        + "\n🎮 Игровой день: " + declared_game_day(record, get)
         + "\n\n" + snapshot["status"]
         + "\n\n🔎 Значимые изменения\n" + observed
         + "\n\n💡 Гипотеза\n" + hypothesis
