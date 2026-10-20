@@ -12,6 +12,7 @@ import os
 from zoneinfo import ZoneInfo
 
 import gspread
+import aiohttp
 
 logger = logging.getLogger(__name__)
 LOG_TAB = "Everest_Алексей_мониторинг"
@@ -207,6 +208,51 @@ def context_text():
             f"{tournaments or 'не указаны'} (только сведения, заданные куратором).")
 
 
+
+async def maybe_ai_commentary(report):
+    """Optional extra qualitative critique, strictly nonessential for alert delivery."""
+    if os.getenv("ZHUKOV_MONITOR_OPENAI_ENABLED", "").lower() not in _ENABLED:
+        return ""
+    key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        logger.warning("Zhukov OpenAI analysis enabled without OPENAI_API_KEY")
+        return ""
+    payload = {
+        "model": os.getenv("ZHUKOV_MONITOR_OPENAI_MODEL", "gpt-4.1-mini"),
+        "instructions": (
+            "Ты эксперт Everest по покерной работоспособности. "
+            "Используй только предоставленные сведения. "
+            "Отделяй факты, наблюдения, гипотезы и предложения. "
+            "Не ставь диагнозов и не придумывай статистику. "
+            "Не присваивай рейтинг готовности от 0 до 100. "
+            "Не трактуй сон более восьми часов как самостоятельный сигнал усталости. "
+            "Дай 2–3 проверяемые гипотезы для куратора, не больше 100 слов. "
+            "Решение о нагрузке принимает куратор."
+        ),
+        "input": report,
+        "max_output_tokens": 230,
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://api.openai.com/v1/responses",
+                json=payload,
+                headers={"Authorization": f"Bearer {key}"},
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+        chunks = []
+        for item in data.get("output", []):
+            for value in item.get("content", []):
+                if value.get("type") == "output_text" and value.get("text"):
+                    chunks.append(value["text"])
+        return "\n\nДОПОЛНИТЕЛЬНЫЙ АНАЛИЗ AI (не решение)\n" + "\n".join(chunks) if chunks else ""
+    except Exception:
+        logger.exception("Optional Zhukov OpenAI analysis unavailable; use deterministic report")
+        return ""
+
+
 def report_text(record, morning, postgame):
     day = record["date"]
     m3 = [x for x in morning if day - timedelta(days=2) <= x["date"] <= day]
@@ -217,7 +263,10 @@ def report_text(record, morning, postgame):
     previous_3 = [x for x in morning if day - timedelta(days=5) <= x["date"] < day - timedelta(days=2)]
     previous_7 = [x for x in morning if day - timedelta(days=13) <= x["date"] < day - timedelta(days=6)]
     g_cycle = [x for x in postgame if x["date"] <= day]
-    m_cycle = [x for x in morning if x["date"] <= day]
+    macro_start = parse_date(os.getenv("ZHUKOV_MACROCYCLE_START_DATE", ""))
+    m_cycle = [x for x in morning if x["date"] <= day and
+               (macro_start is None or x["date"] >= macro_start)]
+    g_cycle = [x for x in g_cycle if macro_start is None or x["date"] >= macro_start]
     today_win = sleep_window(record)
     rest = [x for x in m7 if get(x, "Сегодня").lower() == "отдых"]
     consecutive = any(
@@ -404,5 +453,9 @@ async def tick(bot, spreadsheet, now=None):
             # One curator analysis per day. A late form is still analyzed.
             events.append((f"zhukov:analysis:{day.isoformat()}", "ANALYSIS",
                            day, record["timestamp"], report_text(record, morning, postgame)))
-        for item in sorted(events, key=lambda x: (x[2], x[1])):
-            await _send_once(bot, log_tab, known, item)
+        for key, kind, day, when, message in sorted(events, key=lambda x: (x[2], x[1])):
+            if key in known:
+                continue
+            if kind == "ANALYSIS":
+                message += await maybe_ai_commentary(message)
+            await _send_once(bot, log_tab, known, (key, kind, day, when, message))
