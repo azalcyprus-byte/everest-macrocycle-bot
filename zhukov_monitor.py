@@ -291,7 +291,7 @@ async def maybe_ai_commentary(report):
         return ""
 
 
-def report_text(record, morning, postgame):
+def report_text(record, morning, postgame, historical=False):
     day = record["date"]
     m3 = [x for x in morning if day - timedelta(days=2) <= x["date"] <= day]
     m7 = [x for x in morning if day - timedelta(days=6) <= x["date"] <= day]
@@ -384,7 +384,11 @@ def report_text(record, morning, postgame):
     notes.append(f"Последовательные игровые дни за 7 дней: {'есть' if consecutive else 'не подтверждены'}; "
                  f"утренних дней отдыха {len(rest)}; "
                  f"после игры 9+ ч накануне: {'да' if long_prev else 'нет подтверждения'}.")
-    notes.append(context_text())
+    if historical:
+        notes.append("Фаза макроцикла и приоритетные турниры на эту дату: "
+                     "исторические данные не подключены; текущие настройки не переносим в прошлое.")
+    else:
+        notes.append(context_text())
     independent_flags = [
         get(record, "8. Когда").lower() == "часто",
         get(record, "9. Простые").lower() == "заметно тяжелее обычного",
@@ -409,6 +413,186 @@ def report_text(record, morning, postgame):
         "ПРЕДЛАГАЕМОЕ РЕШЕНИЕ\n" + proposal
         + "\nРекомендация предварительная. Решение принимает куратор."
     )
+
+
+
+def _historical_rows(spreadsheet):
+    """Read Alexey's isolated history without creating or editing worksheets."""
+    sheet_tz = ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai"))
+    morning_tab = spreadsheet.worksheet(os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы"))
+    game_tab = spreadsheet.worksheet(os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы"))
+    morning = normalize_records(morning_tab.get_all_values(), sheet_tz)
+    postgame = normalize_records(game_tab.get_all_values(), sheet_tz)
+    try:
+        audit = spreadsheet.worksheet(LOG_TAB).get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        audit = [HEADERS]
+    return morning, postgame, audit[1:]
+
+
+def _audit_type(row):
+    return str(row[1]).strip() if len(row) > 1 else ""
+
+
+def _audit_day(row):
+    return parse_date(row[2]) if len(row) > 2 else None
+
+
+def _audit_decisions(audit_rows, day):
+    """Confirmed curator decisions, independent of report delivery."""
+    return [
+        str(row[7] if len(row) > 7 and row[7] else row[4]).strip()
+        for row in audit_rows
+        if _audit_type(row) == "CURATOR_DECISION"
+        and _audit_day(row) == day
+        and len(row) > 4
+    ]
+
+
+def _audit_saved_report(audit_rows, day):
+    """Return only a report that is confirmed sent to the curator."""
+    for row in audit_rows:
+        if (_audit_type(row) == "ANALYSIS" and _audit_day(row) == day
+                and len(row) > 5 and row[5] == "SENT" and row[4]):
+            return row[4]
+    return None
+
+
+def read_curator_report(spreadsheet, day=None):
+    """Return a saved sent report or an explicitly labelled historical reconstruction.
+
+    Read-only by design. Do not send alerts, modify Forms, call OpenAI, or
+    recreate historical context using today's macrocycle phase.
+    """
+    morning, postgame, audit = _historical_rows(spreadsheet)
+    morning_by_day = {rec["date"]: rec for rec in morning}
+    games_by_day = {rec["date"]: rec for rec in postgame}
+    if day is None:
+        available = sorted(
+            set(morning_by_day)
+            | set(games_by_day)
+            | {_audit_day(row) for row in audit if _audit_type(row) in ("ANALYSIS", "MISSING")}
+            - {None}
+        )
+        if not available:
+            return "📚 Everest | Алексей Жуков\nПока нет ни одного отчёта."
+        day = available[-1]
+    if not isinstance(day, date):
+        raise ValueError("Report date must be a date")
+    date_label = day.strftime("%d.%m.%Y")
+    notes = _audit_decisions(audit, day)
+    saved = _audit_saved_report(audit, day)
+    if saved:
+        text = (
+            f"💾 История Everest — {date_label}\n"
+            "Оригинальная сохранённая сводка (отправлена куратору).\n\n"
+            + saved
+        )
+    elif day in morning_by_day:
+        text = (
+            f"🔎 Архив Everest — {date_label}\n"
+            "Ретроспективная сводка, рассчитанная сейчас по существующим анкетам. "
+            "Не является копией прежнего Telegram-сообщения; данные могли быть исправлены позже.\n\n"
+            + report_text(morning_by_day[day], morning, postgame, historical=True)
+        )
+    elif day in games_by_day:
+        game = games_by_day[day]
+        text = (
+            f"🎲 Everest | Алексей Жуков | {date_label}\n\n"
+            "Утреннего чек-листа за эту дату нет. Есть отчёт после игры:\n"
+            f"Фактическая игра: {get(game, '1. Сколько часов фактически')} ч.\n"
+            f"Автоматизм: {get(game, '5. Были ли моменты')}.\n"
+            f"Конкретные сбои: {get(game, '6. Были ли конкретные сбои')}.\n\n"
+            "Аналитику утреннего состояния без анкеты сформировать нельзя."
+        )
+    else:
+        missed = [
+            row for row in audit
+            if _audit_type(row) == "MISSING" and _audit_day(row) == day
+        ]
+        if missed:
+            text = (
+                f"⚠️ Everest | Алексей Жуков | {date_label}\n"
+                "В истории зафиксирован пропуск утреннего отчёта.\n\n"
+                + (str(missed[0][4]) if len(missed[0]) > 4 else "")
+            )
+        else:
+            text = (
+                f"📭 Everest | Алексей Жуков | {date_label}\n"
+                "Нет утренней анкеты, постигрового отчёта или сохранённой сводки "
+                "за эту дату. Это не доказательство пропуска контрольного срока."
+            )
+    if notes:
+        text += "\n\n✅ Решения куратора:\n" + "\n".join(
+            f"— {item}" for item in notes
+        )
+    return text
+
+
+def read_curator_history(spreadsheet, limit=15):
+    """Compact index of real submitted dates and independently recorded misses."""
+    limit = max(1, min(int(limit), 30))
+    morning, postgame, audit = _historical_rows(spreadsheet)
+    morning_dates = {item["date"] for item in morning}
+    game_dates = {item["date"] for item in postgame}
+    sent = {
+        _audit_day(row) for row in audit
+        if _audit_type(row) == "ANALYSIS" and len(row) > 5 and row[5] == "SENT"
+    }
+    missing = {_audit_day(row) for row in audit if _audit_type(row) == "MISSING"}
+    decisions = {
+        _audit_day(row) for row in audit if _audit_type(row) == "CURATOR_DECISION"
+    }
+    days = sorted(
+        (morning_dates | game_dates | sent | missing | decisions) - {None},
+        reverse=True,
+    )[:limit]
+    if not days:
+        return "📚 Everest | Алексей Жуков\nИстория пока пуста."
+    lines = [f"📚 Everest | Алексей Жуков\nПоследние {len(days)} дат с данными:\n"]
+    for day in days:
+        tags = []
+        if day in sent:
+            tags.append("💾 сохранённая сводка")
+        elif day in morning_dates:
+            tags.append("🔎 утренняя анкета")
+        elif day in game_dates:
+            tags.append("🎲 после игры")
+        if day in missing:
+            tags.append("⚠️ пропуск срока")
+        if day in decisions:
+            tags.append("✅ решение")
+        lines.append(f"{day.strftime('%d.%m.%Y')} — {', '.join(tags)}")
+    lines.extend([
+        "",
+        "Открыть день: /zhukovreport 20.10.2026",
+        "Последний доступный: /zhukovreport",
+        "Показать больше дат: /zhukovhistory 30",
+        "",
+        "🔎 — пересчёт из существующих анкет, 💾 — оригинальный сохранённый отчёт."
+    ])
+    return "\n".join(lines)
+
+
+def split_telegram_text(text, max_chars=3400):
+    """Split an arbitrarily long analysis without truncating its conclusion."""
+    if max_chars < 250:
+        raise ValueError("max_chars must be at least 250")
+    chunks = []
+    remaining = str(text)
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, max_chars + 1)
+        if cut < max_chars // 3:
+            cut = max_chars
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:]
+        else:
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut + 1:]
+    return chunks
 
 
 def worksheet(spreadsheet):
