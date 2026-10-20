@@ -108,14 +108,13 @@ class PlannedLoadTests(unittest.TestCase):
         self.assertIsNone(plan.planned_type_for(self.types, date(2027, 10, 20)))
         self.assertIsNone(plan.planned_type_for(self.types, date(2026, 11, 11)))
         self.assertIsNone(plan.planned_type_for({}, date(2026, 10, 20)))
-        self.assertEqual(
-            brief.render(
-                record("2026-11-11", "игра"),
-                [record("2026-11-11", "игра")],
-                [], get_value, plan_type=None,
-            ).splitlines()[1],
-            "📅 План нагрузки: не указан",
+        rendered = brief.render(
+            record("2026-11-11", "игра"),
+            [record("2026-11-11", "игра")],
+            [], get_value, plan_type=None,
         )
+        self.assertEqual(rendered.splitlines()[1], "Утренний отчёт")
+        self.assertIn("📅 План нагрузки: не указан", rendered)
 
     def test_conflicting_rows_do_not_create_fictional_plan(self):
         rows = self.rows + [["20.10", "Стабилизация", "T", "10.0"]]
