@@ -88,7 +88,7 @@ def anchor_local(records, user_tz):
         return stamp.replace(tzinfo=user_tz) if stamp.tzinfo is None else stamp.astimezone(user_tz)
     for rec in records:
         if rec["timestamp"]:
-            return rec["timestamp"].astimezone(user_tz)
+            return rec["timestamp"].replace(tzinfo=user_tz)  # sheet display time treated as anchor wall time
     return None
 
 
@@ -346,6 +346,22 @@ async def tick(bot, spreadsheet, now=None):
         if not morning:
             logger.warning("Zhukov monitor: no dated morning reports")
             return
+        # GAS source events are optional until the spreadsheet trigger is installed.
+        # In script mode, event journal is the signal for new analytics.
+        script_mode = os.getenv("ZHUKOV_MONITOR_EVENT_MODE", "poll").lower() == "script"
+        received_dates = None
+        if script_mode:
+            try:
+                event_tab = spreadsheet.worksheet("Everest_Алексей_события")
+                entries = event_tab.get_all_values()
+                received_dates = {
+                    d for row in entries[1:]
+                    if len(row) >= 3 and row[1] == morning_tab.title
+                    for d in [parse_date(row[2])] if d is not None
+                }
+            except gspread.exceptions.WorksheetNotFound:
+                logger.error("Zhukov Apps Script event tab is missing; analytics paused")
+                received_dates = set()
         log_tab = worksheet(spreadsheet)
         log_rows = log_tab.get_all_values()
         known = {row[0] for row in log_rows[1:] if row}
@@ -380,6 +396,8 @@ async def tick(bot, spreadsheet, now=None):
         for record in morning:
             day = record["date"]
             if day < activated or not record["timestamp"]:
+                continue
+            if received_dates is not None and day not in received_dates:
                 continue
             if record["timestamp"].astimezone(tz) > now:
                 continue
