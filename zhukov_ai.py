@@ -224,12 +224,36 @@ def render_analysis(base_report, insight):
     )
 
 
+class AIAnalysisError(Exception):
+    """Safe, user-facing explanation when a requested AI check did not complete."""
+
+
 async def enrich_report(base_report, record, morning, games,
                         get_field, sleep_window, hours_fn,
-                        automation_fn, lapses_fn, drops_fn):
-    """Return original report on missing key, API failure, invalid format or timeout."""
-    if not is_enabled():
+                        automation_fn, lapses_fn, drops_fn, *, strict=False):
+    """Augment a report with AI; optional checks fall back, manual checks fail clearly.
+
+    In strict=True mode, never claim an AI report succeeded when the API is
+    disabled, unauthorized, rate-limited, or returns unusable output.
+    """
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        if strict:
+            raise AIAnalysisError(
+                "В Railway отсутствует OPENAI_API_KEY. Добавь API-ключ в Variables."
+            )
         return base_report
+    if os.getenv("ZHUKOV_MONITOR_OPENAI_ENABLED", "").strip().lower() not in _ENABLED:
+        if strict:
+            raise AIAnalysisError(
+                "AI выключен: установи ZHUKOV_MONITOR_OPENAI_ENABLED=true "
+                "в Railway и дождись завершения Deploy."
+            )
+        return base_report
+    if strict and (
+        "\n\nГИПОТЕЗА\n" not in base_report
+        or "\n\nПРЕДЛАГАЕМОЕ РЕШЕНИЕ\n" not in base_report
+    ):
+        raise AIAnalysisError("Формат исходного отчёта изменился. AI-проверка отменена.")
     context = build_context(
         record, morning, games, get_field, sleep_window,
         hours_fn, automation_fn, lapses_fn, drops_fn,
@@ -244,7 +268,7 @@ async def enrich_report(base_report, record, morning, games,
             "strict": True,
             "schema": SCHEMA,
         }},
-        "max_output_tokens": 650,
+        "max_output_tokens": 1100,
         "store": False,
     }
     try:
@@ -259,9 +283,49 @@ async def enrich_report(base_report, record, morning, games,
                 result = await response.json()
         parsed = parse_response(result)
         if parsed is None:
-            logger.warning("OpenAI hypothesis format invalid; deterministic report retained")
-            return base_report
-        return render_analysis(base_report, parsed)
+            raise AIAnalysisError(
+                "OpenAI ответил, но не вернул полный корректный анализ. "
+                "Проверь выбранную модель и повтори запрос."
+            )
+        enriched = render_analysis(base_report, parsed)
+        if strict and enriched == base_report:
+            raise AIAnalysisError(
+                "Не удалось вставить гипотезы в отчёт; исходные данные не изменены."
+            )
+        return enriched
+    except AIAnalysisError:
+        if strict:
+            raise
+        logger.warning("OpenAI returned an incomplete/invalid analysis; deterministic report retained")
+        return base_report
+    except aiohttp.ClientResponseError as exc:
+        logger.warning("OpenAI HTTP error: status=%s", exc.status)
+        if strict:
+            if exc.status in (401, 403):
+                raise AIAnalysisError(
+                    "OpenAI отклонил ключ или доступ к модели (HTTP "
+                    + str(exc.status) + "). Проверь API-ключ и права проекта."
+                ) from None
+            if exc.status == 429:
+                raise AIAnalysisError(
+                    "OpenAI ограничил запросы или бюджет (HTTP 429). "
+                    "Проверь оплату и лимиты API-проекта."
+                ) from None
+            raise AIAnalysisError(
+                f"OpenAI вернул HTTP {exc.status}. Проверь настройки модели/API."
+            ) from None
+        return base_report
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        logger.warning("OpenAI request error: %s", type(exc).__name__)
+        if strict:
+            raise AIAnalysisError(
+                "Не удалось получить ответ OpenAI: сеть или тайм-аут (20 секунд)."
+            ) from None
+        return base_report
     except Exception:
         logger.exception("Optional OpenAI analysis failed; deterministic report retained")
+        if strict:
+            raise AIAnalysisError(
+                "Ошибка выполнения AI-анализа; сохранённые отчёты не изменены."
+            ) from None
         return base_report
