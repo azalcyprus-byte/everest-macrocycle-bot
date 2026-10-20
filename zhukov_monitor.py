@@ -611,6 +611,11 @@ def telegram_report_html(text):
         r"(?m)^(ℹ️ Надёжность:)",
         r"<b>\1</b>", output,
     )
+    # The subtitle is static, and only this known label gains Telegram bold.
+    output = re.sub(
+        r"(?m)^(Утренний отчёт)$",
+        r"<b>\1</b>", output,
+    )
     # Exact labels are ours; all plan codes and form choices were HTML-escaped.
     output = re.sub(
         r"(?m)^(📅 План нагрузки:|🎮 Игровой день:)([^\n]*)$",
