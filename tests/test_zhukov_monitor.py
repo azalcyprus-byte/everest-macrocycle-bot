@@ -268,6 +268,24 @@ class HistoricalReportsTests(unittest.TestCase):
         self.assertEqual("".join(parts), report)
 
 
+    def test_manual_ai_date_reader_does_not_write(self):
+        before = {
+            name: sheet.get_all_values()
+            for name, sheet in self.book.tabs.items()
+        }
+        data = m.read_ai_report_inputs(self.book, date(2026, 10, 20))
+        self.assertIsNotNone(data)
+        report, record, morning, games = data
+        self.assertEqual(record["date"], date(2026, 10, 20))
+        self.assertIn("ФАКТ", report)
+        self.assertIn("исторические данные не подключены", report)
+        self.assertIsNone(m.read_ai_report_inputs(self.book, date(2026, 10, 18)))
+        self.assertEqual(before, {
+            name: sheet.get_all_values()
+            for name, sheet in self.book.tabs.items()
+        })
+
+
 class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.target = {
