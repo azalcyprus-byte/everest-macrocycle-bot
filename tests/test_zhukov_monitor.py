@@ -160,7 +160,7 @@ class MonitoringTests(unittest.IsolatedAsyncioTestCase):
         await m.tick(self.bot, self.book, datetime(2026, 10, 2, 19, tzinfo=TZ))
         await m.tick(self.bot, self.book, datetime(2026, 10, 2, 20, tzinfo=TZ))
         self.assertEqual(len(self.bot.messages), 2)
-        self.assertEqual(sum("отсутствует" in x[1] for x in self.bot.messages), 1)
+        self.assertEqual(sum("На контрольный момент" in x[1] for x in self.bot.messages), 1)
         self.assertTrue(all(chat == 900 for chat, _ in self.bot.messages))
 
     async def test_no_historical_anchor_before_first_new_report(self):
