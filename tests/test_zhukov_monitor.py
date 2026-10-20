@@ -413,6 +413,24 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Жуков", fake.payload["input"])
         self.assertNotIn("Владивосток", fake.payload["input"])
 
+    async def test_manual_ai_refuses_disabled_or_missing_configuration(self):
+        args = (self.base_report, self.target, [self.target], [],
+                m.get, m.sleep_window, m.game_hours,
+                m.automation, m.concrete_lapse, m.quality_drop)
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "false",
+            "OPENAI_API_KEY": "test-placeholder",
+        }):
+            with self.assertRaisesRegex(ai.AIAnalysisError, "AI выключен"):
+                await ai.enrich_report(*args, strict=True)
+            self.assertEqual(await ai.enrich_report(*args), self.base_report)
+        with patch.dict(os.environ, {
+            "ZHUKOV_MONITOR_OPENAI_ENABLED": "true",
+            "OPENAI_API_KEY": "",
+        }):
+            with self.assertRaisesRegex(ai.AIAnalysisError, "OPENAI_API_KEY"):
+                await ai.enrich_report(*args, strict=True)
+
     async def test_long_ai_report_delivered_in_multiple_messages(self):
         env = patch.dict(os.environ, {
             "TELEGRAM_USER_ID": "900",
