@@ -64,9 +64,11 @@ class Spreadsheet:
 class Bot:
     def __init__(self):
         self.messages = []
+        self.parse_modes = []
 
-    async def send_message(self, chat_id, text):
+    async def send_message(self, chat_id, text, **kwargs):
         self.messages.append((chat_id, text))
+        self.parse_modes.append(kwargs.get("parse_mode"))
 
 
 class PureLogicTests(unittest.TestCase):
@@ -374,6 +376,29 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
             session.assert_not_called()
         self.assertEqual(result, self.base_report)
 
+    def test_telegram_html_bolds_cost_only_and_escapes_report_content(self):
+        plain = (
+            "План: A < B & C\n"
+            "ПРЕДЛАГАЕМОЕ РЕШЕНИЕ\nОставить план.\n\n"
+            "💳 OpenAI API: ≈ $0.000690 за этот анализ "
+            "(по токенам; фактическое списание может отличаться)."
+        )
+        rendered = m.telegram_report_html(plain)
+        self.assertIn("A &lt; B &amp; C", rendered)
+        self.assertIn("💳 <b>OpenAI API</b>: ≈ <b>$0.000690</b>", rendered)
+        self.assertIn("ПРЕДЛАГАЕМОЕ РЕШЕНИЕ", rendered)
+        self.assertNotIn("<b>ПРЕДЛАГАЕМОЕ РЕШЕНИЕ</b>", rendered)
+        no_usage = m.telegram_report_html(
+            "💳 OpenAI API: стоимость этого запроса не удалось рассчитать"
+        )
+        self.assertIn("💳 <b>OpenAI API</b>: стоимость", no_usage)
+        self.assertNotIn("<b>$", no_usage)
+        safety = m.telegram_report_html(
+            "<b>Непроверенный HTML</b>\n"
+            "💳 OpenAI API: ≈ $0.000690"
+        )
+        self.assertIn("&lt;b&gt;Непроверенный HTML&lt;/b&gt;", safety)
+
     def test_openai_cost_uses_actual_input_output_and_cached_tokens(self):
         response = {
             "model": "gpt-4.1-mini-2025-04-14",
@@ -521,6 +546,35 @@ class OpenAIHypothesisTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ai.AIAnalysisError, "не вернул полный"):
                     await ai.enrich_report(*args, strict=True)
                 self.assertEqual(await ai.enrich_report(*args), self.base_report)
+
+    async def test_auto_report_formats_card_cost_as_html(self):
+        env = patch.dict(os.environ, {
+            "TELEGRAM_USER_ID": "900",
+            "ZHUKOV_CURATOR_CHAT_ID": "900",
+            "ZHUKOV_TELEGRAM_USER_ID": "901",
+            "ZHUKOV_SHEET_TIMEZONE": "Europe/Moscow",
+        })
+        with env:
+            ws = Sheet("журнал", [m.HEADERS])
+            bot = Bot()
+            await m._send_once(bot, ws, set(), (
+                "zhukov:analysis:2026-10-20", "ANALYSIS",
+                date(2026, 10, 20),
+                datetime(2026, 10, 20, 8, tzinfo=TZ),
+                "Предложение куратору.\n\n"
+                "💳 OpenAI API: ≈ $0.000690 за этот анализ.",
+            ))
+            self.assertEqual(bot.parse_modes, ["HTML"])
+            self.assertIn(
+                "💳 <b>OpenAI API</b>: ≈ <b>$0.000690</b>",
+                bot.messages[0][1],
+            )
+            self.assertIn(
+                "💳 OpenAI API: ≈ $0.000690",
+                ws.rows[1][4],
+            )
+            self.assertNotIn("<b>", ws.rows[1][4])
+            self.assertEqual(ws.rows[1][5], "SENT")
 
     async def test_long_ai_report_delivered_in_multiple_messages(self):
         env = patch.dict(os.environ, {
