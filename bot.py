@@ -5440,7 +5440,10 @@ async def zhukovai(
         + enriched
     )
     for part in zhukov_monitor.split_telegram_text(response):
-        await update.effective_message.reply_text(part)
+        await update.effective_message.reply_text(
+            zhukov_monitor.telegram_report_html(part),
+            parse_mode="HTML",
+        )
 
 
 async def zhukovreport(
