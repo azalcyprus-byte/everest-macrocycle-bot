@@ -12,6 +12,8 @@ import os
 from decimal import Decimal
 
 import aiohttp
+import asyncio
+import zhukov_plan
 import zhukov_brief
 
 logger = logging.getLogger(__name__)
@@ -311,14 +313,19 @@ class AIAnalysisError(Exception):
 
 async def enrich_report(base_report, record, morning, games,
                         get_field, sleep_window, hours_fn,
-                        automation_fn, lapses_fn, drops_fn, *, strict=False):
+                        automation_fn, lapses_fn, drops_fn, *,
+                        strict=False, plan_type=None):
     """Return one compact curated brief regardless of AI availability.
 
     Strict manual checks explicitly report API failure; scheduled checks
     always deliver a compact deterministic fallback, without a cost line.
     """
+    if plan_type is None and os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        plan = await asyncio.to_thread(zhukov_plan.optional_plan_types)
+        plan_type = zhukov_plan.planned_type_for(plan, record["date"])
     fallback = zhukov_brief.render(
-        record, morning, games, get_field, ai_unavailable=True,
+        record, morning, games, get_field,
+        ai_unavailable=True, plan_type=plan_type,
     )
     if not os.getenv("OPENAI_API_KEY", "").strip():
         if strict:
@@ -367,7 +374,8 @@ async def enrich_report(base_report, record, morning, games,
                 "Проверь выбранную модель и повтори запрос."
             )
         enriched = zhukov_brief.render(
-            record, morning, games, get_field, insight=parsed,
+            record, morning, games, get_field,
+            insight=parsed, plan_type=plan_type,
         )
         return enriched + response_cost_footer(result, payload["model"])
     except AIAnalysisError:
