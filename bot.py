@@ -10,6 +10,7 @@ import time as time_module
 import uuid
 import zhukov_monitor
 import zhukov_ai
+import everest_curator_ai
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -5362,6 +5363,64 @@ async def start_zhukov_morning_session(
         )
 
 
+async def _respond_everest_curator(update: Update, prompt: str) -> None:
+    """Serve the private curator only; read-only AI tools and safe output."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    try:
+        answer = await everest_curator_ai.ask(
+            update.effective_user.id, prompt, get_zhukov_spreadsheet,
+        )
+    except everest_curator_ai.CuratorAIError as exc:
+        await update.effective_message.reply_text("❌ Everest AI: " + str(exc))
+        return
+    for part in zhukov_monitor.split_telegram_text(answer):
+        await update.effective_message.reply_text(
+            zhukov_monitor.telegram_report_html(part),
+            parse_mode="HTML",
+        )
+
+
+async def everest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Natural-language curator request: /everest <question>."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    prompt = " ".join(context.args or []).strip()
+    if not prompt:
+        await update.effective_message.reply_text(
+            "🏔️ Everest AI Curator 1.0\n"
+            "Напиши вопрос после /everest или просто отправь сообщение "
+            "в этом личном чате.\n"
+            "Примеры:\n"
+            "• /everest Какой план нагрузки на завтра?\n"
+            "• /everest Что изменилось за последние 7 дней?\n"
+            "Пока доступно только чтение данных; изменения не выполняются."
+        )
+        return
+    await _respond_everest_curator(update, prompt)
+
+
+async def everestreset(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Discard short-lived chat history, not project rules or data."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    await everest_curator_ai.reset(update.effective_user.id)
+    await update.effective_message.reply_text(
+        "Контекст текущего AI-разговора очищен. Таблицы и правила не менялись."
+    )
+
+
 async def zhukovai(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8752,6 +8811,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await start_or_continue_morning_session(update, context)
         return
 
+    if (
+        update.effective_chat is not None
+        and update.effective_chat.type == "private"
+        and everest_curator_ai.enabled()
+    ):
+        await _respond_everest_curator(update, text)
+        return
+
     await update.effective_message.reply_text(
         "Сейчас штаб работает в фиксированном режиме без AI-координатора:\n"
         "• «Доброе утро» — запуск трёх утренних чек-листов;\n"
@@ -8791,6 +8858,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
     telegram_app.add_handler(CommandHandler("zhukovreport", zhukovreport))
     telegram_app.add_handler(CommandHandler("zhukovai", zhukovai))
+    telegram_app.add_handler(CommandHandler("everest", everest))
+    telegram_app.add_handler(CommandHandler("everestreset", everestreset))
     telegram_app.add_handler(CommandHandler("zhukovhistory", zhukovhistory))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
