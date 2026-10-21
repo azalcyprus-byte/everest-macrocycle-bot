@@ -10,6 +10,7 @@ import time as time_module
 import uuid
 import zhukov_monitor
 import zhukov_ai
+import everest_curator_chat
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -5362,6 +5363,71 @@ async def start_zhukov_morning_session(
         )
 
 
+async def _answer_everest_curator(update: Update, question: str) -> None:
+    """Curator only: read Google Sheets and ask AI; never write or message athlete."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    try:
+        source = await asyncio.to_thread(get_zhukov_spreadsheet)
+        result = await everest_curator_chat.answer_question(
+            update.effective_user.id, question, source,
+        )
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    except RuntimeError as exc:
+        await update.effective_message.reply_text(
+            "Everest AI: " + str(exc)[:350]
+        )
+        return
+    except Exception:
+        logger.exception("Everest curator AI question failed")
+        await update.effective_message.reply_text(
+            "Everest AI: ошибка чтения данных или ответа модели; "
+            "изменений в Google Sheets не было."
+        )
+        return
+    for part in zhukov_monitor.split_telegram_text(result):
+        await update.effective_message.reply_text(
+            zhukov_monitor.telegram_report_html(part),
+            parse_mode="HTML",
+        )
+
+
+async def everestai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One explicit AI question from the curator's private Telegram chat."""
+    if not is_authorized(update):
+        return
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return
+    question = " ".join(context.args or []).strip()
+    if not question:
+        await update.effective_message.reply_text(
+            "Напиши /everestai и свой вопрос, например:\n"
+            "/everestai Что изменилось у Алексея за последние семь дней?\n\n"
+            "Можно также просто отправлять вопросы обычными сообщениями. "
+            "Агент пока работает только на чтение."
+        )
+        return
+    await _answer_everest_curator(update, question)
+
+
+async def everestreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear only volatile curator AI dialogue, never source observations."""
+    if not is_authorized(update):
+        return
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return
+    everest_curator_chat.reset_dialogue(update.effective_user.id)
+    await update.effective_message.reply_text(
+        "Контекст текущего диалога Everest AI очищен. "
+        "Google Sheets и история мониторинга не изменились."
+    )
+
+
 async def zhukovai(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8752,6 +8818,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await start_or_continue_morning_session(update, context)
         return
 
+    # Keep checklist and snooze commands above this read-only AI fallback.
+    if (update.effective_chat is not None
+            and update.effective_chat.type == "private"
+            and everest_curator_chat.enabled()):
+        await _answer_everest_curator(update, text)
+        return
+
     await update.effective_message.reply_text(
         "Сейчас штаб работает в фиксированном режиме без AI-координатора:\n"
         "• «Доброе утро» — запуск трёх утренних чек-листов;\n"
@@ -8791,6 +8864,8 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
     telegram_app.add_handler(CommandHandler("zhukovreport", zhukovreport))
     telegram_app.add_handler(CommandHandler("zhukovai", zhukovai))
+    telegram_app.add_handler(CommandHandler("everestai", everestai))
+    telegram_app.add_handler(CommandHandler("everestreset", everestreset))
     telegram_app.add_handler(CommandHandler("zhukovhistory", zhukovhistory))
     telegram_app.add_handler(CommandHandler("sheet", sheet))
     telegram_app.add_handler(CommandHandler("readtest", readtest))
