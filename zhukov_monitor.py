@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import zhukov_ai
 import zhukov_brief
+import zhukov_evening
 import zhukov_plan
 import aiohttp
 
@@ -419,10 +420,10 @@ def _audit_decisions(audit_rows, day):
     ]
 
 
-def _audit_saved_report(audit_rows, day):
+def _audit_saved_report(audit_rows, day, kind="ANALYSIS"):
     """Return only a report that is confirmed sent to the curator."""
     for row in audit_rows:
-        if (_audit_type(row) == "ANALYSIS" and _audit_day(row) == day
+        if (_audit_type(row) == kind and _audit_day(row) == day
                 and len(row) > 5 and row[5] == "SENT" and row[4]):
             return row[4]
     return None
@@ -473,7 +474,7 @@ def read_curator_report(spreadsheet, day=None, plan_types=None):
         available = sorted(
             set(morning_by_day)
             | set(games_by_day)
-            | {_audit_day(row) for row in audit if _audit_type(row) in ("ANALYSIS", "MISSING")}
+            | {_audit_day(row) for row in audit if _audit_type(row) in ("ANALYSIS", "EVENING_ANALYSIS", "MISSING")}
             - {None}
         )
         if not available:
@@ -484,12 +485,23 @@ def read_curator_report(spreadsheet, day=None, plan_types=None):
     date_label = day.strftime("%d.%m.%Y")
     notes = _audit_decisions(audit, day)
     saved = _audit_saved_report(audit, day)
-    if saved:
-        text = (
-            f"💾 История Everest — {date_label}\n"
-            "Оригинальная сохранённая сводка (отправлена куратору).\n\n"
-            + saved
-        )
+    saved_evening = _audit_saved_report(audit, day, "EVENING_ANALYSIS")
+    if saved or saved_evening:
+        reports = []
+        if saved:
+            reports.append("☀️ Утренняя сводка (сохранена):\n" + saved)
+        elif day in morning_by_day:
+            reports.append(
+                "🔎 Утро — ретроспективная реконструкция:\n"
+                + zhukov_brief.render(morning_by_day[day], morning, postgame,
+                                      get, ai_unavailable=True,
+                                      plan_type=zhukov_plan.planned_type_for(plan_types, day))
+            )
+        if saved_evening:
+            reports.append("🌙 Постигровая сводка (сохранена):\n" + saved_evening)
+        text = (f"💾 История Everest — {date_label}\n"
+                "Оригинальные отправленные сводки отмечены как сохранённые.\n\n"
+                + "\n\n".join(reports))
     elif day in morning_by_day:
         text = (
             f"🔎 Архив Everest — {date_label}\n"
@@ -543,12 +555,16 @@ def read_curator_history(spreadsheet, limit=15):
         _audit_day(row) for row in audit
         if _audit_type(row) == "ANALYSIS" and len(row) > 5 and row[5] == "SENT"
     }
+    evening_sent = {
+        _audit_day(row) for row in audit
+        if _audit_type(row) == "EVENING_ANALYSIS" and len(row) > 5 and row[5] == "SENT"
+    }
     missing = {_audit_day(row) for row in audit if _audit_type(row) == "MISSING"}
     decisions = {
         _audit_day(row) for row in audit if _audit_type(row) == "CURATOR_DECISION"
     }
     days = sorted(
-        (morning_dates | game_dates | sent | missing | decisions) - {None},
+        (morning_dates | game_dates | sent | evening_sent | missing | decisions) - {None},
         reverse=True,
     )[:limit]
     if not days:
@@ -557,9 +573,11 @@ def read_curator_history(spreadsheet, limit=15):
     for day in days:
         tags = []
         if day in sent:
-            tags.append("💾 сохранённая сводка")
+            tags.append("💾 утренняя сводка")
         elif day in morning_dates:
             tags.append("🔎 утренняя анкета")
+        if day in evening_sent:
+            tags.append("💾 постигровая сводка")
         elif day in game_dates:
             tags.append("🎲 после игры")
         if day in missing:
@@ -604,7 +622,7 @@ def telegram_report_html(text):
         r"<b>\1</b>", output,
     )
     output = re.sub(
-        r"(?m)^(🔎 Значимые изменения|💡 Гипотеза|🎯 Рекомендация куратору)$",
+        r"(?m)^(🔎 Значимые изменения|🔎 Качество сессии|📈 Динамика|💡 Гипотеза|🎯 Рекомендация куратору)$",
         r"<b>\1</b>", output,
     )
     output = re.sub(
@@ -613,12 +631,12 @@ def telegram_report_html(text):
     )
     # The subtitle is static, and only this known label gains Telegram bold.
     output = re.sub(
-        r"(?m)^(Утренний отчёт)$",
+        r"(?m)^(Утренний отчёт|Постигровой отчёт)$",
         r"<b>\1</b>", output,
     )
     # Exact labels are ours; all plan codes and form choices were HTML-escaped.
     output = re.sub(
-        r"(?m)^(📅 План нагрузки:|🎮 Игровой день:)([^\n]*)$",
+        r"(?m)^(📅 План нагрузки:|🎮 Игровой день:|🎲 Факт игры:)([^\n]*)$",
         r"<b>\1</b>\2", output,
     )
     return output
@@ -720,6 +738,7 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
         # In script mode, event journal is the signal for new analytics.
         script_mode = os.getenv("ZHUKOV_MONITOR_EVENT_MODE", "poll").lower() == "script"
         received_dates = None
+        postgame_received_dates = None
         if script_mode:
             try:
                 event_tab = spreadsheet.worksheet("Everest_Алексей_события")
@@ -729,9 +748,15 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                     if len(row) >= 3 and row[1] == morning_tab.title
                     for d in [parse_date(row[2])] if d is not None
                 }
+                postgame_received_dates = {
+                    d for row in entries[1:]
+                    if len(row) >= 3 and row[1] == game_tab.title
+                    for d in [parse_date(row[2])] if d is not None
+                }
             except gspread.exceptions.WorksheetNotFound:
                 logger.error("Zhukov Apps Script event tab is missing; analytics paused")
                 received_dates = set()
+                postgame_received_dates = set()
         log_tab = worksheet(spreadsheet)
         log_rows = log_tab.get_all_values()
         known = {row[0] for row in log_rows[1:] if row}
@@ -746,6 +771,23 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                                 "First enabled date; no historical missed-day flood.",
                                 "SENT", "", ""])
             known.add("zhukov:monitor:activation")
+        # Separate activation prevents sending a backlog of old evening forms
+        # when evening notifications are enabled on an existing monitoring bot.
+        evening_config = next(
+            (row for row in log_rows[1:]
+             if row and row[0] == "zhukov:evening-monitor:activation"), None
+        )
+        if evening_config and len(evening_config) > 3:
+            evening_activation = datetime.fromisoformat(evening_config[3]).astimezone(tz)
+        else:
+            evening_activation = now
+            log_tab.append_row([
+                "zhukov:evening-monitor:activation", "CONFIG",
+                now.date().isoformat(), now.isoformat(),
+                "Only postgame submissions after this activation are reported.",
+                "SENT", "", "",
+            ])
+            known.add("zhukov:evening-monitor:activation")
         anchor_record = next(
             (row for row in log_rows[1:]
              if row and row[0] == "zhukov:monitor:anchor"), None
@@ -801,6 +843,21 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                                record, morning, postgame, get, ai_unavailable=True,
                                plan_type=zhukov_plan.planned_type_for(plan_types, day),
                            )))
+        for record in postgame:
+            day = record["date"]
+            stamp = record["timestamp"]
+            if stamp is None or stamp.astimezone(tz) < evening_activation:
+                continue
+            if stamp.astimezone(tz) > now:
+                continue
+            if postgame_received_dates is not None and day not in postgame_received_dates:
+                continue
+            key = f"zhukov:evening-analysis:{day.isoformat()}"
+            if key in known:
+                continue
+            events.append((
+                key, "EVENING_ANALYSIS", day, stamp, None,
+            ))
         for key, kind, day, when, message in sorted(events, key=lambda x: (x[2], x[1])):
             if key in known:
                 continue
@@ -811,4 +868,12 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                         message, target, morning, postgame,
                         plan_type=zhukov_plan.planned_type_for(plan_types, day),
                     )
+            elif kind == "EVENING_ANALYSIS":
+                game = next((r for r in postgame if r["date"] == day), None)
+                if game is None:
+                    continue
+                message = await zhukov_evening.enrich_report(
+                    game, morning, postgame,
+                    plan_type=zhukov_plan.planned_type_for(plan_types, day),
+                )
             await _send_once(bot, log_tab, known, (key, kind, day, when, message))
