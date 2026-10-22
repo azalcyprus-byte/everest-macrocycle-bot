@@ -55,6 +55,98 @@ def enabled():
     )
 
 
+_MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+
+def _requested_checklist_date(question, today):
+    """Resolve an explicit checklist date deterministically, never via the LLM."""
+    iso = re.search(r"(?<!\d)(20\d{2})-(\d{1,2})-(\d{1,2})(?!\d)", question)
+    numeric = re.search(r"(?<!\d)(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?(?!\d)", question)
+    words = re.search(
+        r"(?<!\d)(\d{1,2})\s+("
+        + "|".join(_MONTHS_RU)
+        + r")(?:\s+(20\d{2}))?\b", question,
+    )
+    try:
+        if iso:
+            from datetime import date as _date
+            return _date(int(iso[1]), int(iso[2]), int(iso[3]))
+        if numeric or words:
+            from datetime import date as _date
+            d = int(numeric[1] if numeric else words[1])
+            m = int(numeric[2]) if numeric else _MONTHS_RU[words[2]]
+            year_text = numeric[3] if numeric else words[3]
+            year = int(year_text) if year_text else today.year
+            candidate = _date(year, m, d)
+            if not year_text and candidate > today:
+                candidate = _date(year - 1, m, d)
+            return candidate
+    except ValueError:
+        return None
+    if "позавчера" in question:
+        return today - timedelta(days=2)
+    if "вчера" in question:
+        return today - timedelta(days=1)
+    return today
+
+
+def checklist_status_answer(question, spreadsheet, *, today=None):
+    """Answer factual submission-status questions from Google Sheets, without AI.
+
+    The check is deliberately narrow. General analysis remains with the model.
+    """
+    q = question.casefold()
+    if any(word in q for word in ("почему", "зачем", "причин", "как повлиял")):
+        return None
+    if not any(word in q for word in (
+        "заполн", "отправ", "сдал", "сдан", "поступ", "получен",
+        "пришёл", "пришел", "есть", "не было",
+    )):
+        return None
+    if not any(word in q for word in (
+        "отч", "чек", "анкет", "заполн", "за ", "сегодня", "вчера",
+    )):
+        return None
+    # Do not override analytical or comparative requests.
+    if any(word in q for word in ("сравни", "почему", "динамик", "анализ", "рекоменд", "тенденц")):
+        return None
+
+    tz = ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai"))
+    current_day = today or datetime.now(tz).date()
+    report_day = _requested_checklist_date(q, current_day)
+    if report_day is None:
+        return "Не удалось определить дату отчёта. Укажи её, например: 22.10.2026."
+
+    morning_only = "утрен" in q and not any(x in q for x in ("вечер", "постигр", "после игры"))
+    postgame_only = any(x in q for x in ("вечер", "постигр", "после игры")) and "утрен" not in q
+    requested = (
+        [("Утренний", os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы"))]
+        if morning_only else
+        [("Постигровой", os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы"))]
+        if postgame_only else
+        [("Утренний", os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы")),
+         ("Постигровой", os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы"))]
+    )
+    result = [f"📋 Алексей | {report_day:%d.%m.%Y}"]
+    for title, tab in requested:
+        records = zhukov_monitor.normalize_records(
+            spreadsheet.worksheet(tab).get_all_values(), tz
+        )
+        found = next((rec for rec in records if rec["date"] == report_day), None)
+        if found:
+            stamp = found["timestamp"]
+            when = f" {stamp:%d.%m.%Y в %H:%M}" if stamp else " (время неизвестно)"
+            result.append(f"✅ {title} отчёт: заполнен{when}.")
+        else:
+            result.append(f"⚪ {title} отчёт: записи в Google Sheets нет.")
+    result.append("Время указано по Google Таблице (Asia/Shanghai).")
+    return "\n".join(result)
+
+
 def _question(text):
     text = str(text or "").strip()
     if not text or len(text) > MAX_QUESTION:
@@ -146,6 +238,10 @@ async def answer_question(curator_id, message, spreadsheet):
     text = _question(message)
     if not enabled():
         raise RuntimeError("Everest AI недоступен: нет API-ключа или функция отключена.")
+    # Exact form-submission status is a source-of-truth query, never an LLM guess.
+    direct = await asyncio.to_thread(checklist_status_answer, text, spreadsheet)
+    if direct is not None:
+        return direct
     lock = _LOCKS.setdefault(curator_id, asyncio.Lock())
     async with lock:
         plan = await asyncio.to_thread(zhukov_plan.optional_plan_types)

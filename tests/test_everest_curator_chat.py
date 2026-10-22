@@ -79,6 +79,34 @@ class CuratorFactsTests(unittest.TestCase):
             [0, 0],
         )
 
+
+    def test_checklist_submission_answer_reads_real_date_and_timestamp(self):
+        book = FakeBook()
+        book.tabs["После игры — ответы"] = FakeSheet([
+            ["Отметка времени", "Дата", "1. Сколько часов фактически играл сегодня?"],
+            ["22.10.2026 23:08:14", "22.10.2026", "4"],
+        ])
+        reply = curator.checklist_status_answer(
+            "За 22 октября заполнен?", book, today=date(2026, 10, 23)
+        )
+        self.assertIn("22.10.2026", reply)
+        self.assertIn("Постигровой отчёт: заполнен 22.10.2026 в 23:08", reply)
+        self.assertNotIn("Постигровой отчёт: записи", reply)
+        self.assertIn("Утренний отчёт: записи в Google Sheets нет", reply)
+
+    def test_status_answer_no_invented_future_date_or_report(self):
+        book = FakeBook()
+        reply = curator.checklist_status_answer(
+            "Вечерний отчёт за 22 октября заполнен?",
+            book, today=date(2026, 10, 25)
+        )
+        self.assertIn("22.10.2026", reply)
+        self.assertIn("Постигровой отчёт: записи в Google Sheets нет", reply)
+        self.assertNotIn("Утренний отчёт", reply)
+        self.assertIsNone(curator.checklist_status_answer(
+            "Почему не заполнил отчёт?", book, today=date(2026, 10, 25)
+        ))
+
     def test_only_exact_plan_days_and_explicit_missingness(self):
         facts = curator.build_facts(
             FakeBook(), {}, today=date(2026, 10, 20), days=7,
@@ -168,6 +196,26 @@ class CuratorAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(curator._HISTORY[100001]), 2)
         curator.reset_dialogue(100001)
         self.assertNotIn(100001, curator._HISTORY)
+
+
+    async def test_factual_submission_question_skips_paid_api(self):
+        book = FakeBook()
+        book.tabs["После игры — ответы"] = FakeSheet([
+            ["Отметка времени", "Дата"],
+            ["22.10.2026 23:08:14", "22.10.2026"],
+        ])
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "TEST_KEY_DO_NOT_USE",
+            "EVEREST_CURATOR_AI_ENABLED": "true",
+        }), patch("everest_curator_chat.aiohttp.ClientSession") as api, patch(
+            "everest_curator_chat.build_facts"
+        ) as facts:
+            answer = await curator.answer_question(
+                100004, "Вечерний отчёт за 22.10.2026 заполнен?", book
+            )
+        self.assertIn("✅ Постигровой отчёт: заполнен 22.10.2026 в 23:08", answer)
+        api.assert_not_called()
+        facts.assert_not_called()
 
     async def test_invalid_api_response_does_not_claim_success_or_store_history(self):
         class Response:
