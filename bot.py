@@ -10,6 +10,8 @@ import time as time_module
 import uuid
 import zhukov_monitor
 import zhukov_ai
+import zhukov_evening
+import zhukov_plan
 import everest_curator_chat
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -5504,6 +5506,73 @@ async def zhukovai(
         )
 
 
+async def zhukovevening(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Curator-only on-demand copy of the automated evening analysis.
+
+    Read-only: no notification journal, no report resend to Alexey, no schedule changes.
+    """
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    args = context.args or []
+    if len(args) != 1:
+        await update.effective_message.reply_text(
+            "Формат: /zhukovevening 22.10.2026\n"
+            "Можно также указать 2026-10-22.\n"
+            "Формируется новая постигровая сводка только для тебя. "
+            "Отчёты и журнал мониторинга не изменяются."
+        )
+        return
+    target_day = zhukov_monitor.parse_date(args[0])
+    if target_day is None:
+        await update.effective_message.reply_text(
+            "Неверная дата. Пример: /zhukovevening 22.10.2026"
+        )
+        return
+    try:
+        book = await asyncio.to_thread(get_zhukov_spreadsheet)
+        historical = await asyncio.to_thread(
+            zhukov_evening.read_historical_inputs, book, target_day,
+        )
+    except Exception:
+        logger.exception("Zhukov manual postgame source read failed")
+        await update.effective_message.reply_text(
+            "Не удалось прочитать вечерние анкеты из Google Sheets. "
+            "Исходные данные не изменены."
+        )
+        return
+    if historical is None:
+        await update.effective_message.reply_text(
+            f"За {target_day:%d.%m.%Y} нет постигровой анкеты.\n"
+            "Выбери другую дату из /zhukovhistory."
+        )
+        return
+    record, morning, games = historical
+    try:
+        plan = await asyncio.to_thread(zhukov_plan.optional_plan_types)
+        planned_load = zhukov_plan.planned_type_for(plan, target_day)
+        report = await zhukov_evening.enrich_report(
+            record, morning, games, plan_type=planned_load,
+        )
+    except Exception:
+        logger.exception("Zhukov manual postgame analysis failed")
+        await update.effective_message.reply_text(
+            "Не удалось сформировать постигровую сводку. "
+            "Сохранённая история и анкеты не изменены."
+        )
+        return
+    for part in zhukov_monitor.split_telegram_text(report):
+        await update.effective_message.reply_text(
+            zhukov_monitor.telegram_report_html(part),
+            parse_mode="HTML",
+        )
+
+
 async def zhukovreport(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8863,6 +8932,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("zhukovtest", zhukovtest))
     telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
     telegram_app.add_handler(CommandHandler("zhukovreport", zhukovreport))
+    telegram_app.add_handler(CommandHandler("zhukovevening", zhukovevening))
     telegram_app.add_handler(CommandHandler("zhukovai", zhukovai))
     telegram_app.add_handler(CommandHandler("everestai", everestai))
     telegram_app.add_handler(CommandHandler("everestreset", everestreset))
