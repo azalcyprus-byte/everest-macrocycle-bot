@@ -117,7 +117,7 @@ class CuratorAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_openai_request_is_read_only_bounded_and_costed(self):
         reply = {
             "status": "completed",
-            "model": "gpt-4.1-mini",
+            "model": "gpt-6.1-sol",
             "usage": {"input_tokens": 900, "output_tokens": 100},
             "output": [{"content": [{"type": "output_text",
                                     "text": "За неделю нет подтверждённого тренда. Сохранить план."}]}],
@@ -146,7 +146,7 @@ class CuratorAPITests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {
             "OPENAI_API_KEY": "TEST_KEY_DO_NOT_USE",
             "EVEREST_CURATOR_AI_ENABLED": "true",
-            "EVEREST_CURATOR_AI_MODEL": "gpt-4.1-mini",
+            "EVEREST_CURATOR_AI_MODEL": "gpt-6.1-sol",
         }), patch("everest_curator_chat.aiohttp.ClientSession", return_value=fake), patch(
             "everest_curator_chat.zhukov_plan.optional_plan_types", return_value={}
         ), patch("everest_curator_chat.build_facts", return_value={
@@ -158,7 +158,10 @@ class CuratorAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("нет подтверждённого тренда", result)
         self.assertIn("💳 OpenAI API: ≈ $", result)
         self.assertFalse(fake.payload["store"])
-        self.assertEqual(fake.payload["model"], "gpt-4.1-mini")
+        self.assertEqual(fake.payload["model"], "gpt-6.1-sol")
+        self.assertEqual(fake.payload["reasoning"], {"effort": "medium"})
+        self.assertEqual(fake.payload["max_output_tokens"], 2200)
+        self.assertIn("≈ $0.002800", result)
         self.assertTrue(fake.payload["input"][-1]["content"].startswith("Проанализируй"))
         self.assertEqual(fake.url, "https://api.openai.com/v1/responses")
         self.assertNotIn("name", fake.payload["input"][0]["content"].lower())

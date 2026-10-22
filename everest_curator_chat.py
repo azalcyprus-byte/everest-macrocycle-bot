@@ -163,10 +163,14 @@ async def answer_question(curator_id, message, spreadsheet):
                 {"role": "user", "content": text},
             ],
             "store": False,
-            "max_output_tokens": 700,
+            "max_output_tokens": 2200 if model == "gpt-6.1-sol" else 700,
         }
+        if model == "gpt-6.1-sol":
+            payload["reasoning"] = {"effort": "medium"}
         try:
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = aiohttp.ClientTimeout(
+                total=60 if model == "gpt-6.1-sol" else 30
+            )
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     "https://api.openai.com/v1/responses",

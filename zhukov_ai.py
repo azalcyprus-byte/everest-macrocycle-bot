@@ -71,6 +71,7 @@ INSTRUCTIONS = (
 # No inference about account discounts, taxes or billing adjustments.
 _TEXT_PRICES_PER_MILLION = {
     "gpt-4.1-mini": ("0.40", "0.10", "1.60"),
+    "gpt-6.1-sol": ("2.00", "0.10", "10.00"),
     "gpt-4.1-nano": ("0.10", "0.025", "0.40"),
     "gpt-4.1": ("2.00", "0.50", "8.00"),
     "gpt-5-mini": ("0.25", "0.025", "2.00"),
