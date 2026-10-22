@@ -96,6 +96,40 @@ class EveningBriefTests(unittest.TestCase):
         self.assertIn("<b>Постигровой отчёт</b>", monitor.telegram_report_html(text))
         self.assertIn("<b>🎲 Факт игры:</b>", monitor.telegram_report_html(text))
 
+
+    def test_historical_date_reader_uses_no_future_data_or_writes(self):
+        book = Book()
+        book.worksheet("После игры — ответы").append_row(
+            game("22.10.2026 23:08:14", "22.10.2026", "4")
+        )
+        book.worksheet("После игры — ответы").append_row(
+            game("23.10.2026 22:30:00", "23.10.2026", "6")
+        )
+        book.worksheet("Утро — ответы").append_row(
+            ["23.10.2026 08:00:00", "23.10.2026", "игра"]
+        )
+        before = {name: tab.get_all_values() for name, tab in book.tabs.items()}
+        record, mornings, games = evening.read_historical_inputs(
+            book, date(2026, 10, 22)
+        )
+        self.assertEqual(record["date"], date(2026, 10, 22))
+        self.assertEqual(record["fields"]["1. Сколько часов фактически играл сегодня?"], "4")
+        self.assertTrue(all(row["date"] <= date(2026, 10, 22) for row in mornings))
+        self.assertTrue(all(row["date"] <= date(2026, 10, 22) for row in games))
+        self.assertEqual(len(games), 2)
+        self.assertEqual(before, {name: tab.get_all_values() for name, tab in book.tabs.items()})
+
+    def test_historical_date_reader_missing_evening_form(self):
+        book = Book()
+        self.assertIsNone(
+            evening.read_historical_inputs(book, date(2026, 10, 22))
+        )
+
+    def test_historical_date_reader_rejects_invalid_date(self):
+        book = Book()
+        with self.assertRaises(ValueError):
+            evening.read_historical_inputs(book, "22.10.2026")
+
     def test_no_game_hours_does_not_invent_duration(self):
         book = Book()
         r = game("22.10.2026 23:08:14", "22.10.2026", "")

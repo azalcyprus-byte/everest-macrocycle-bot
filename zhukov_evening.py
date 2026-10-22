@@ -34,6 +34,39 @@ INSTRUCTIONS = (
 )
 
 
+def read_historical_inputs(spreadsheet, day):
+    """Read an evening form for an explicit date without modifying Sheets.
+
+    Exclude later submissions so retrospective 3/7-day comparisons and AI
+    context cannot see future observations. Return None without a game form.
+    """
+    from datetime import date
+    from zoneinfo import ZoneInfo
+    import zhukov_monitor as m
+
+    if not isinstance(day, date):
+        raise ValueError("Explicit report date required")
+    tz = ZoneInfo(os.getenv("ZHUKOV_SHEET_TIMEZONE", "Asia/Shanghai"))
+    morning_tab = spreadsheet.worksheet(
+        os.getenv("ZHUKOV_MORNING_SHEET", "Утро — ответы")
+    )
+    game_tab = spreadsheet.worksheet(
+        os.getenv("ZHUKOV_POSTGAME_SHEET", "После игры — ответы")
+    )
+    morning = [
+        rec for rec in m.normalize_records(morning_tab.get_all_values(), tz)
+        if rec["date"] <= day
+    ]
+    games = [
+        rec for rec in m.normalize_records(game_tab.get_all_values(), tz)
+        if rec["date"] <= day
+    ]
+    record = next((item for item in games if item["date"] == day), None)
+    if record is None:
+        return None
+    return record, morning, games
+
+
 def _label(value):
     """Constrain questionnaire categories displayed in the report."""
     clean = " ".join(str(value or "").split())
