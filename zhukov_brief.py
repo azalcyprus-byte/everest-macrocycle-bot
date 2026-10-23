@@ -4,7 +4,7 @@ Pure functions: no OpenAI calls, no mutation of source Sheets, no messaging.
 Automatic and on-demand briefs use the same layout; private historical
 copies that were already sent remain unchanged in the audit journal.
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 import json
 import re
 import os
@@ -183,65 +183,6 @@ def _fallback_action(snapshot):
     return "Сохранить согласованный план и сравнить внимание в следующем отчёте."
 
 
-def _field(record, get, prefix):
-    """Return a compact value only when that real form field is present."""
-    value = get(record, prefix, default="")
-    value = " ".join(str(value or "").split())
-    return value[:160] if value else ""
-
-
-def morning_facts(record, get, sleep_window=None):
-    """Format the real morning form without treating time in bed as sleep."""
-    bedtime = _field(record, get, "1. Во сколько лег")
-    asleep = _field(record, get, "4. Как быстро уснул")
-    wake = _field(record, get, "2. Во сколько окончательно")
-    awakenings = _field(record, get, "3. Сколько раз просыпался")
-    rising = _field(record, get, "5. Как встал")
-    sleepiness = _field(record, get, "6. Через 30–60 минут")
-    body = _field(record, get, "7. Что сейчас")
-    attention = _field(record, get, "8. Когда читаешь")
-    decisions = _field(record, get, "9. Простые утренние")
-    factors = _field(record, get, "11. Что со вчера")
-
-    sleep = []
-    if bedtime:
-        sleep.append("отход ко сну: " + bedtime)
-    if asleep:
-        sleep.append("засыпание: " + asleep)
-    if wake:
-        sleep.append("окончательное пробуждение: " + wake)
-    if awakenings:
-        sleep.append("ночных пробуждений: " + awakenings)
-    if sleep_window is not None:
-        window = sleep_window(record)
-    else:
-        try:
-            start = datetime.strptime(bedtime[:5], "%H:%M")
-            end = datetime.strptime(wake[:5], "%H:%M")
-            window = (end - start).total_seconds() / 3600
-            window = window if window >= 0 else window + 24
-            window = round(window, 1) if window > 0 else None
-        except (TypeError, ValueError):
-            window = None
-    if window is not None:
-        sleep.append(f"окно между указанными временами: {window:g} ч (не фактический сон)")
-    if rising:
-        sleep.append("подъём: " + rising)
-
-    awake = []
-    if sleepiness:
-        awake.append("сонливость через 30–60 минут: " + sleepiness)
-    if body:
-        awake.append("самочувствие/тело: " + body)
-    if attention:
-        awake.append("уход внимания при чтении: " + attention)
-    if decisions:
-        awake.append("простые дела и решения: " + decisions)
-    if factors:
-        awake.append("возможные факторы со вчера: " + factors)
-    return sleep, awake
-
-
 def render(record, morning, games, get, insight=None, *,
            ai_unavailable=False, plan_type=None):
     """Render ONE compact plain-text Telegram brief.
@@ -286,19 +227,12 @@ def render(record, morning, games, get, insight=None, *,
             workload_label = str(plan_code) + " (" + hours_text + " ч игры)"
     else:
         workload_label = "не указан"
-    sleep, awake = morning_facts(record, get)
-    source = "\n".join(
-        ["🌅 Источник: утренняя Google Form"]
-        + (["Сон: " + "; ".join(sleep) + "."] if sleep else [])
-        + (["Бодрствование: " + "; ".join(awake) + "."] if awake else [])
-    )
     brief = (
         "🏔️ Everest | Алексей Жуков | "
         + record["date"].strftime("%d.%m.%Y")
         + "\nУтренний отчёт"
         + "\n\n📅 План нагрузки: " + workload_label
         + "\n🎮 Игровой день: " + declared_game_day(record, get)
-        + "\n\n" + source
         + "\n\n" + snapshot["status"]
         + "\n\n🔎 Значимые изменения\n" + observed
         + "\n\n💡 Гипотеза\n" + hypothesis
