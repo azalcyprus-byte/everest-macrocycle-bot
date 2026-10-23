@@ -172,19 +172,6 @@ def render(game, morning, games, *, plan_type=None, insight=None,
     )
     if ai_unavailable:
         reliability += " AI-анализ недоступен."
-    import zhukov_monitor as m
-    same_day_morning = next((r for r in morning if r["date"] == day), None)
-    if same_day_morning is None:
-        morning_source = "🌅 Источник: утренняя Google Form\nНет анкеты за эту дату."
-    else:
-        sleep, awake = zhukov_brief.morning_facts(
-            same_day_morning, m.get, m.sleep_window,
-        )
-        morning_source = "\n".join(
-            ["🌅 Источник: утренняя Google Form"]
-            + (["Сон: " + "; ".join(sleep) + "."] if sleep else [])
-            + (["Бодрствование: " + "; ".join(awake) + "."] if awake else [])
-        )
     postgame_source = (
         "🎲 Источник: постигровая Google Form\n"
         f"Факт игры: {played}.\n"
@@ -194,7 +181,7 @@ def render(game, morning, games, *, plan_type=None, insight=None,
     return (
         f"🏔️ Everest | Алексей Жуков | {day:%d.%m.%Y}\nПостигровой отчёт\n\n"
         f"📅 План нагрузки: {planned}\n🎲 Факт игры: {played}\n\n"
-        + morning_source + "\n\n" + postgame_source + "\n\n"
+        + postgame_source + "\n\n"
         f"{status}\n\n🔎 Качество сессии\n" + "\n".join(changes)
         + "\n\n📈 Динамика\n"
         + f"3 дня: {window(three)}.\n7 дней: {window(week)}."
