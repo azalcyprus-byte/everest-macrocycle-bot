@@ -242,6 +242,17 @@ def morning_facts(record, get, sleep_window=None):
     return sleep, awake
 
 
+def morning_state_lines(record, get):
+    """Render form answers as two readable lines, without technical labels."""
+    sleep, awake = morning_facts(record, get)
+    lines = []
+    if sleep:
+        lines.append("😴 Сон: " + "; ".join(sleep) + ".")
+    if awake:
+        lines.append("🧠 После пробуждения: " + "; ".join(awake) + ".")
+    return lines
+
+
 def render(record, morning, games, get, insight=None, *,
            ai_unavailable=False, plan_type=None):
     """Render ONE compact plain-text Telegram brief.
@@ -286,19 +297,14 @@ def render(record, morning, games, get, insight=None, *,
             workload_label = str(plan_code) + " (" + hours_text + " ч игры)"
     else:
         workload_label = "не указан"
-    sleep, awake = morning_facts(record, get)
-    source = "\n".join(
-        ["🌅 Источник: утренняя Google Form"]
-        + (["Сон: " + "; ".join(sleep) + "."] if sleep else [])
-        + (["Бодрствование: " + "; ".join(awake) + "."] if awake else [])
-    )
+    state_lines = morning_state_lines(record, get)
     brief = (
         "🏔️ Everest | Алексей Жуков | "
         + record["date"].strftime("%d.%m.%Y")
         + "\nУтренний отчёт"
         + "\n\n📅 План нагрузки: " + workload_label
         + "\n🎮 Игровой день: " + declared_game_day(record, get)
-        + "\n\n" + source
+        + ("\n\n" + "\n".join(state_lines) if state_lines else "")
         + "\n\n" + snapshot["status"]
         + "\n\n🔎 Значимые изменения\n" + observed
         + "\n\n💡 Гипотеза\n" + hypothesis

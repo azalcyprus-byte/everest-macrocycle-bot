@@ -172,16 +172,14 @@ def render(game, morning, games, *, plan_type=None, insight=None,
     )
     if ai_unavailable:
         reliability += " AI-анализ недоступен."
-    postgame_source = (
-        "🎲 Источник: постигровая Google Form\n"
-        f"Факт игры: {played}.\n"
-        f"Изменение состояния по ходу игры: {f['course']}.\n"
-        f"Самочувствие к концу игры: {f['body']}."
+    postgame_state = (
+        f"🧠 Состояние по ходу игры: {f['course']}.\n"
+        f"💪 К концу игры: {f['body']}."
     )
     return (
         f"🏔️ Everest | Алексей Жуков | {day:%d.%m.%Y}\nПостигровой отчёт\n\n"
         f"📅 План нагрузки: {planned}\n🎲 Факт игры: {played}\n\n"
-        + postgame_source + "\n\n"
+        + postgame_state + "\n\n"
         f"{status}\n\n🔎 Качество сессии\n" + "\n".join(changes)
         + "\n\n📈 Динамика\n"
         + f"3 дня: {window(three)}.\n7 дней: {window(week)}."
