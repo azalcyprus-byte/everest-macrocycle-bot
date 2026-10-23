@@ -51,8 +51,12 @@ class Book:
     def __init__(self):
         self.tabs = {
             "Утро — ответы": Sheet("Утро — ответы", [
-                ["Отметка времени", "Дата", "Сегодня"],
-                ["21.10.2026 08:00:00", "21.10.2026", "игра"],
+                ["Отметка времени", "Дата", "Сегодня", "1. Во сколько лег спать?",
+                 "2. Во сколько окончательно проснулся?", "4. Как быстро уснул?",
+                 "6. Через 30–60 минут после пробуждения сонливость осталась?",
+                 "8. Когда читаешь сообщения или обычный текст, приходится перечитывать, потому что внимание уходит?"],
+                ["21.10.2026 08:00:00", "21.10.2026", "игра", "23:30", "07:30",
+                 "быстро", "немного", "иногда"],
             ]),
             "После игры — ответы": Sheet("После игры — ответы", [
                 HEAD,
@@ -74,14 +78,21 @@ class EveningBriefTests(unittest.TestCase):
     def test_actual_evening_form_yields_compact_grounded_report(self):
         day = date(2026, 10, 22)
         book = Book()
+        book.worksheet("Утро — ответы").append_row(
+            ["22.10.2026 08:00:00", "22.10.2026", "игра", "23:30", "07:30",
+             "быстро", "немного", "иногда"]
+        )
         book.worksheet("После игры — ответы").append_row(
             game("22.10.2026 23:08:14", "22.10.2026")
         )
         rows = monitor.normalize_records(
             book.worksheet("После игры — ответы").get_all_values(), TZ
         )
+        mornings = monitor.normalize_records(
+            book.worksheet("Утро — ответы").get_all_values(), TZ
+        )
         text = evening.render(
-            rows[-1], [], rows,
+            rows[-1], mornings, rows,
             plan_type=PlannedLoadCode("M", Decimal("5.5")),
         )
         self.assertIn("Постигровой отчёт", text)
@@ -89,6 +100,10 @@ class EveningBriefTests(unittest.TestCase):
         self.assertIn("📅 План нагрузки: M (5,5 ч Game OPT)", text)
         self.assertIn("Внимание (начало → конец): большую часть времени → почти всегда", text)
         self.assertIn("Автоматизм: один-два отдельных эпизода; конкретные сбои: нет", text)
+        self.assertIn("🌅 Источник: утренняя Google Form", text)
+        self.assertIn("🎲 Источник: постигровая Google Form", text)
+        self.assertIn("окно между указанными временами: 8 ч (не фактический сон)", text)
+        self.assertIn("уход внимания при чтении: иногда", text)
         self.assertIn("3 дня: 2 анкет, 7 ч в 2 анкетах", text)
         self.assertIn("7 дней: 2 анкет", text)
         self.assertNotIn("доказан", text.lower())

@@ -12,6 +12,11 @@ def make_morning(day, sleepiness="нет", attention="нет", decisions="как
     return {
         "date": date.fromisoformat(day),
         "fields": {
+            "1. Во сколько лег спать?": "23:15",
+            "2. Во сколько окончательно проснулся?": "07:45",
+            "3. Сколько раз просыпался за ночь?": "2",
+            "4. Как быстро уснул?": "долго, около 40 минут",
+            "5. Как встал?": "тяжело",
             "6. Через 30–60 минут": sleepiness,
             "8. Когда читаешь": attention,
             "9. Простые решения": decisions,
@@ -24,7 +29,7 @@ class BriefTests(unittest.TestCase):
     def test_sparse_day_is_one_compact_report_without_raw_checklist(self):
         record = make_morning("2026-10-20", attention="иногда")
         text = brief.render(record, [record], [], monitor.get)
-        self.assertLess(len(text), 900)
+        self.assertLess(len(text), 1400)
         self.assertIn("🏔️ Everest | Алексей Жуков | 20.10.2026", text)
         self.assertIn("✅ Нет подтверждённых оснований менять план", text)
         self.assertIn("🔎 Значимые изменения", text)
@@ -33,7 +38,11 @@ class BriefTests(unittest.TestCase):
         self.assertIn("ℹ️ Надёжность: за 7 дней 1/7 анкет", text)
         self.assertIn("Проверяемой закономерности пока не выявлено.", text)
         self.assertNotIn("Весь наблюдаемый период", text)
-        self.assertNotIn("Окно между отходом ко сну", text)
+        self.assertIn("🌅 Источник: утренняя Google Form", text)
+        self.assertIn("отход ко сну: 23:15", text)
+        self.assertIn("засыпание: долго, около 40 минут", text)
+        self.assertIn("окно между указанными временами: 8.5 ч (не фактический сон)", text)
+        self.assertIn("сонливость через 30–60 минут: нет", text)
         self.assertNotIn("ФАКТ\n", text)
         self.assertNotIn("⚠️", text)
 
@@ -86,7 +95,7 @@ class BriefTests(unittest.TestCase):
         self.assertIn(insight["hypothesis"], text)
         self.assertIn(insight["curator_action"], text)
         self.assertIn("4/7 анкет", text)
-        self.assertLess(len(text), 900)
+        self.assertLess(len(text), 1400)
 
     def test_illness_is_distinguished_from_game_fatigue(self):
         record = make_morning("2026-10-20", body="признаки болезни")
