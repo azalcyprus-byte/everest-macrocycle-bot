@@ -12,31 +12,94 @@ def _choice(record, prefix, get):
     return get(record, prefix, "").strip().lower()
 
 
-def condition_index(record, get):
-    """Calculated 0..100 index based only on five explicit form answers."""
-    penalties = (
-        (_choice(record, "5. Как встал", get), {
-            "легко": 0, "обычно": 8, "тяжело": 18,
-            "очень тяжело, хотелось продолжать спать": 30,
-        }),
-        (_choice(record, "6. Через", get), {
-            "нет": 0, "немного": 10, "заметная, могу снова уснуть": 25,
-        }),
-        (_choice(record, "8. Когда", get), {
-            "нет": 0, "иногда": 12, "часто": 25,
-        }),
-        (_choice(record, "9. Простые", get), {
-            "как обычно": 0, "немного медленнее обычного": 12,
-            "заметно тяжелее обычного": 25,
-        }),
-    )
-    score = 100
-    for value, scale in penalties:
-        score -= scale.get(value, 0)
+def _sleep_window(record, get):
+    start = _clock_minutes(record, get)
+    raw = _choice(record, "2. Во сколько окончательно", get)[:5]
+    try:
+        hour, minute = (int(x) for x in raw.split(":"))
+        end = hour * 60 + minute
+    except (ValueError, TypeError):
+        return None
+    if start is None or not 0 <= hour < 24 or not 0 <= minute < 60:
+        return None
+    duration = (end - start) % 1440
+    return duration / 60 if duration else None
+
+
+def condition_components(record, get):
+    """Everest 100-point model: S(25) + Z(10) + V(35) + C(30)."""
+    hours = _sleep_window(record, get)
+    if hours is None:
+        duration_score = 0
+    elif 8 <= hours <= 10:
+        duration_score = 15
+    elif 7 <= hours < 8 or 10 < hours <= 11:
+        duration_score = 12
+    elif 6 <= hours < 7 or 11 < hours <= 12:
+        duration_score = 8
+    elif 5 <= hours < 6 or 12 < hours <= 13:
+        duration_score = 4
+    else:
+        duration_score = 0
+
+    awakenings = _choice(record, "3. Сколько раз", get)
+    if awakenings == "не просыпался":
+        awakening_score = 10
+    elif awakenings in {"1 раз", "просыпался 1–2 раза, быстро засыпал"}:
+        awakening_score = 8
+    elif awakenings == "2 раза и более":
+        awakening_score = 4
+    elif "часто просыпался" in awakenings or "долго не мог уснуть" in awakenings:
+        awakening_score = 2
+    else:
+        awakening_score = 0
+    s_score = duration_score + awakening_score
+
+    onset = _choice(record, "4. Как быстро уснул", get).replace("–", "-")
+    if "до 15" in onset:
+        z_score = 10
+    elif "15-30" in onset:
+        z_score = 8
+    elif "30-60" in onset:
+        z_score = 5
+    elif onset and onset != "нет данных":
+        z_score = 0
+    else:
+        z_score = 0
+
+    rise_score = {
+        "легко": 15, "обычно": 12, "тяжело": 6,
+        "очень тяжело, хотелось продолжать спать": 0,
+    }.get(_choice(record, "5. Как встал", get), 0)
+    sleepiness_score = {
+        "нет": 20, "немного": 12, "заметная, могу снова уснуть": 0,
+    }.get(_choice(record, "6. Через", get), 0)
+    v_score = rise_score + sleepiness_score
+
+    attention_score = {
+        "нет": 10, "иногда": 6, "часто": 0,
+    }.get(_choice(record, "8. Когда", get), 0)
+    decisions_score = {
+        "как обычно": 10, "немного медленнее обычного": 6,
+        "заметно тяжелее обычного": 0,
+    }.get(_choice(record, "9. Простые", get), 0)
     body = _choice(record, "7. Что", get)
-    if body and body not in {"нет данных", "ничего необычного"}:
-        score -= 30 if "признаки болезни" in body else 15
-    return max(0, min(100, score))
+    if body == "ничего необычного":
+        body_score = 10
+    elif "признаки болезни" in body:
+        body_score = 0
+    elif "слабость" in body:
+        body_score = 3
+    elif body and body != "нет данных":
+        body_score = 5
+    else:
+        body_score = 0
+    c_score = attention_score + decisions_score + body_score
+    return {"S": s_score, "Z": z_score, "V": v_score, "C": c_score}
+
+
+def condition_index(record, get):
+    return sum(condition_components(record, get).values())
 
 
 def _clock_minutes(record, get):
@@ -89,15 +152,17 @@ def _risk(record, get):
     body = _choice(record, "7. Что", get)
     if body not in {"", "нет данных", "ничего необычного"}:
         return body
-    return "явных утренних сигналов не отмечено"
+    return ("не выявлен — в ответах нет выраженной сонливости, проблем "
+            "внимания, замедления решений или недомогания")
 
 
 def render_report(record, morning, get, plan_type, recommendation):
-    score = condition_index(record, get)
+    components = condition_components(record, get)
+    score = sum(components.values())
     yesterday = record["date"] - timedelta(days=1)
     prior = next((r for r in morning if r["date"] == yesterday), None)
     delta = None if prior is None else score - condition_index(prior, get)
-    comparison = "нет анкеты за вчера" if delta is None else f"{delta:+d} к вчера"
+    comparison = "нет анкеты за вчера" if delta is None else f"изменение {delta:+d} баллов к вчера"
     hours = zhukov_plan.planned_opt_hours(plan_type)
     if plan_type is None:
         plan = "не указан"
@@ -115,11 +180,12 @@ def render_report(record, morning, get, plan_type, recommendation):
                  f"{_clock_text(average)}; отклонение {_duration_text(bedtime_delta)}")
     return (
         f"🏔️ Everest | Алексей Жуков | {record['date']:%d.%m.%Y}\n"
-        f"🌅 Состояние: {score}/100.\n"
+        f"🌅 Индекс утра: {score}/100 "
+        f"(S {components['S']} + Z {components['Z']} + V {components['V']} + C {components['C']}).\n"
         f"🔎 Значимые изменения: {comparison}.\n"
         f"📅 План: {plan}.\n"
         f"🎯 Рекомендация куратору: {recommendation}\n"
-        f"⚠️ Ключевой риск: {_risk(record, get)}.\n"
+        f"⚠️ Ключевой риск по утренней анкете: {_risk(record, get)}.\n"
         f"🌙 Режим сна: {sleep}."
     )
 
@@ -171,11 +237,11 @@ def render_chart_png(series):
     for value in range(0, 101, 20):
         y = bottom - value / 100 * plot_h
         draw.line((left, y, right, y), fill="#e5e9f0", width=1)
-        draw.text((right + 10, y - 8), str(value), fill="#556070", font=small)
+        draw.text((20, y - 8), str(value), fill="#556070", font=small)
     for i in range(6):
         value = max_hours * i / 5
         y = bottom - i / 5 * plot_h
-        draw.text((10, y - 8), f"{value:.0f}h", fill="#556070", font=small)
+        draw.text((right + 10, y - 8), f"{value:.0f}h", fill="#556070", font=small)
     n = len(series)
     step = plot_w / max(1, n - 1)
     bar_w = max(18, min(54, int(plot_w / max(1, n) * .48)))
