@@ -140,6 +140,23 @@ def _duration_text(minutes):
     return f"{sign}{value // 60}ч{value % 60:02d}м"
 
 
+def _hours_text(hours):
+    minutes = int(round(hours * 60))
+    return f"{minutes // 60}ч{minutes % 60:02d}м"
+
+
+def recent_sleep_window(record, morning, get, limit=7):
+    current = _sleep_window(record, get)
+    previous = sorted(
+        (r for r in morning if r["date"] < record["date"]),
+        key=lambda r: r["date"], reverse=True,
+    )[:limit]
+    values = [value for value in (_sleep_window(r, get) for r in previous)
+              if value is not None]
+    average = sum(values) / len(values) if values else None
+    return current, average, len(values)
+
+
 def _risk(record, get):
     if "признаки болезни" in _choice(record, "7. Что", get):
         return "признаки недомогания"
@@ -171,6 +188,9 @@ def render_report(record, morning, get, plan_type, recommendation):
     else:
         plan = str(plan_type) + " · " + format(hours.normalize(), "f").replace(".", ",") + " ч"
     current, average, bedtime_delta, count = recent_bedtime(record, morning, get)
+    window, average_window, window_count = recent_sleep_window(
+        record, morning, get,
+    )
     if current is None:
         sleep = "время отхода ко сну не распознано"
     elif average is None:
@@ -178,6 +198,15 @@ def render_report(record, morning, get, plan_type, recommendation):
     else:
         sleep = (f"лёг {_clock_text(current)}; среднее предыдущих {count} анкет "
                  f"{_clock_text(average)}; отклонение {_duration_text(bedtime_delta)}")
+    if window is None:
+        sleep_window_text = "окно сна не рассчитано"
+    elif average_window is None:
+        sleep_window_text = f"окно сна {_hours_text(window)}; среднего пока нет"
+    else:
+        sleep_window_text = (
+            f"окно сна {_hours_text(window)}; среднее предыдущих "
+            f"{window_count} анкет {_hours_text(average_window)}"
+        )
     return (
         f"🏔️ Everest | Алексей Жуков | {record['date']:%d.%m.%Y}\n"
         f"🌅 Индекс утра: {score}/100 "
@@ -186,7 +215,7 @@ def render_report(record, morning, get, plan_type, recommendation):
         f"📅 План: {plan}.\n"
         f"🎯 Рекомендация куратору: {recommendation}\n"
         f"⚠️ Ключевой риск по утренней анкете: {_risk(record, get)}.\n"
-        f"🌙 Режим сна: {sleep}."
+        f"🌙 Режим сна: {sleep}; {sleep_window_text}."
     )
 
 

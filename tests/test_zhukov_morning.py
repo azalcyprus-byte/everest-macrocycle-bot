@@ -64,6 +64,8 @@ class MorningReportTests(unittest.TestCase):
         self.assertIn("План: L+ · 4,5 ч", text)
         self.assertIn("Ключевой риск по утренней анкете:", text)
         self.assertIn("отклонение +1ч30м", text)
+        self.assertIn("окно сна 8ч30м", text)
+        self.assertIn("среднее предыдущих 1 анкет 8ч30м", text)
         self.assertLess(len(text), 1024)
 
 
