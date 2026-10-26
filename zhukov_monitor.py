@@ -19,6 +19,7 @@ import zhukov_ai
 import zhukov_brief
 import zhukov_evening
 import zhukov_plan
+import zhukov_morning
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -639,6 +640,10 @@ def telegram_report_html(text):
         r"(?m)^(📅 План нагрузки:|🎮 Игровой день:|🎲 Факт игры:)([^\n]*)$",
         r"<b>\1</b>\2", output,
     )
+    output = re.sub(
+        r"(?m)^(🌅 Состояние:|🔎 Значимые изменения:|📅 План:|🎯 Рекомендация куратору:|⚠️ Ключевой риск:|🌙 Режим сна:)([^\n]*)$",
+        r"<b>\1</b>\2", output,
+    )
     return output
 
 
@@ -693,7 +698,7 @@ def record_curator_decision(spreadsheet, day, decision, curator_id):
 
 
 async def _send_once(bot, ws, records, event):
-    key, kind, day, due, text = event
+    key, kind, day, due, text, photo = (*event, None)[:6]
     if key in records:
         return
     ws.append_row([key, kind, day.isoformat(), due.isoformat(), text,
@@ -702,13 +707,19 @@ async def _send_once(bot, ws, records, event):
     records.add(key)
     try:
         _, _, chat_id = config()
-        # AI reports may exceed Telegram's single-message limit.
-        for part in split_telegram_text(text):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=telegram_report_html(part),
-                parse_mode="HTML",
+        if photo is not None:
+            await bot.send_photo(
+                chat_id=chat_id, photo=photo,
+                caption=telegram_report_html(text), parse_mode="HTML",
             )
+        else:
+            # AI reports may exceed Telegram's single-message limit.
+            for part in split_telegram_text(text):
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=telegram_report_html(part),
+                    parse_mode="HTML",
+                )
     except Exception as exc:
         logger.exception("Zhukov monitor notification failed for %s", key)
         # Do not automatically retry ambiguous network failures: no duplicate alerts.
@@ -827,7 +838,7 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                     day, deadline,
                     f"⚠️ Everest | Алексей Жуков\nНа контрольный момент "
                     f"{deadline.strftime('%d.%m.%Y %H:%M')} (время Google Таблицы: {getattr(tz,'key',str(tz))}) "
-                    f"утреннего отчёта за {day.strftime('%d.%m.%Y')} не было. {qualifier}",
+                    f"утреннего отчёта за {day.strftime('%d.%m.%Y')} не было. {qualifier}", None,
                 ))
         for record in morning:
             day = record["date"]
@@ -842,7 +853,7 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                            day, record["timestamp"], zhukov_brief.render(
                                record, morning, postgame, get, ai_unavailable=True,
                                plan_type=zhukov_plan.planned_type_for(plan_types, day),
-                           )))
+                           ), None))
         for record in postgame:
             day = record["date"]
             stamp = record["timestamp"]
@@ -856,9 +867,9 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
             if key in known:
                 continue
             events.append((
-                key, "EVENING_ANALYSIS", day, stamp, None,
+                key, "EVENING_ANALYSIS", day, stamp, None, None,
             ))
-        for key, kind, day, when, message in sorted(events, key=lambda x: (x[2], x[1])):
+        for key, kind, day, when, message, photo in sorted(events, key=lambda x: (x[2], x[1])):
             if key in known:
                 continue
             if kind == "ANALYSIS":
@@ -868,6 +879,20 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                         message, target, morning, postgame,
                         plan_type=zhukov_plan.planned_type_for(plan_types, day),
                     )
+                    recommendation = zhukov_brief.recommendation_from_report(message)
+                    plan_type = zhukov_plan.planned_type_for(plan_types, day)
+                    message = zhukov_morning.render_report(
+                        target, morning, get, plan_type, recommendation,
+                    )
+                    try:
+                        photo = zhukov_morning.render_chart_png(
+                            zhukov_morning.chart_series(
+                                target, morning, postgame, get, plan_types,
+                            )
+                        )
+                    except Exception:
+                        logger.exception("Zhukov morning chart generation failed for %s", day)
+                        message += "\n📈 График недоступен: ошибка построения отмечена в логах."
             elif kind == "EVENING_ANALYSIS":
                 game = next((r for r in postgame if r["date"] == day), None)
                 if game is None:
@@ -876,4 +901,4 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                     game, morning, postgame,
                     plan_type=zhukov_plan.planned_type_for(plan_types, day),
                 )
-            await _send_once(bot, log_tab, known, (key, kind, day, when, message))
+            await _send_once(bot, log_tab, known, (key, kind, day, when, message, photo))

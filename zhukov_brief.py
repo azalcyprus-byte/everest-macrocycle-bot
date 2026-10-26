@@ -183,6 +183,15 @@ def _fallback_action(snapshot):
     return "Сохранить согласованный план и сравнить внимание в следующем отчёте."
 
 
+def recommendation_from_report(text):
+    """Extract the already safety-filtered curator recommendation."""
+    marker = "🎯 Рекомендация куратору\n"
+    if marker not in str(text):
+        return "сохранить согласованный план и проверить следующий отчёт."
+    value = str(text).split(marker, 1)[1].split("\n\n", 1)[0].strip()
+    return value or "сохранить согласованный план и проверить следующий отчёт."
+
+
 def render(record, morning, games, get, insight=None, *,
            ai_unavailable=False, plan_type=None):
     """Render ONE compact plain-text Telegram brief.

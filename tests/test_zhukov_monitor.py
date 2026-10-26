@@ -70,6 +70,11 @@ class Bot:
         self.messages.append((chat_id, text))
         self.parse_modes.append(kwargs.get("parse_mode"))
 
+    async def send_photo(self, chat_id, photo, caption, **kwargs):
+        self.messages.append((chat_id, caption))
+        self.parse_modes.append(kwargs.get("parse_mode"))
+        self.photo = photo.read()
+
 
 class PureLogicTests(unittest.TestCase):
     def test_fixed_30h_then_24h(self):

@@ -3,3 +3,4 @@ aiohttp==3.11.11
 gspread==6.2.1
 google-auth==2.40.3
 google-api-python-client>=2.0,<3.0
+Pillow==11.1.0
