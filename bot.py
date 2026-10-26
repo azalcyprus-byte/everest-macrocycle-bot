@@ -8918,6 +8918,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
+    # Telegram occasionally delivers pasted command-like text without a
+    # BotCommand entity. Route it explicitly before the curator AI fallback.
+    morning_command = re.fullmatch(
+        r"/?zhukovmorning(?:@[A-Za-z0-9_]+)?\s+(\S+)", text, re.IGNORECASE,
+    )
+    if morning_command and is_authorized(update):
+        context.args = [morning_command.group(1)]
+        logger.info("Routing text fallback to /zhukovmorning")
+        await zhukovmorning(update, context)
+        return
+
     if is_zhukov(update):
         if MORNING_TRIGGER_PATTERN.search(text):
             await start_zhukov_morning_session(update, context)
