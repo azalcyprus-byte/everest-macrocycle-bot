@@ -12,6 +12,8 @@ import zhukov_monitor
 import zhukov_ai
 import zhukov_evening
 import zhukov_plan
+import zhukov_morning
+import zhukov_brief
 import everest_curator_chat
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -5506,6 +5508,59 @@ async def zhukovai(
         )
 
 
+async def zhukovmorning(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Rebuild the agreed compact morning report and PNG for one date."""
+    if not is_authorized(update):
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    args = context.args or []
+    target_day = zhukov_monitor.parse_date(args[0]) if len(args) == 1 else None
+    if target_day is None:
+        await update.effective_message.reply_text(
+            "Формат: /zhukovmorning 26.10.2026\n"
+            "Можно также указать 2026-10-26."
+        )
+        return
+    try:
+        book = await asyncio.to_thread(get_zhukov_spreadsheet)
+        plan = await asyncio.to_thread(zhukov_plan.optional_plan_types)
+        source = await asyncio.to_thread(
+            zhukov_monitor.read_ai_report_inputs, book, target_day, plan,
+        )
+        if source is None:
+            await update.effective_message.reply_text(
+                f"За {target_day:%d.%m.%Y} нет утренней анкеты."
+            )
+            return
+        base_report, record, morning_rows, game_rows = source
+        recommendation = zhukov_brief.recommendation_from_report(base_report)
+        report = zhukov_morning.render_report(
+            record, morning_rows, zhukov_monitor.get,
+            zhukov_plan.planned_type_for(plan, target_day), recommendation,
+        )
+        chart = zhukov_morning.render_chart_png(
+            zhukov_morning.chart_series(
+                record, morning_rows, game_rows, zhukov_monitor.get, plan,
+            )
+        )
+        await update.effective_message.reply_photo(
+            photo=chart,
+            caption=zhukov_monitor.telegram_report_html(report),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Zhukov manual morning report failed")
+        await update.effective_message.reply_text(
+            "Не удалось сформировать утренний отчёт с графиком. "
+            "Исходные анкеты и журнал не изменены."
+        )
+
+
 async def zhukovevening(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8932,6 +8987,7 @@ async def main() -> None:
     telegram_app.add_handler(CommandHandler("zhukovtest", zhukovtest))
     telegram_app.add_handler(CommandHandler("zhukovdecision", zhukovdecision))
     telegram_app.add_handler(CommandHandler("zhukovreport", zhukovreport))
+    telegram_app.add_handler(CommandHandler("zhukovmorning", zhukovmorning))
     telegram_app.add_handler(CommandHandler("zhukovevening", zhukovevening))
     telegram_app.add_handler(CommandHandler("zhukovai", zhukovai))
     telegram_app.add_handler(CommandHandler("everestai", everestai))
