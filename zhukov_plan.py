@@ -1,7 +1,7 @@
 """Read-only parser for Alexey's published Everest macrocycle daily plan.
 
 Source: separate Google Sheet "Everest — Алексей Жуков",
-tab "Волна по дням", columns "Дата", "Day Type".
+tab "Макроцикл 2", columns "Дата", "Day Type".
 Dates in that sheet are DD.MM without the year; the cycle year is explicit.
 Do not infer a plan for dates absent from the source.
 """
@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 import re
 
 _ALLOWED_CODE = re.compile(r"^[A-Z][A-Z0-9+/-]{0,7}$")
+DEFAULT_PLAN_SHEET = "Макроцикл 2"
 
 
 class PlannedLoadCode(str):
@@ -132,9 +133,12 @@ def load_plan_types():
             scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
         )
         client = gspread.authorize(credentials)
+        plan_sheet = os.getenv(
+            "ZHUKOV_PLAN_SHEET", DEFAULT_PLAN_SHEET
+        ).strip() or DEFAULT_PLAN_SHEET
         rows = client.open_by_key(spreadsheet_id).worksheet(
-            "Волна по дням"
-        ).get("A1:E250", value_render_option="FORMATTED_VALUE")
+            plan_sheet
+        ).get("A1:I250", value_render_option="FORMATTED_VALUE")
         parsed = parse_plan_rows(rows, year=year)
         _cache = parsed
         _cache_time = now
