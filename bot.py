@@ -230,6 +230,22 @@ MORNING_90_FORM_URL = _normalize_google_form_url(
     os.environ.get("MORNING_90_FORM_URL", "")
 )
 
+# Andrey's M5 forms are independent of Alexey's checklist configuration.
+INGAME_STATE_FORM_URL = _normalize_google_form_url(
+    os.environ.get(
+        "INGAME_STATE_FORM_URL",
+        "https://docs.google.com/forms/d/e/1FAIpQLSeRejUXPdZu4Fl3JThIkKU-lxzIl7dfjt5eBc6TJc31utI6Mg/viewform",
+    )
+)
+POSTGAME_FORM_URL = _normalize_google_form_url(
+    os.environ.get(
+        "POSTGAME_FORM_URL",
+        "https://docs.google.com/forms/d/e/1FAIpQLScGTgxHLON1ZcWK1FN0a-R3I9io-iSmROZ5rPuCyU5spxlkJg/viewform",
+    )
+)
+OWNER_MENU_INGAME = "🧠 Контроль во время игры"
+OWNER_MENU_POSTGAME = "📝 Отчёт после игры"
+
 # Independent observation flow for Alexey Zhukov. Railway can override every
 # value, while these responder links remain safe defaults.
 ZHUKOV_MORNING_FORM_URL = _normalize_google_form_url(
@@ -5217,6 +5233,80 @@ def test_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def owner_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Keep Andrey's two M5 checklist buttons below the message input."""
+    return ReplyKeyboardMarkup(
+        [[OWNER_MENU_INGAME], [OWNER_MENU_POSTGAME]],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+    )
+
+
+def owner_game_forms_keyboard(label: str | None = None) -> InlineKeyboardMarkup:
+    links = (
+        (OWNER_MENU_INGAME, INGAME_STATE_FORM_URL),
+        (OWNER_MENU_POSTGAME, POSTGAME_FORM_URL),
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(title, url=url)]
+        for title, url in links
+        if url and (label is None or title == label)
+    ])
+
+
+async def handle_owner_game_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    if (not is_authorized(update)
+            or is_zhukov(update)
+            or update.effective_chat is None
+            or update.effective_chat.type != "private"
+            or update.effective_message is None):
+        return False
+    if text not in (OWNER_MENU_INGAME, OWNER_MENU_POSTGAME):
+        return False
+    url = (INGAME_STATE_FORM_URL
+           if text == OWNER_MENU_INGAME else POSTGAME_FORM_URL)
+    if not url:
+        await update.effective_message.reply_text(
+            "Ссылка на этот чек-лист пока не настроена."
+        )
+        return True
+    await update.effective_message.reply_text(
+        text + ":\n" + url,
+        reply_markup=owner_game_forms_keyboard(text),
+    )
+    return True
+
+
+async def install_owner_game_menu(bot) -> None:
+    """Deliver the updated private keyboard once; journal survives restarts."""
+    if ALLOWED_USER_ID == ZHUKOV_TELEGRAM_USER_ID:
+        return
+    links = INGAME_STATE_FORM_URL + "|" + POSTGAME_FORM_URL
+    revision = hashlib.sha256(links.encode("utf-8")).hexdigest()[:16]
+    try:
+        sent = await _send_morning_message_once(
+            bot=bot,
+            chat_id=ALLOWED_USER_ID,
+            idempotency_key=f"owner-game-menu:m5-v1:{revision}",
+            operation="OWNER_GAME_MENU",
+            object_id="M5_GAME_FORMS",
+            text=(
+                "Добавлены две кнопки под строкой ввода:\n"
+                + OWNER_MENU_INGAME + "\n" + OWNER_MENU_POSTGAME + "\n\n"
+                "Нажми нужную кнопку — получишь ссылку на Google-форму."
+            ),
+            reply_markup=owner_main_menu_keyboard(),
+        )
+        logger.info("Owner M5 game menu delivered=%s", sent)
+    except Exception:
+        logger.exception("Owner M5 menu delivery failed; /start and /forms remain available")
+
+
 def zhukov_main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Persistent ReplyKeyboard visible only to Alexey after /start or /forms."""
     return ReplyKeyboardMarkup(
@@ -5280,9 +5370,11 @@ async def zhukov_forms(
         return
     if not is_authorized(update):
         return
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return
     await update.effective_message.reply_text(
-        "Чек-листы Алексея Жукова:",
-        reply_markup=zhukov_forms_keyboard(),
+        "Твои игровые чек-листы M5:",
+        reply_markup=owner_game_forms_keyboard(),
     )
 
 
@@ -6028,7 +6120,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Для запуска дневного контура напишите: Доброе утро\n"
         "Статус утра: /morningstatus\n"
         "Статус вечернего закрытия: /eveningstatus\n"
-        "Статус контура Жукова: /zhukovstatus"
+        "Статус контура Жукова: /zhukovstatus\n\n"
+        "Игровые формы M5 доступны на кнопках под строкой ввода и через /forms.",
+        reply_markup=(
+            owner_main_menu_keyboard()
+            if update.effective_chat is not None
+            and update.effective_chat.type == "private" else None
+        ),
     )
 
 
@@ -6842,7 +6940,7 @@ async def _send_morning_message_once(
     operation: str,
     object_id: str,
     text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
     payload: dict | None = None,
 ) -> bool:
     claim = await asyncio.to_thread(
@@ -9107,6 +9205,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if await handle_owner_game_menu(update, context, text):
+        return
+
     if await _handle_evening_snooze_message(update, context, text):
         return
 
@@ -9244,6 +9345,7 @@ async def main() -> None:
             drop_pending_updates=True,
         )
         logger.info("Telegram bot started.")
+        await install_owner_game_menu(telegram_app.bot)
         await asyncio.Event().wait()
     finally:
         await telegram_app.updater.stop()

@@ -13,6 +13,7 @@ on:
       - "tests/test_zhukov_evening_v2.py"
       - "zhukov_sleep.py"
       - "tests/test_zhukov_sleep.py"
+      - "tests/test_owner_game_menu.py"
       - "tests/test_zhukov_evening.py"
       - "everest_curator_chat.py"
       - "tests/test_everest_curator_chat.py"
@@ -42,5 +43,6 @@ jobs:
       - run: python -m compileall -q bot.py zhukov_monitor.py zhukov_ai.py zhukov_evening.py zhukov_evening_v2.py tests/test_zhukov_evening_v2.py zhukov_sleep.py tests/test_zhukov_sleep.py tests/test_zhukov_evening.py zhukov_brief.py tests/test_zhukov_monitor.py tests/test_zhukov_brief.py zhukov_plan.py tests/test_zhukov_plan.py everest_curator_chat.py tests/test_everest_curator_chat.py
       - run: python -m unittest discover -s tests -p "test_zhukov_*.py" -v
       - run: python -m unittest discover -s tests -p "test_everest_curator_chat.py" -v
+      - run: python -m unittest discover -s tests -p "test_owner_game_menu.py" -v
       - run: cp apps_script/ZhukovEvents.gs /tmp/ZhukovEvents.js && node --check /tmp/ZhukovEvents.js
       - run: node tests/test_zhukov_apps_script.js

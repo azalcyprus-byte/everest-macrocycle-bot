@@ -152,10 +152,11 @@ class BedtimeMenuTests(unittest.IsolatedAsyncioTestCase):
         ])
         curator = FakeUpdate("/start", user_id=900)
         await bot.start(curator, SimpleNamespace())
-        self.assertFalse(any(
-            "reply_markup" in kwargs for _, kwargs
-            in curator.effective_message.replies
-        ))
+        curator_markup = curator.effective_message.replies[-1][1]["reply_markup"]
+        self.assertEqual(
+            [[b.text for b in row] for row in curator_markup.keyboard],
+            [[bot.OWNER_MENU_INGAME], [bot.OWNER_MENU_POSTGAME]],
+        )
 
     async def test_morning_and_evening_return_existing_form_urls(self):
         with patch.object(bot, "ZHUKOV_MORNING_FORM_URL",
