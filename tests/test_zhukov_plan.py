@@ -104,6 +104,10 @@ class PlannedLoadTests(unittest.TestCase):
             "0",
         )
 
+    def test_second_macrocycle_is_default_and_empty_plan_stays_empty(self):
+        self.assertEqual(plan.DEFAULT_PLAN_SHEET, "Макроцикл 2")
+        self.assertEqual(plan.parse_plan_rows([self.rows[0]], year=2026), {})
+
     def test_never_reuses_a_prior_year_or_guesses_unlisted_days(self):
         self.assertIsNone(plan.planned_type_for(self.types, date(2027, 10, 20)))
         self.assertIsNone(plan.planned_type_for(self.types, date(2026, 11, 11)))
