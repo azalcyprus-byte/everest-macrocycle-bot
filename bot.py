@@ -12,6 +12,7 @@ import zhukov_monitor
 import zhukov_ai
 import zhukov_sleep
 import zhukov_evening
+import zhukov_evening_v2
 import zhukov_plan
 import zhukov_morning
 import zhukov_brief
@@ -55,6 +56,7 @@ ZHUKOV_GOOGLE_SHEET_ID = os.environ.get(
     "ZHUKOV_GOOGLE_SHEET_ID",
     "1Ax_cP0of8ezqL-COJjFBlleHz_Xcle3T1h0vxFrjUmM",
 ).strip()
+ZHUKOV_EVENING_GOOGLE_SHEET_ID = os.environ.get("ZHUKOV_EVENING_GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CALENDAR_ID = os.environ.get(
     "GOOGLE_CALENDAR_ID",
     "azalcyprus@gmail.com",
@@ -162,6 +164,7 @@ action_journal_thread_lock = threading.Lock()
 spreadsheet_connection_lock = threading.Lock()
 _cached_spreadsheet = None
 _cached_zhukov_spreadsheet = None
+_cached_zhukov_evening_spreadsheet = None
 _cached_action_journal_worksheet = None
 _cached_evening_worksheet = None
 _action_journal_headers_validated = False
@@ -525,6 +528,21 @@ def get_zhukov_spreadsheet():
             operation="open Zhukov spreadsheet",
         )
         return _cached_zhukov_spreadsheet
+
+
+def get_zhukov_evening_spreadsheet():
+    """Read new evening responses using Alexey's existing service-account client."""
+    global _cached_zhukov_evening_spreadsheet
+    if not ZHUKOV_EVENING_GOOGLE_SHEET_ID:
+        return None
+    morning = get_zhukov_spreadsheet()
+    with spreadsheet_connection_lock:
+        if _cached_zhukov_evening_spreadsheet is None:
+            _cached_zhukov_evening_spreadsheet = _sheets_api_call(
+                lambda: morning.client.open_by_key(ZHUKOV_EVENING_GOOGLE_SHEET_ID),
+                operation="open Alexey new evening response spreadsheet",
+            )
+        return _cached_zhukov_evening_spreadsheet
 
 
 def _batch_get_values(spreadsheet, ranges: list[str]) -> list[list[list[str]]]:
@@ -5687,9 +5705,21 @@ async def zhukovevening(
         return
     try:
         book = await asyncio.to_thread(get_zhukov_spreadsheet)
-        historical = await asyncio.to_thread(
-            zhukov_evening.read_historical_inputs, book, target_day,
-        )
+        # Prefer the new all-days evening form, then the legacy postgame form
+        # for historical dates. Never merge their incompatible schemas.
+        historical = None
+        is_new_form = False
+        new_book = await asyncio.to_thread(get_zhukov_evening_spreadsheet)
+        if new_book is not None:
+            historical = await asyncio.to_thread(
+                zhukov_evening_v2.historical_inputs,
+                new_book, book, target_day,
+            )
+            is_new_form = historical is not None
+        if historical is None:
+            historical = await asyncio.to_thread(
+                zhukov_evening.read_historical_inputs, book, target_day,
+            )
     except Exception:
         logger.exception("Zhukov manual postgame source read failed")
         await update.effective_message.reply_text(
@@ -5707,9 +5737,14 @@ async def zhukovevening(
     try:
         plan = await asyncio.to_thread(zhukov_plan.optional_plan_types)
         planned_load = zhukov_plan.planned_type_for(plan, target_day)
-        report = await zhukov_evening.enrich_report(
-            record, morning, games, plan_type=planned_load,
-        )
+        if is_new_form:
+            report = zhukov_evening_v2.render(
+                record, morning, games, plan_type=planned_load,
+            )
+        else:
+            report = await zhukov_evening.enrich_report(
+                record, morning, games, plan_type=planned_load,
+            )
     except Exception:
         logger.exception("Zhukov manual postgame analysis failed")
         await update.effective_message.reply_text(
@@ -5853,9 +5888,22 @@ async def zhukov_curator_monitor_tick(
         return
     try:
         sheet = await asyncio.to_thread(get_zhukov_spreadsheet)
+    except Exception:
+        logger.exception("Zhukov morning spreadsheet unavailable")
+        return
+    try:
         await zhukov_monitor.tick(context.bot, sheet)
     except Exception:
-        logger.exception("Zhukov curator monitoring tick failed")
+        logger.exception("Zhukov legacy monitoring tick failed")
+    if ZHUKOV_EVENING_GOOGLE_SHEET_ID:
+        try:
+            evening_sheet = await asyncio.to_thread(get_zhukov_evening_spreadsheet)
+            await zhukov_evening_v2.tick(context.bot, sheet, evening_sheet)
+        except Exception:
+            logger.exception(
+                "New evening source unavailable: check service-account access "
+                "and ZHUKOV_EVENING_RESPONSES_TAB"
+            )
 
 
 async def zhukov_orchestrator_tick(
