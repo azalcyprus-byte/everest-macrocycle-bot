@@ -89,6 +89,27 @@ class FakeBot:
         self.sent.append((chat_id, text))
 
 
+class NewEveningSpreadsheetAccessTests(unittest.TestCase):
+    def test_uses_high_level_gspread_client_not_spreadsheet_http_client(self):
+        from unittest.mock import sentinel
+        with patch.dict(os.environ, {
+            "BOT_TOKEN": "123456789:FAKE_TEST_TOKEN",
+            "TELEGRAM_USER_ID": "900",
+        }):
+            import bot
+        with patch.object(bot, "ZHUKOV_EVENING_GOOGLE_SHEET_ID", "new-sheet-id"), \
+             patch.object(bot, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}"), \
+             patch.object(bot, "_cached_zhukov_evening_spreadsheet", None), \
+             patch.object(bot.Credentials, "from_service_account_info",
+                          return_value=sentinel.credentials), \
+             patch.object(bot.gspread, "authorize") as authorize:
+            authorize.return_value.open_by_key.return_value = sentinel.sheet
+            result = bot.get_zhukov_evening_spreadsheet()
+            self.assertIs(result, sentinel.sheet)
+            authorize.assert_called_once_with(sentinel.credentials)
+            authorize.return_value.open_by_key.assert_called_once_with("new-sheet-id")
+
+
 class NewEveningTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {
