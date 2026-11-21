@@ -531,15 +531,29 @@ def get_zhukov_spreadsheet():
 
 
 def get_zhukov_evening_spreadsheet():
-    """Read new evening responses using Alexey's existing service-account client."""
+    """Open the new evening response spreadsheet via the service-account Client.
+
+    gspread.Spreadsheet.client is an HTTPClient in gspread 6.2, not the
+    high-level Client, so it has no open_by_key method.
+    """
     global _cached_zhukov_evening_spreadsheet
     if not ZHUKOV_EVENING_GOOGLE_SHEET_ID:
         return None
-    morning = get_zhukov_spreadsheet()
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing.")
     with spreadsheet_connection_lock:
         if _cached_zhukov_evening_spreadsheet is None:
+            info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+            credentials = Credentials.from_service_account_info(
+                info,
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive",
+                ],
+            )
+            client = gspread.authorize(credentials)
             _cached_zhukov_evening_spreadsheet = _sheets_api_call(
-                lambda: morning.client.open_by_key(ZHUKOV_EVENING_GOOGLE_SHEET_ID),
+                lambda: client.open_by_key(ZHUKOV_EVENING_GOOGLE_SHEET_ID),
                 operation="open Alexey new evening response spreadsheet",
             )
         return _cached_zhukov_evening_spreadsheet
