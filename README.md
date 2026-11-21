@@ -36,11 +36,16 @@ ZHUKOV_ORCHESTRATOR_TICK_SECONDS=60
 ZHUKOV_GOOGLE_SHEET_ID=1Ax_cP0of8ezqL-COJjFBlleHz_Xcle3T1h0vxFrjUmM
 ZHUKOV_MORNING_SHEET=Утро — ответы
 ZHUKOV_POSTGAME_SHEET=После игры — ответы
+ZHUKOV_EVENING_GOOGLE_SHEET_ID=1I_6iEwyCvk69gF3YRcwTh994_K55sdbvrjRZrNkXrdo
+ZHUKOV_EVENING_RESPONSES_TAB=Form Responses 1
+ZHUKOV_PLAN_SPREADSHEET_ID=1zhViAYswrLlOQJltqkZYRO8cNrxrdHtBkVNs_tHRbr8
+ZHUKOV_PLAN_SHEET=Макроцикл 2
+ZHUKOV_PLAN_YEAR=2026
 ```
 
 Ссылки на обе формы уже имеют безопасные значения по умолчанию; при необходимости их можно заменить переменными `ZHUKOV_MORNING_FORM_URL` и `ZHUKOV_POSTGAME_FORM_URL`.
 
-Чтобы бот видел ответы, таблицу Жукова нужно открыть для адреса `client_email` из действующей переменной `GOOGLE_SERVICE_ACCOUNT_JSON` в роли читателя.
+Чтобы бот видел утренние и вечерние ответы, обе таблицы ответов и таблицу плана нужно открыть для адреса `client_email` из действующей переменной `GOOGLE_SERVICE_ACCOUNT_JSON` в роли читателя.
 
 ## Вечерняя форма
 
