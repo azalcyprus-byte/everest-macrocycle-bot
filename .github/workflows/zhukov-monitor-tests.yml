@@ -21,7 +21,7 @@ on:
       - ".github/workflows/zhukov-monitor-tests.yml"
   push:
     branches:
-      - feature/zhukov-state-monitoring
+      - "feature/**"
 permissions:
   contents: read
 jobs:
