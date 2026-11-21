@@ -10,6 +10,7 @@ import time as time_module
 import uuid
 import zhukov_monitor
 import zhukov_ai
+import zhukov_sleep
 import zhukov_evening
 import zhukov_plan
 import zhukov_morning
@@ -24,7 +25,7 @@ from aiohttp import web
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -102,6 +103,7 @@ day_plan_test_lock = asyncio.Lock()
 full_plan_test_lock = asyncio.Lock()
 morning_test_lock = asyncio.Lock()
 coordinator_lock = asyncio.Lock()
+zhukov_bedtime_lock = asyncio.Lock()
 morning_planning_lock = asyncio.Lock()
 persistent_scheduled_keys: set[str] = set()
 
@@ -235,6 +237,10 @@ ZHUKOV_POSTGAME_FORM_URL = _normalize_google_form_url(
         "https://docs.google.com/forms/d/e/1FAIpQLScy-MqtW-CMza1Wh5NLrom_-3aBZrMj_i5J0KO-KCtheiWLNw/viewform",
     )
 )
+
+ZHUKOV_MENU_MORNING = "☀️ Утренний отчёт"
+ZHUKOV_MENU_EVENING = "🌙 Вечерний отчёт"
+ZHUKOV_MENU_SLEEP = "🛏 Ложусь спать"
 
 # Evening closure flow. The URL supplied by Andrey is the safe default;
 # Railway can override it without changing code.
@@ -5175,6 +5181,19 @@ def test_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def zhukov_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent ReplyKeyboard visible only to Alexey after /start or /forms."""
+    return ReplyKeyboardMarkup(
+        [
+            [ZHUKOV_MENU_MORNING, ZHUKOV_MENU_EVENING],
+            [ZHUKOV_MENU_SLEEP],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+    )
+
+
 def zhukov_forms_keyboard(
     *,
     morning: bool = True,
@@ -5215,12 +5234,89 @@ async def zhukov_forms(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    if not (is_zhukov(update) or is_authorized(update)):
+    if is_zhukov(update):
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            return
+        await update.effective_message.reply_text(
+            "Меню Everest: выбери нужную кнопку под строкой ввода.",
+            reply_markup=zhukov_main_menu_keyboard(),
+        )
+        return
+    if not is_authorized(update):
         return
     await update.effective_message.reply_text(
         "Чек-листы Алексея Жукова:",
         reply_markup=zhukov_forms_keyboard(),
     )
+
+
+async def handle_zhukov_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    """Route only Alexey's own private-chat reply-keyboard choices."""
+    if not is_zhukov(update):
+        return False
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return False
+    if text == ZHUKOV_MENU_MORNING:
+        if not ZHUKOV_MORNING_FORM_URL:
+            await update.effective_message.reply_text(
+                "Ссылка на утреннюю форму пока не настроена."
+            )
+        else:
+            await update.effective_message.reply_text(
+                "☀️ Утренний отчёт Алексея:\n" + ZHUKOV_MORNING_FORM_URL,
+                reply_markup=zhukov_forms_keyboard(morning=True, postgame=False),
+            )
+        return True
+    if text == ZHUKOV_MENU_EVENING:
+        if not ZHUKOV_POSTGAME_FORM_URL:
+            await update.effective_message.reply_text(
+                "Ссылка на вечернюю форму пока не настроена."
+            )
+        else:
+            await update.effective_message.reply_text(
+                "🌙 Вечерний (постигровой) отчёт Алексея:\n"
+                + ZHUKOV_POSTGAME_FORM_URL,
+                reply_markup=zhukov_forms_keyboard(morning=False, postgame=True),
+            )
+        return True
+    if text == ZHUKOV_MENU_SLEEP:
+        # Use Telegram's incoming message time, not the (possibly later)
+        # time when Google Sheets processing completes.
+        pressed_at = update.effective_message.date or datetime.now(ZoneInfo("UTC"))
+        try:
+            async with zhukov_bedtime_lock:
+                spreadsheet = await asyncio.to_thread(get_zhukov_spreadsheet)
+                created, local = await asyncio.to_thread(
+                    zhukov_sleep.save_bedtime,
+                    spreadsheet,
+                    pressed_at,
+                    local_timezone=getattr(ZHUKOV_TZ, "key", "Asia/Phnom_Penh"),
+                )
+        except Exception:
+            logger.exception("Zhukov bedtime timestamp could not be persisted")
+            await update.effective_message.reply_text(
+                "Не удалось сохранить время отхода ко сну. "
+                "Попробуй нажать кнопку ещё раз."
+            )
+            return True
+        label = local.strftime("%d.%m.%Y в %H:%M")
+        zone_name = getattr(ZHUKOV_TZ, "key", "Asia/Phnom_Penh")
+        if created:
+            await update.effective_message.reply_text(
+                f"🛏 Отметка «Ложусь спать» сохранена: {label} ({zone_name}).\n"
+                "Это время нажатия кнопки, а не измеренное время засыпания."
+            )
+        else:
+            await update.effective_message.reply_text(
+                f"🛏 Отметка уже сохранена: {label} ({zone_name}).\n"
+                "Повторное нажатие в течение 30 минут не создаёт новую запись."
+            )
+        return True
+    return False
 
 
 async def zhukovstatus(
@@ -5843,13 +5939,16 @@ async def zhukov_orchestrator_tick(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_zhukov(update):
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            return
         await update.effective_message.reply_text(
-            "Алексей, бот Everest подключён ✅\n\n"
-            "Чтобы получить утренний чек-лист, напиши: Доброе утро\n\n"
-            "В игровой день через 15 часов бот пришлёт постигровой "
-            "чек-лист и будет напоминать о нём каждые 15 минут.\n\n"
-            "Открыть обе ссылки в любой момент: /forms",
-            reply_markup=zhukov_forms_keyboard(),
+            "Алексей, Everest подключён ✅\n\n"
+            "Под строкой ввода доступны три постоянные кнопки:\n"
+            "☀️ Утренний отчёт — ссылка на утреннюю анкету;\n"
+            "🌙 Вечерний отчёт — ссылка на постигровую анкету;\n"
+            "🛏 Ложусь спать — сохранение точного времени нажатия.\n\n"
+            "Автоматические напоминания и команда «Доброе утро» также работают.",
+            reply_markup=zhukov_main_menu_keyboard(),
         )
         return
 
@@ -8930,12 +9029,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if is_zhukov(update):
+        if await handle_zhukov_menu(update, context, text):
+            return
         if MORNING_TRIGGER_PATTERN.search(text):
             await start_zhukov_morning_session(update, context)
             return
         await update.effective_message.reply_text(
-            "Чтобы получить утренний чек-лист, напиши: Доброе утро\n"
-            "Обе ссылки доступны по команде /forms"
+            "Выбери кнопку отчёта или «Ложусь спать» под строкой ввода.\n"
+            "Если меню скрыто, открой его командой /start или /forms."
         )
         return
 
