@@ -56,7 +56,10 @@ ZHUKOV_GOOGLE_SHEET_ID = os.environ.get(
     "ZHUKOV_GOOGLE_SHEET_ID",
     "1Ax_cP0of8ezqL-COJjFBlleHz_Xcle3T1h0vxFrjUmM",
 ).strip()
-ZHUKOV_EVENING_GOOGLE_SHEET_ID = os.environ.get("ZHUKOV_EVENING_GOOGLE_SHEET_ID", "").strip()
+ZHUKOV_EVENING_GOOGLE_SHEET_ID = os.environ.get(
+    "ZHUKOV_EVENING_GOOGLE_SHEET_ID",
+    "1I_6iEwyCvk69gF3YRcwTh994_K55sdbvrjRZrNkXrdo",
+).strip()
 GOOGLE_CALENDAR_ID = os.environ.get(
     "GOOGLE_CALENDAR_ID",
     "azalcyprus@gmail.com",
