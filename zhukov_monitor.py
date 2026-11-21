@@ -728,7 +728,7 @@ async def _send_once(bot, ws, records, event):
     _mark(ws, row_number, "SENT")
 
 
-async def tick(bot, spreadsheet, now=None, plan_types=None):
+async def tick(bot, spreadsheet, now=None, plan_types=None, *, morning_reports=True):
     if not enabled():
         return
     if plan_types is None and os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
@@ -841,6 +841,10 @@ async def tick(bot, spreadsheet, now=None, plan_types=None):
                     f"утреннего отчёта за {day.strftime('%d.%m.%Y')} не было. {qualifier}", None,
                 ))
         for record in morning:
+            # Production passes False: the cycle-2 dashboard owns morning
+            # delivery. Keep the archival renderer for historical comparisons.
+            if not morning_reports:
+                break
             day = record["date"]
             if day < activated or not record["timestamp"]:
                 continue
