@@ -7,10 +7,19 @@ Do not infer a plan for dates absent from the source.
 """
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+import os
 import re
 
 _ALLOWED_CODE = re.compile(r"^[A-Z][A-Z0-9+/-]{0,7}$")
 DEFAULT_PLAN_SHEET = "Макроцикл 2"
+CYCLE_START = date(2026, 11, 23)
+CYCLE_END = date(2026, 12, 23)
+DAILY_COLUMNS = {
+    "game": "Game OPT (ч)",
+    "heavy": "Анализ трансляций (мин)",
+    "light": "Видеоразборы (мин)",
+    "physical": "Физическая активность (мин)",
+}
 
 
 class PlannedLoadCode(str):
@@ -161,8 +170,85 @@ def optional_plan_types():
         return {}
 
 
+def parse_daily_plan_rows(rows):
+    """Macrocycle 2 only. Empty loads are unknown; conflicting dates fail closed."""
+    if not rows:
+        return {}
+    headers = [str(value).strip() for value in rows[0]]
+    if "Дата" not in headers or "Day Type" not in headers:
+        raise ValueError("Macrocycle 2 must contain Дата and Day Type")
+    result, conflicts = {}, set()
+    for row in rows[1:]:
+        fields = {key: str(row[i] if i < len(row) else "").strip()
+                  for i, key in enumerate(headers)}
+        day = None
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m"):
+            try:
+                day = datetime.strptime(fields["Дата"], fmt).date()
+                if fmt == "%d.%m":
+                    day = day.replace(year=2026)
+                break
+            except ValueError:
+                continue
+        if day is None or not CYCLE_START <= day <= CYCLE_END:
+            continue
+        entry = {
+            "type": fields.get("Day Type") or None,
+            "purpose": fields.get("Назначение дня") or None,
+            "timezone": fields.get("Часовой пояс") or None,
+        }
+        for key, column in DAILY_COLUMNS.items():
+            raw = fields.get(column, "")
+            number = _parse_hours(raw) if key == "game" else _parse_minutes(raw)
+            entry[key] = float(number) if number is not None else None
+        if day in result and result[day] != entry:
+            conflicts.add(day)
+        else:
+            result[day] = entry
+    return {day: value for day, value in result.items() if day not in conflicts}
+
+
+def _parse_minutes(raw):
+    text = str(raw if raw is not None else "").strip().replace(",", ".")
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return None
+    return number if number.is_finite() and 0 <= number <= 1440 else None
+
+
+def load_daily_plan():
+    """Read all load categories from the exact cycle-2 sheet, with no fallback."""
+    import json
+    import time
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    global _daily_cache, _daily_cache_time
+    with _cache_lock:
+        now = time.monotonic()
+        if _daily_cache is not None and now - _daily_cache_time < 300:
+            return {day: dict(value) for day, value in _daily_cache.items()}
+        sheet_id = os.getenv("ZHUKOV_PLAN_SPREADSHEET_ID",
+                             "1zhViAYswrLlOQJltqkZYRO8cNrxrdHtBkVNs_tHRbr8")
+        title = os.getenv("ZHUKOV_PLAN_SHEET", DEFAULT_PLAN_SHEET).strip()
+        if title != DEFAULT_PLAN_SHEET:
+            raise ValueError("Morning dashboard requires the exact Макроцикл 2 tab")
+        credentials = Credentials.from_service_account_info(
+            json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        )
+        book = gspread.authorize(credentials).open_by_key(sheet_id)
+        rows = book.worksheet(title).get("A1:M200", value_render_option="FORMATTED_VALUE")
+        _daily_cache = parse_daily_plan_rows(rows)
+        _daily_cache_time = now
+        return {day: dict(value) for day, value in _daily_cache.items()}
+
+
 import threading
 
 _cache_lock = threading.Lock()
 _cache = None
 _cache_time = 0.0
+_daily_cache = None
+_daily_cache_time = 0.0

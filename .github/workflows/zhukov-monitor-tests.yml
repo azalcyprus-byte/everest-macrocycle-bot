@@ -3,6 +3,10 @@ on:
   pull_request:
     paths:
       - "zhukov_monitor.py"
+      - "zhukov_dashboard.py"
+      - "zhukov_dashboard_delivery.py"
+      - "tests/test_zhukov_dashboard.py"
+      - "assets/**"
       - "zhukov_ai.py"
       - "zhukov_evening.py"
       - "zhukov_evening_v2.py"

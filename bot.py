@@ -15,6 +15,7 @@ import zhukov_evening
 import zhukov_evening_v2
 import zhukov_plan
 import zhukov_morning
+import zhukov_dashboard_delivery
 import zhukov_brief
 import everest_curator_chat
 from datetime import date, datetime, time, timedelta
@@ -5643,7 +5644,7 @@ async def zhukovmorning(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Rebuild the agreed compact morning report and PNG for one date."""
+    """Recalculate the one existing cycle-2 morning message for one date."""
     if not is_authorized(update):
         return
     chat = update.effective_chat
@@ -5653,37 +5654,26 @@ async def zhukovmorning(
     target_day = zhukov_monitor.parse_date(args[0]) if len(args) == 1 else None
     if target_day is None:
         await update.effective_message.reply_text(
-            "Формат: /zhukovmorning 26.10.2026\n"
-            "Можно также указать 2026-10-26."
+            "Формат: /zhukovmorning 23.11.2026\n"
+            "Дата должна относиться к макроциклу 2: 23.11–23.12.2026."
         )
         return
     try:
         book = await asyncio.to_thread(get_zhukov_spreadsheet)
-        plan = await asyncio.to_thread(zhukov_plan.optional_plan_types)
-        source = await asyncio.to_thread(
-            zhukov_monitor.read_ai_report_inputs, book, target_day, plan,
-        )
-        if source is None:
-            await update.effective_message.reply_text(
-                f"За {target_day:%d.%m.%Y} нет утренней анкеты."
-            )
+        if not zhukov_plan.CYCLE_START <= target_day <= zhukov_plan.CYCLE_END:
+            await update.effective_message.reply_text("Эта дата вне макроцикла 2. Исторические отчёты сохранены.")
             return
-        base_report, record, morning_rows, game_rows = source
-        recommendation = zhukov_brief.recommendation_from_report(base_report)
-        report = zhukov_morning.render_report(
-            record, morning_rows, zhukov_monitor.get,
-            zhukov_plan.planned_type_for(plan, target_day), recommendation,
+        evening_book = await asyncio.to_thread(get_zhukov_evening_spreadsheet)
+        result = await zhukov_dashboard_delivery.tick(
+            context.bot, book, evening_book, target_day=target_day,
         )
-        chart = zhukov_morning.render_chart_png(
-            zhukov_morning.chart_series(
-                record, morning_rows, game_rows, zhukov_monitor.get, plan,
-            )
-        )
-        await update.effective_message.reply_photo(
-            photo=chart,
-            caption=zhukov_monitor.telegram_report_html(report),
-            parse_mode="HTML",
-        )
+        if result and any(value == "review" for value in result):
+            status = "Отправка требует проверки: повторное сообщение не создавалось."
+        elif result:
+            status = "Утренний отчёт пересчитан в том же сообщении."
+        else:
+            status = "За эту дату пока нет доступной утренней анкеты."
+        await update.effective_message.reply_text(status)
     except Exception:
         logger.exception("Zhukov manual morning report failed")
         await update.effective_message.reply_text(
@@ -5909,9 +5899,10 @@ async def zhukov_curator_monitor_tick(
         logger.exception("Zhukov morning spreadsheet unavailable")
         return
     try:
-        await zhukov_monitor.tick(context.bot, sheet)
+        await zhukov_monitor.tick(context.bot, sheet, morning_reports=False)
     except Exception:
         logger.exception("Zhukov legacy monitoring tick failed")
+    evening_sheet = None
     if ZHUKOV_EVENING_GOOGLE_SHEET_ID:
         try:
             evening_sheet = await asyncio.to_thread(get_zhukov_evening_spreadsheet)
@@ -5921,6 +5912,10 @@ async def zhukov_curator_monitor_tick(
                 "New evening source unavailable: check service-account access "
                 "and ZHUKOV_EVENING_RESPONSES_TAB"
             )
+    try:
+        await zhukov_dashboard_delivery.tick(context.bot, sheet, evening_sheet)
+    except Exception:
+        logger.exception("Zhukov morning dashboard tick failed")
 
 
 async def zhukov_orchestrator_tick(
