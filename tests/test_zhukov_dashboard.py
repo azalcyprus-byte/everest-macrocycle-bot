@@ -33,7 +33,6 @@ def morning(day=DAY, **changes):
         "5. Как встал?": "обычно", "6. Через 30–60 минут": "нет",
         "7. Что сейчас": "ничего необычного", "8. Когда читаешь": "нет",
         "9. Простые утренние дела": "как обычно",
-        "10.  Насколько легко тебе сейчас думать": "как обычно",
         "12. Что со вчера могло повлиять": "ничего необычного",
     }
     fields.update(changes)
@@ -71,6 +70,19 @@ class DashboardLogicTests(unittest.TestCase):
         incomplete = morning()
         incomplete["fields"]["5. Как встал?"] = ""
         self.assertIsNone(dashboard.historical_index(incomplete))
+
+    def test_question_ten_is_ignored_in_all_state_assessments(self):
+        current = morning()
+        old_form = morning(**{
+            "10. Насколько легко тебе сейчас думать и разбираться в сложных вопросах?":
+                "Очень тяжело, хочется избегать умственной работы."
+        })
+        without_q10 = dashboard.build_report(current, [current], [], [], {})
+        with_q10 = dashboard.build_report(old_form, [old_form], [], [], {})
+        self.assertEqual(without_q10["index"], with_q10["index"])
+        self.assertEqual(without_q10["analysis"], with_q10["analysis"])
+        self.assertNotIn("thinking", with_q10)
+        self.assertNotIn("затруднение сложного мышления", " ".join(with_q10["analysis"]))
 
     def test_sleep_button_midpoints_and_missing_inputs(self):
         for category, minutes in (("До 15 минут", 7.5), ("15–30 минут", 22.5), ("30–60 минут", 45)):
