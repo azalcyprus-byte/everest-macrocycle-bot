@@ -216,7 +216,6 @@ def build_report(record, mornings, evenings, bedtimes, plans, warnings=()):
         "index": score, "delta": delta, "series": series,
         "sleep": estimated_sleep(record, bedtimes, current_plan),
         "sleepiness": field(record, "Через 30–60", NO_DATA),
-        "thinking": field(record, "Насколько легко тебе сейчас думать", NO_DATA),
         "awakenings": field(record, "Сколько раз просыпался", NO_DATA),
         "latency_answer": field(record, "Как быстро уснул", NO_DATA),
         "body": field(record, "Что сейчас", NO_DATA),
@@ -255,8 +254,6 @@ def analysis(report, record):
         signals.append("выраженная сонливость")
     if field(record, "Когда читаешь").casefold() == "часто":
         signals.append("частые трудности внимания")
-    if "тяжел" in report["thinking"].casefold() or "тяжёл" in report["thinking"].casefold():
-        signals.append("затруднение сложного мышления")
     body = report["body"].casefold()
     if body not in ("ничего необычного", "нет", NO_DATA.casefold()):
         signals.append("отмечены телесные симптомы")
@@ -322,7 +319,6 @@ def render_png(report, *, demo=False):
         y += card_height + 22
 
     state_lines = ["Сонливость: " + report["sleepiness"],
-                   "Сложное мышление: " + report["thinking"],
                    "Засыпание: " + report["latency_answer"],
                    "Пробуждения: " + report["awakenings"],
                    "Тело: " + report["body"], "Факторы: " + report["factors"]]
