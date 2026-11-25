@@ -26,9 +26,9 @@ def _sleep_window(record, get):
     return duration / 60 if duration else None
 
 
-def condition_components(record, get):
-    """Everest 100-point model: S(25) + Z(10) + V(35) + C(30)."""
-    hours = _sleep_window(record, get)
+def condition_components(record, get, *, sleep_window_hours=None):
+    """Everest 100-point model; allow the verified button-to-wake window."""
+    hours = sleep_window_hours if sleep_window_hours is not None else _sleep_window(record, get)
     if hours is None:
         duration_score = 0
     elif 8 <= hours <= 10:
@@ -98,8 +98,8 @@ def condition_components(record, get):
     return {"S": s_score, "Z": z_score, "V": v_score, "C": c_score}
 
 
-def condition_index(record, get):
-    return sum(condition_components(record, get).values())
+def condition_index(record, get, *, sleep_window_hours=None):
+    return sum(condition_components(record, get, sleep_window_hours=sleep_window_hours).values())
 
 
 def _clock_minutes(record, get):
