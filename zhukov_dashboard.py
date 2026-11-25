@@ -105,16 +105,17 @@ def parse_bedtimes(rows):
     return sorted(set(result))
 
 
-def estimated_sleep(record, bedtimes, plan=None):
-    """Wake instant minus recorded button instant minus agreed latency.
+def bedtime_window(record, bedtimes, plan=None):
+    """Elapsed UTC hours from the latest valid bedtime-button press to wake.
 
-    Never substitute the morning self-reported bedtime for a missing button.
-    Use elapsed UTC time across DST. Unknown wake zone/latency/button => None.
+    The morning form's old bedtime field is not used here. Report date and city
+    locate the wake instant; UTC button timestamps survive timezone changes.
     """
+    if record is None or not bedtimes:
+        return None
     zone = location_zone(record, plan)
     wake_time = _clock(field(record, "Во сколько окончательно проснулся"))
-    latency = latency_minutes(field(record, "Как быстро уснул"))
-    if zone is None or wake_time is None or latency is None:
+    if zone is None or wake_time is None:
         return None
     wake_local = datetime.combine(record["date"], wake_time, zone)
     # Reject nonexistent/ambiguous wall times rather than guessing a DST fold.
@@ -129,20 +130,37 @@ def estimated_sleep(record, bedtimes, plan=None):
     candidates = [stamp for stamp in bedtimes if timedelta(0) < wake - stamp <= timedelta(hours=24)]
     if not candidates:
         return None
-    minutes = (wake - max(candidates)).total_seconds() / 60 - latency
-    return minutes / 60 if 0 < minutes <= 24 * 60 else None
+    return (wake - max(candidates)).total_seconds() / 3600
 
 
-def historical_index(record):
-    required = ("Во сколько лег спать", "Во сколько окончательно проснулся",
-                "Сколько раз просыпался", "Как быстро уснул", "Как встал",
-                "Через 30–60", "Что сейчас", "Когда читаешь", "Простые")
+def estimated_sleep(record, bedtimes, plan=None):
+    """Estimated sleep = button-to-wake UTC hours minus reported sleep latency."""
+    window = bedtime_window(record, bedtimes, plan)
+    latency = latency_minutes(field(record, "Как быстро уснул")) if record else None
+    if window is None or latency is None:
+        return None
+    hours = window - latency / 60
+    return hours if 0 < hours <= 24 else None
+
+
+def historical_index(record, bedtimes=None, plan=None):
+    """Score the button-to-wake interval for current reports.
+
+    Preserve the legacy self-reported bedtime only for historical records
+    lacking a button. Never treat missing sleep input as measured zero.
+    """
+    required = ("Во сколько окончательно проснулся", "Сколько раз просыпался",
+                "Как быстро уснул", "Как встал", "Через 30–60",
+                "Что сейчас", "Когда читаешь", "Простые")
     missing = {"", "нет данных", "не указано", "—", "n/a"}
     if record is None or any(field(record, name).casefold() in missing for name in required):
         return None
-    if zhukov_morning._sleep_window(record, field) is None:
+    window = bedtime_window(record, bedtimes, plan)
+    if window is None:
+        window = zhukov_morning._sleep_window(record, field)
+    if window is None:
         return None
-    return zhukov_morning.condition_index(record, field)
+    return zhukov_morning.condition_index(record, field, sleep_window_hours=window)
 
 
 def evening_loads(record):
@@ -188,12 +206,13 @@ def build_report(record, mornings, evenings, bedtimes, plans, warnings=()):
     evenings = [r for r in evenings if r["date"] < day]
     current_plan = plans.get(day, {})
     previous = _latest(mornings, yesterday)
-    score, prior_score = historical_index(record), historical_index(previous)
+    score = historical_index(record, bedtimes, current_plan)
+    prior_score = historical_index(previous, bedtimes, plans.get(yesterday))
     delta = score - prior_score if score is not None and prior_score is not None else None
     series = []
     for offset in range(6, -1, -1):
         target = day - timedelta(days=offset)
-        series.append({"date": target, "index": historical_index(_latest(mornings, target))})
+        series.append({"date": target, "index": historical_index(_latest(mornings, target), bedtimes, plans.get(target))})
     yesterday_record = _latest(evenings, yesterday)
     facts = evening_loads(yesterday_record)
     three_days = [day - timedelta(days=offset) for offset in (3, 2, 1)]
