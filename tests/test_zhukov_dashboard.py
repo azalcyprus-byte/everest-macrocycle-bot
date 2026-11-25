@@ -71,6 +71,34 @@ class DashboardLogicTests(unittest.TestCase):
         incomplete["fields"]["5. Как встал?"] = ""
         self.assertIsNone(dashboard.historical_index(incomplete))
 
+    def test_button_supplies_missing_bedtime_for_index_and_weekly_chart(self):
+        current = morning(**{"1. Во сколько лег спать?": ""})
+        self.assertIsNone(dashboard.historical_index(current))
+        self.assertEqual(dashboard.historical_index(current, [bed()]), 97)
+        result = dashboard.build_report(current, [current], [], [bed()], {})
+        self.assertEqual(result["index"], 97)
+        self.assertEqual(result["series"][-1]["index"], 97)
+        self.assertAlmostEqual(result["sleep"], 8.375)
+
+    def test_button_has_priority_over_obsolete_morning_bedtime(self):
+        current = morning(**{"1. Во сколько лег спать?": "04:00"})
+        self.assertEqual(dashboard.historical_index(current, [bed()]), 97)
+        self.assertNotEqual(dashboard.historical_index(current), 97)
+
+    def test_button_restores_two_day_index_comparison_when_form_omits_bedtime(self):
+        prior = morning(DAY - timedelta(days=1), **{"1. Во сколько лег спать?": ""})
+        current = morning(**{"1. Во сколько лег спать?": ""})
+        report = dashboard.build_report(current, [prior, current], [], [bed(DAY - timedelta(days=1)), bed()], {})
+        self.assertEqual(report["index"], 97)
+        self.assertEqual(report["delta"], 0)
+        self.assertEqual(report["series"][-2]["index"], 97)
+        self.assertEqual(report["series"][-1]["index"], 97)
+
+    def test_unknown_bedtime_is_not_scored_as_zero(self):
+        current = morning(**{"1. Во сколько лег спать?": ""})
+        self.assertIsNone(dashboard.historical_index(current, []))
+        self.assertIsNone(dashboard.build_report(current, [current], [], [], {})["index"])
+
     def test_question_ten_is_ignored_in_all_state_assessments(self):
         current = morning()
         old_form = morning(**{
