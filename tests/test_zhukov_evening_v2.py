@@ -151,6 +151,30 @@ class NewEveningTests(unittest.TestCase):
         self.assertIn("не фактический сон", report)
         self.assertNotIn("🎮 Во время игры", report)
         self.assertIn("Тело к концу дня:", report)
+    def test_physical_checkbox_used_without_obsolete_minutes_question(self):
+        headers = [h for h in NEW_HEADERS if not h.startswith("Сколько минут физической активности")]
+        values = evening("11/26/2026 6:15:20 PM", "26.11.2026", "Нет")
+        values = [value for header, value in zip(NEW_HEADERS, values)
+                  if not header.startswith("Сколько минут физической активности")]
+        values[headers.index("Чем ты занимался сегодня? (1 или несколько вариантов)")] = (
+            "Смотрел видеоразборы., Занимался физической подготовкой."
+        )
+        record = v2.parse_records([headers, values])[0]
+        self.assertEqual(v2.physical_activity(record), 1)
+        brief = v2.render(record, [], [record])
+        self.assertIn("Физическая активность: была", brief)
+        self.assertIn("активность: 1/1 отчётных дней", brief)
+        self.assertNotIn("45 мин", brief)
+
+    def test_checkbox_no_selection_vs_other_activity(self):
+        record = v2.parse_records([
+            NEW_HEADERS,
+            evening("11/26/2026 6:15:20 PM", "26.11.2026"),
+        ])[0]
+        self.assertEqual(v2.physical_activity(record), 0)
+        record["fields"]["Чем ты занимался сегодня? (1 или несколько вариантов)"] = ""
+        self.assertIsNone(v2.physical_activity(record))
+
     def test_game_day_uses_only_new_form_game_fields(self):
         source = Book(True)
         source.worksheet(v2.NEW_FORM_TAB).append_row(
