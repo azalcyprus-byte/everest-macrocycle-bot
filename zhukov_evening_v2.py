@@ -104,6 +104,23 @@ def _minutes(rec, prefix):
     return val if 0 <= val <= 1440 else None
 
 
+def physical_activity(record):
+    """Checkbox source of truth: 1 = selected, 0 = other selections, None = absent.
+
+    Ignore the obsolete physical-activity minutes field, even on old rows.
+    """
+    if not record:
+        return None
+    raw = next((
+        value for name, value in record.get("fields", {}).items()
+        if name.startswith("Чем ты занимался сегодня?")
+    ), None)
+    if raw is None or not str(raw).strip():
+        return None
+    selections = " ".join(str(raw).casefold().split())
+    return int("занимался физической подготовкой" in selections)
+
+
 def _hours(rec):
     raw = _field(rec, "1. Сколько часов фактически")
     try:
@@ -168,11 +185,12 @@ def render(record, morning, evenings, *, plan_type=None):
         "тип дня не указан"
     )
     activity = _field(record, "Чем ты занимался сегодня?")
-    movement = _minutes(record, "Сколько минут физической активности")
+    movement = physical_activity(record)
     video = _minutes(record, "Сколько минут сегодня смотрел видеоразборы")
     active = _minutes(record, "Сколько минут сегодня занимался активным анализом")
     def fmt(val):
         return f"{val:g} мин" if val is not None else "не указано"
+    movement_label = {1: "была", 0: "не была"}.get(movement, "нет данных")
     body = _field(record, "Что ощущалось в теле к концу дня?")
     load = _field(record, "Насколько умственно тяжёлым")
     factors = _field(record, "Что сегодня могло повлиять")
@@ -197,6 +215,11 @@ def render(record, morning, evenings, *, plan_type=None):
         known = [_hours(x) for x in played]
         known = [h for h in known if h is not None]
         return f"{len(records)} анкет; {len(played)} игровых дней; {sum(known):g} ч подтверждённой игры" if known else f"{len(records)} анкет; {len(played)} игровых дней; игровые часы не указаны"
+    def physical_days(records):
+        known = [physical_activity(x) for x in records]
+        known = [value for value in known if value is not None]
+        return f"{sum(known)}/{len(known)} отчётных дней" if known else "нет данных"
+
     game_lines = ""
     if game is True:
         course = _field(record, "2. Менялось ли твоё состояние")
@@ -220,7 +243,7 @@ def render(record, morning, evenings, *, plan_type=None):
         f"Вечерний отчёт (новая Google Форма)\n\n"
         f"📅 План: {planned}; ответ игрока: {game_label}.\n"
         f"📋 Занятия: {activity}.\n"
-        f"🏃 Активность: {fmt(movement)}; видеоразборы: {fmt(video)}; "
+        f"🏃 Физическая активность: {movement_label}; видеоразборы: {fmt(video)}; "
         f"активный анализ трансляций: {fmt(active)}.\n"
         f"🧠 Умственная нагрузка обучения: {load}.\n"
         f"💬 Тело к концу дня: {body}.\n"
@@ -228,7 +251,8 @@ def render(record, morning, evenings, *, plan_type=None):
         f"💤 Сон и пробуждение (утренняя анкета)\n{morning_lines}\n"
         + game_lines
         + f"\n{status}\n\n"
-        f"📈 Динамика вечерних анкет\n3 дня: {window(three)}.\n7 дней: {window(week)}.\n\n"
+        f"📈 Динамика вечерних анкет\n3 дня: {window(three)}; активность: {physical_days(three)}.\n"
+        f"7 дней: {window(week)}; активность: {physical_days(week)}.\n\n"
         f"🎯 Куратору: {recommendation}\n"
         f"ℹ️ Источник: новая вечерняя Google Форма; сон — утренняя анкета. "
         f"Описания субъективны, выводы предварительные."
