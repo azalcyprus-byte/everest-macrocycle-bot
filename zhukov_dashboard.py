@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 
 import zhukov_morning
+import zhukov_evening_v2
 import zhukov_plan
 import zhukov_sleep
 
@@ -24,7 +25,7 @@ CATEGORIES = (
     ("game", "Игра", "ч"),
     ("heavy", "Анализ трансляций", "мин"),
     ("light", "Видеоразборы", "мин"),
-    ("physical", "Физическая активность", "мин"),
+    ("physical", "Физическая активность", "дн."),
 )
 CITY_ZONES = {
     "пномпень": "Asia/Phnom_Penh", "phnom penh": "Asia/Phnom_Penh",
@@ -176,7 +177,7 @@ def evening_loads(record):
         "game": game,
         "heavy": number(field(record, "Сколько минут сегодня занимался активным анализом"), 1440),
         "light": number(field(record, "Сколько минут сегодня смотрел видеоразборы"), 1440),
-        "physical": number(field(record, "Сколько минут физической активности"), 1440),
+        "physical": zhukov_evening_v2.physical_activity(record),
     }
 
 
@@ -389,8 +390,12 @@ def render_png(report, *, demo=False):
         yy = top + 44 + i * 76
         planned, actual = report["yesterday_plan"].get(key), report["facts"][key]
         text(56, yy, label, 27)
-        plan_text = "Самоконтроль" if key == "physical" and planned is None else "План не задан"
-        text(640, yy, _fmt(planned, unit) if planned is not None else plan_text, 24, amber)
+        if key == "physical":
+            # Binary checkbox is not comparable with the legacy plan's minutes.
+            text(640, yy, "Самоконтроль", 24, amber)
+            text(840, yy, {1: "Была", 0: "Не была"}.get(actual, NO_DATA), 24, cyan)
+            continue
+        text(640, yy, _fmt(planned, unit) if planned is not None else "План не задан", 24, amber)
         text(840, yy, _fmt(actual, unit), 24, cyan)
         maximum = max([v for v in (planned, actual) if v is not None] + [1])
         for val, color, shift in ((planned, amber, 40), (actual, cyan, 50)):
@@ -424,8 +429,8 @@ def render_png(report, *, demo=False):
     today = ["Тип дня: " + (plan.get("type") or "План не задан")]
     for key, label, unit in CATEGORIES:
         val = plan.get(key)
-        if key == "physical" and val is None:
-            today.append(label + ": самоконтроль")
+        if key == "physical":
+            today.append(label + ": самоконтроль (была / не была)")
         else:
             today.append(label + ": " + (_fmt(val, unit) if val is not None else "План не задан"))
     if plan.get("purpose"):
