@@ -39,7 +39,7 @@ def morning(day=DAY, **changes):
     return {"date": day, "timestamp": datetime.combine(day, datetime.min.time(), ZONE) + timedelta(hours=9), "fields": fields}
 
 
-def evening(day=DAY - timedelta(days=1), game="Нет", hours="", heavy="60", light="30", physical="45"):
+def evening(day=DAY - timedelta(days=1), game="Нет", hours="", heavy="60", light="30", physical="45", activity="Занимался физической подготовкой."):
     return {"date": day, "timestamp": datetime.combine(day, datetime.min.time(), ZONE) + timedelta(hours=22), "fields": {
         "Сегодня был игровой день?": game, "1. Сколько часов фактически играл сегодня?": hours,
         "Сколько минут сегодня занимался активным анализом трансляций?": heavy,
@@ -53,6 +53,7 @@ def evening(day=DAY - timedelta(days=1), game="Нет", hours="", heavy="60", li
         "5. Были ли конкретные сбои внимания?": "Нет",
         "Timestamp": "11/25/2026 10:00:00 PM", "Дата": day.strftime("%m/%d/%Y"),
         "Что ощущалось в теле к концу дня?": "ничего необычного",
+        "Чем ты занимался сегодня? (1 или несколько вариантов)": activity,
     }}
 
 
@@ -142,10 +143,27 @@ class DashboardLogicTests(unittest.TestCase):
         plans = {DAY: {"type": "M", "heavy": 90, "light": 20},
                  DAY - timedelta(days=1): {"heavy": 60, "light": 30, "game": 0}}
         result = dashboard.build_report(morning(), [morning()], [evening()], [], plans)
-        self.assertEqual(result["facts"], {"game": 0, "heavy": 60, "light": 30, "physical": 45})
+        self.assertEqual(result["facts"], {"game": 0, "heavy": 60, "light": 30, "physical": 1})
         self.assertEqual(result["today_plan"]["heavy"], 90)
         self.assertIsNone(result["sleep"])
         self.assertEqual(result["game_quality"], [])
+
+    def test_checkbox_overrides_old_minutes_without_confusing_units(self):
+        present = evening(physical="0", activity="Смотрел видеоразборы., Занимался физической подготовкой.")
+        absent = evening(physical="240", activity="Смотрел видеоразборы.")
+        unknown = evening(physical="90", activity="")
+        self.assertEqual(dashboard.evening_loads(present)["physical"], 1)
+        self.assertEqual(dashboard.evening_loads(absent)["physical"], 0)
+        self.assertIsNone(dashboard.evening_loads(unknown)["physical"])
+        days = [DAY - timedelta(days=n) for n in (1, 2, 3)]
+        records = [dict(rec, date=day) for rec, day in zip((present, absent, unknown), days)]
+        result = dashboard.build_report(morning(), [morning()], records, [], {
+            DAY - timedelta(days=1): {"physical": 180}
+        })
+        self.assertEqual(result["facts"]["physical"], 1)
+        self.assertEqual(result["totals"]["physical"], {"value": 1, "days": 2})
+        self.assertIn("Физическая активность: 1 дн.", result["analysis"][1])
+        self.assertEqual(Image.open(dashboard.render_png(result)).format, "PNG")
 
     def test_game_day_quality_and_new_evening_only_hours(self):
         result = dashboard.build_report(morning(), [morning()], [evening(game="Да", hours="8,5")], [], {})
@@ -154,7 +172,7 @@ class DashboardLogicTests(unittest.TestCase):
 
     def test_rest_travel_missing_numbers_do_not_become_zero(self):
         result = dashboard.build_report(morning(**{"Сегодня": "перелёт"}), [morning()],
-                                        [evening(heavy="", light="", physical="")], [], {})
+                                        [evening(heavy="", light="", physical="", activity="")], [], {})
         self.assertEqual(result["facts"]["game"], 0)
         for key in ("heavy", "light", "physical"):
             self.assertIsNone(result["facts"][key])
